@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""M0 gate: every op must match NumPy reference, allclose(atol=1e-5, rtol=1e-5)."""
+import ctypes
+import os
+import subprocess
+import sys
+
+import numpy as np
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+subprocess.run(["make", "-s", "lib"], cwd=ROOT, check=True)
+
+lib = ctypes.CDLL(os.path.join(ROOT, "build", "libtinytorch.so"))
+F32P = ctypes.POINTER(ctypes.c_float)
+I64P = ctypes.POINTER(ctypes.c_long)
+
+lib.tt_fromdata.restype = ctypes.c_void_p
+lib.tt_fromdata.argtypes = [F32P, I64P, ctypes.c_int]
+lib.tt_new.restype = ctypes.c_void_p
+lib.tt_new.argtypes = [I64P, ctypes.c_int]
+lib.tt_retain.restype = ctypes.c_void_p
+lib.tt_retain.argtypes = [ctypes.c_void_p]
+lib.tt_release.argtypes = [ctypes.c_void_p]
+lib.tt_data.restype = F32P
+lib.tt_data.argtypes = [ctypes.c_void_p]
+lib.tt_numel.restype = ctypes.c_long
+lib.tt_numel.argtypes = [ctypes.c_void_p]
+lib.tt_ndim.restype = ctypes.c_int
+lib.tt_ndim.argtypes = [ctypes.c_void_p]
+lib.tt_shape.argtypes = [ctypes.c_void_p, I64P]
+lib.tt_strides.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+for name in ("tt_add", "tt_mul", "tt_matmul", "tt_relu", "tt_softmax"):
+    f = getattr(lib, name)
+    f.restype = ctypes.c_void_p
+    f.argtypes = [ctypes.c_void_p]
+for name in ("tt_addscalar", "tt_mulscalar"):
+    f = getattr(lib, name)
+    f.restype = ctypes.c_void_p
+    f.argtypes = [ctypes.c_void_p, ctypes.c_float]
+
+FAILURES = []
+
+
+def check(name, cond, detail=""):
+    if cond:
+        print(f"  ok  {name}")
+    else:
+        print(f" FAIL {name} {detail}")
+        FAILURES.append(f"{name} {detail}")
+
+
+def make(arr):
+    arr = np.ascontiguousarray(arr, dtype=np.float32)
+    ndim = arr.ndim
+    shape = (ctypes.c_long * max(ndim, 1))(*arr.shape)
+    t = lib.tt_fromdata(arr.ctypes.data_as(F32P), shape, ndim)
+    assert t, f"tt_fromdata failed for shape {arr.shape}"
+    return t
+
+
+def to_np(t, shape):
+    n = int(lib.tt_numel(t))
+    buf = np.ctypeslib.as_array(lib.tt_data(t), shape=(n,))
+    return buf.copy().reshape(shape)
+
+
+def run_unary(name, fn, x):
+    t_in = make(x)
+    t_out = fn(t_in)
+    got = to_np(t_out, x.shape)
+    ref = np.maximum(x, 0.0)
+    ok = np.allclose(got, ref, atol=1e-5, rtol=1e-5)
+    check(f"{name}{list(x.shape)}", ok,
+          f"max_err={np.abs(got - ref).max():.3e}" if not ok else "")
+    lib.tt_release(t_in)
+    lib.tt_release(t_out)
+
+
+def run_binary(name, fn, x, y):
+    tx, ty = make(x), make(y)
+    t_out = fn(tx, ty)
+    got = to_np(t_out, x.shape)
+    ref = {"add": np.add, "mul": np.multiply}[name](x, y)
+    ok = np.allclose(got, ref, atol=1e-5, rtol=1e-5)
+    check(f"{name}{list(x.shape)}", ok,
+          f"max_err={np.abs(got - ref).max():.3e}" if not ok else "")
+    lib.tt_release(tx)
+    lib.tt_release(ty)
+    lib.tt_release(t_out)
+
+
+def run_scalar(name, fn, x, s):
+    tx = make(x)
+    t_out = fn(tx, ctypes.c_float(s))
+    got = to_np(t_out, x.shape)
+    ref = {"addscalar": np.add, "mulscalar": np.multiply}[name](x, s)
+    ok = np.allclose(got, ref, atol=1e-5, rtol=1e-5)
+    check(f"{name}{list(x.shape)}+{s}", ok,
+          f"max_err={np.abs(got - ref).max():.3e}" if not ok else "")
+    lib.tt_release(tx)
+    lib.tt_release(t_out)
+
+
+def softmax_ref(x):
+    x = x.astype(np.float64)
+    m = x.max(axis=-1, keepdims=True)
+    e = np.exp(x - m)
+    return (e / e.sum(axis=-1, keepdims=True)).astype(np.float32)
+
+
+def run_softmax(x):
+    tx = make(x)
+    t_out = lib.tt_softmax(tx)
+    got = to_np(t_out, x.shape)
+    ref = softmax_ref(x)
+    ok = np.allclose(got, ref, atol=1e-5, rtol=1e-5)
+    sums_ok = np.allclose(got.sum(axis=-1), 1.0, atol=1e-5)
+    check(f"softmax{list(x.shape)}", ok and sums_ok,
+          f"max_err={np.abs(got - ref).max():.3e}" if not ok else "")
+    lib.tt_release(tx)
+    lib.tt_release(t_out)
+
+
+def run_matmul(a, b):
+    ta, tb = make(a), make(b)
+    t_out = lib.tt_matmul(ta, tb)
+    got = to_np(t_out, (a.shape[0], b.shape[1]))
+    ref = a @ b
+    ok = np.allclose(got, ref, atol=1e-5, rtol=1e-5)
+    check(f"matmul{list(a.shape)}x{list(b.shape)}", ok,
+          f"max_err={np.abs(got - ref).max():.3e}" if not ok else "")
+    lib.tt_release(ta)
+    lib.tt_release(tb)
+    lib.tt_release(t_out)
+
+
+rng = np.random.default_rng(42)
+
+print("== elementwise ==")
+for shape in [(8,), (3, 4), (2, 3, 4)]:
+    x = rng.standard_normal(shape).astype(np.float32)
+    y = rng.standard_normal(shape).astype(np.float32)
+    run_binary("add", lib.tt_add, x, y)
+    run_binary("mul", lib.tt_mul, x, y)
+    run_scalar("addscalar", lib.tt_addscalar, x, 2.5)
+    run_scalar("mulscalar", lib.tt_mulscalar, x, -0.5)
+    run_unary("relu", lib.tt_relu, x)
+    run_unary("relu", lib.tt_relu, np.array([-3.0, 0.0, 2.5], dtype=np.float32))
+
+print("== matmul ==")
+run_matmul(rng.standard_normal((3, 4)), rng.standard_normal((4, 5)))
+run_matmul(rng.standard_normal((16, 16)), rng.standard_normal((16, 16)))
+run_matmul(rng.standard_normal((1, 7)), rng.standard_normal((7, 1)))
+run_matmul(rng.standard_normal((32, 64)), rng.standard_normal((64, 17)))
+
+print("== softmax ==")
+run_softmax(rng.standard_normal((5,)))
+run_softmax(rng.standard_normal((3, 6)))
+run_softmax(rng.standard_normal((2, 3, 4)) + 100.0)  # stability
+run_softmax(np.full((4,), -1e9, dtype=np.float32))
+
+print("== shape/stride metadata ==")
+x = rng.standard_normal((2, 3, 4)).astype(np.float32)
+t = make(x)
+shp = (ctypes.c_long * 3)()
+stp = (ctypes.c_int * 3)()
+lib.tt_shape(ctypes.c_void_p(t), shp)
+lib.tt_strides(ctypes.c_void_p(t), stp)
+check("shape", list(shp) == [2, 3, 4], f"got {list(shp)}")
+check("strides", list(stp) == [12, 4, 1], f"got {list(stp)}")
+check("ndim", lib.tt_ndim(ctypes.c_void_p(t)) == 3)
+check("numel", int(lib.tt_numel(ctypes.c_void_p(t))) == 24)
+lib.tt_release(t)
+
+print("== error paths ==")
+a = make(rng.standard_normal((3, 4)))
+b = make(rng.standard_normal((5, 6)))
+check("matmul-mismatch->NULL", not lib.tt_matmul(a, b))
+c = make(rng.standard_normal((2, 3)))
+check("add-shape-mismatch->NULL", not lib.tt_add(a, c))
+lib.tt_release(a)
+lib.tt_release(b)
+lib.tt_release(c)
+
+print("== lifecycle (retain/release) ==")
+t = make(rng.standard_normal((4,)))
+u = lib.tt_retain(ctypes.c_void_p(t))
+lib.tt_release(ctypes.c_void_p(u))
+lib.tt_release(ctypes.c_void_p(t))
+print("  ok  retain/release no crash")
+
+if FAILURES:
+    print(f"\n{len(FAILURES)} FAILURE(S)")
+    sys.exit(1)
+print("\nALL M0 OP TESTS PASS")
