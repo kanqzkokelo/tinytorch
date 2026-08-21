@@ -1,0 +1,41 @@
+#ifndef TINYTORCH_AUTOGRAD_H
+#define TINYTORCH_AUTOGRAD_H
+
+#include "tensor.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct AGNode AGNode;
+
+/* graph construction: ops mirror the M0 tensor API but record the DAG */
+AGNode *ag_leaf(Tensor *t, int requires_grad);   /* retains t */
+AGNode *ag_add(AGNode *a, AGNode *b);
+AGNode *ag_mul(AGNode *a, AGNode *b);
+AGNode *ag_addscalar(AGNode *a, float s);
+AGNode *ag_mulscalar(AGNode *a, float s);
+AGNode *ag_matmul(AGNode *a, AGNode *b);         /* 2D @ 2D */
+AGNode *ag_relu(AGNode *a);
+AGNode *ag_softmax(AGNode *a);                   /* last axis */
+AGNode *ag_padones(AGNode *a);                   /* append ones column */
+
+/* accessors */
+Tensor *ag_value(const AGNode *n);
+Tensor *ag_grad(const AGNode *n);                /* NULL until backward */
+int     ag_requires_grad(const AGNode *n);
+
+/* reverse-mode AD.
+ * ag_backward(out): seed out->grad with 1.0 (scalar losses).
+ * ag_backward_from(out, seed): copy seed (numel floats) into out->grad.
+ * Both propagate through the DAG in reverse topological order. */
+void    ag_backward(AGNode *out);
+void    ag_backward_from(AGNode *out, const float *seed);
+
+void    ag_release(AGNode *n);                   /* refcounted node */
+AGNode *ag_retain(AGNode *n);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
