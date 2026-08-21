@@ -20,6 +20,15 @@ AGNode *ag_relu(AGNode *a);
 AGNode *ag_softmax(AGNode *a);                   /* last axis */
 AGNode *ag_padones(AGNode *a);                   /* append ones column */
 
+/* spatial & shape autograd nodes */
+AGNode *ag_reshape(AGNode *a, const long *new_shape, int new_ndim);
+AGNode *ag_conv2d(AGNode *a, AGNode *w, AGNode *b,
+                  int stride_h, int stride_w, int pad_h, int pad_w);
+AGNode *ag_maxpool2d(AGNode *a, int pool_h, int pool_w,
+                     int stride_h, int stride_w);
+AGNode *ag_avgpool2d(AGNode *a, int pool_h, int pool_w,
+                     int stride_h, int stride_w);
+
 /* accessors */
 Tensor *ag_value(const AGNode *n);
 Tensor *ag_grad(const AGNode *n);                /* NULL until backward */

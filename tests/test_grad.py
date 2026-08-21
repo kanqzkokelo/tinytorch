@@ -25,7 +25,7 @@ def forward_scalar(build, arrays):
     return val, nodes, out
 
 
-def gradcheck(name, build, arrays):
+def gradcheck(name, build, arrays, h=H, atol=ATOL):
     global R
     probe_nodes = [Node.leaf(a.copy(), False) for a in arrays]
     probe = build(*probe_nodes)
@@ -47,11 +47,11 @@ def gradcheck(name, build, arrays):
         for i in range(arrays[k].size):
             ap = [x.copy() for x in arrays]
             am = [x.copy() for x in arrays]
-            ap[k].reshape(-1)[i] += H
-            am[k].reshape(-1)[i] -= H
+            ap[k].reshape(-1)[i] += h
+            am[k].reshape(-1)[i] -= h
             fp, _, _ = forward_scalar(build, ap)
             fm, _, _ = forward_scalar(build, am)
-            num[i] = (fp - fm) / (2 * H)
+            num[i] = (fp - fm) / (2 * h)
 
     worst_violation = -np.inf
     max_rel = 0.0
@@ -62,7 +62,7 @@ def gradcheck(name, build, arrays):
         if mask.any():
             max_rel = max(max_rel, float(
                 (np.abs(an - nm)[mask] / np.abs(nm)[mask]).max()))
-    ok = worst_violation < ATOL
+    ok = worst_violation < atol
     status = " ok " if ok else " FAIL"
     print(f"{status} {name:38s} max_rel={max_rel:.2e} "
           f"violation={worst_violation:.2e}")
@@ -99,6 +99,14 @@ gradcheck("matmul", lambda x, w: x.matmul(w),
           [clear_x((4, 3)), clear_x((3, 5))])
 gradcheck("softmax", lambda x: x.softmax(), [clear_x((4, 5))])
 gradcheck("padones", lambda x: x.padones(), [clear_x((4, 3))])
+
+gradcheck("reshape", lambda x: x.reshape((2, 6)), [clear_x((3, 4))])
+gradcheck("conv2d", lambda x, w, b: x.conv2d(w, b, stride=1, pad=1),
+          [clear_x((2, 2, 5, 5)), clear_x((3, 2, 3, 3)), clear_x((3,))], atol=2e-4)
+gradcheck("maxpool2d", lambda x: x.maxpool2d(pool_size=2, stride=2),
+          [clear_x((2, 2, 6, 6))])
+gradcheck("avgpool2d", lambda x: x.avgpool2d(pool_size=2, stride=2),
+          [clear_x((2, 2, 6, 6))])
 gradcheck("composite softmax(relu(0.5*x@w)+0.1)",
           lambda x, w: ((x.matmul(w) * 0.5).relu() + 0.1).softmax(),
           [clear_x((4, 3)), clear_x((3, 6))])

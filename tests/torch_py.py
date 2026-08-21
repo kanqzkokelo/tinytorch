@@ -42,6 +42,18 @@ def _load():
             f.argtypes = [ctypes.c_void_p] * (
                 2 if name in ("ag_add", "ag_mul", "ag_matmul") else 1)
 
+    lib.ag_reshape.restype = ctypes.c_void_p
+    lib.ag_reshape.argtypes = [ctypes.c_void_p, I64P, ctypes.c_int]
+    lib.ag_conv2d.restype = ctypes.c_void_p
+    lib.ag_conv2d.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                              ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    lib.ag_maxpool2d.restype = ctypes.c_void_p
+    lib.ag_maxpool2d.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_int]
+    lib.ag_avgpool2d.restype = ctypes.c_void_p
+    lib.ag_avgpool2d.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_int]
+
     lib.ag_value.restype = ctypes.c_void_p
     lib.ag_value.argtypes = [ctypes.c_void_p]
     lib.ag_grad.restype = ctypes.c_void_p
@@ -143,6 +155,33 @@ class Node:
 
     def padones(self):
         return Node(LIB.ag_padones(self.ptr))
+
+    def reshape(self, shape):
+        ndim = len(shape)
+        c_shape = (ctypes.c_long * ndim)(*shape)
+        return Node(LIB.ag_reshape(self.ptr, c_shape, ndim))
+
+    def conv2d(self, w, b=None, stride=1, pad=0):
+        sh = stride if isinstance(stride, int) else stride[0]
+        sw = stride if isinstance(stride, int) else stride[1]
+        ph = pad if isinstance(pad, int) else pad[0]
+        pw = pad if isinstance(pad, int) else pad[1]
+        b_ptr = b.ptr if b else None
+        return Node(LIB.ag_conv2d(self.ptr, w.ptr, b_ptr, sh, sw, ph, pw))
+
+    def maxpool2d(self, pool_size=2, stride=2):
+        ph = pool_size if isinstance(pool_size, int) else pool_size[0]
+        pw = pool_size if isinstance(pool_size, int) else pool_size[1]
+        sh = stride if isinstance(stride, int) else stride[0]
+        sw = stride if isinstance(stride, int) else stride[1]
+        return Node(LIB.ag_maxpool2d(self.ptr, ph, pw, sh, sw))
+
+    def avgpool2d(self, pool_size=2, stride=2):
+        ph = pool_size if isinstance(pool_size, int) else pool_size[0]
+        pw = pool_size if isinstance(pool_size, int) else pool_size[1]
+        sh = stride if isinstance(stride, int) else stride[0]
+        sw = stride if isinstance(stride, int) else stride[1]
+        return Node(LIB.ag_avgpool2d(self.ptr, ph, pw, sh, sw))
 
     def release(self):
         if self.ptr:

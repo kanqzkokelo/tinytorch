@@ -11,16 +11,21 @@ typedef enum {
     OP_MATMUL,
     OP_RELU,
     OP_SOFTMAX,
-    OP_PADONES
+    OP_PADONES,
+    OP_RESHAPE,
+    OP_CONV2D,
+    OP_MAXPOOL2D,
+    OP_AVGPOOL2D
 } OpKind;
 
 struct AGNode {
     Tensor *val;
     Tensor *grad;
-    AGNode *parents[2];
+    AGNode *parents[3];
     int     nparents;
     OpKind  kind;
     float   scalar;
+    int     params[4];
     int     requires_grad;
     int     mark;      /* topo DFS state */
     int     refcount;
@@ -198,6 +203,69 @@ AGNode *ag_padones(AGNode *a) {
     return n;
 }
 
+AGNode *ag_reshape(AGNode *a, const long *new_shape, int new_ndim) {
+    if (!a) return NULL;
+    Tensor *v = tt_reshape(a->val, new_shape, new_ndim);
+    if (!v) return NULL;
+    AGNode *n = node_new(v, a->requires_grad);
+    if (!n) return NULL;
+    n->parents[0] = ag_retain(a);
+    n->nparents = 1;
+    n->kind = OP_RESHAPE;
+    return n;
+}
+
+AGNode *ag_conv2d(AGNode *a, AGNode *w, AGNode *b,
+                  int stride_h, int stride_w, int pad_h, int pad_w) {
+    if (!a || !w) return NULL;
+    Tensor *v = tt_conv2d(a->val, w->val, b ? b->val : NULL, stride_h, stride_w, pad_h, pad_w);
+    if (!v) return NULL;
+    int req = a->requires_grad || w->requires_grad || (b && b->requires_grad);
+    AGNode *n = node_new(v, req);
+    if (!n) return NULL;
+    n->parents[0] = ag_retain(a);
+    n->parents[1] = ag_retain(w);
+    n->nparents = 2;
+    if (b) {
+        n->parents[2] = ag_retain(b);
+        n->nparents = 3;
+    }
+    n->kind = OP_CONV2D;
+    n->params[0] = stride_h; n->params[1] = stride_w;
+    n->params[2] = pad_h;    n->params[3] = pad_w;
+    return n;
+}
+
+AGNode *ag_maxpool2d(AGNode *a, int pool_h, int pool_w,
+                     int stride_h, int stride_w) {
+    if (!a) return NULL;
+    Tensor *v = tt_maxpool2d(a->val, pool_h, pool_w, stride_h, stride_w);
+    if (!v) return NULL;
+    AGNode *n = node_new(v, a->requires_grad);
+    if (!n) return NULL;
+    n->parents[0] = ag_retain(a);
+    n->nparents = 1;
+    n->kind = OP_MAXPOOL2D;
+    n->params[0] = pool_h;   n->params[1] = pool_w;
+    n->params[2] = stride_h; n->params[3] = stride_w;
+    return n;
+}
+
+AGNode *ag_avgpool2d(AGNode *a, int pool_h, int pool_w,
+                     int stride_h, int stride_w) {
+    if (!a) return NULL;
+    Tensor *v = tt_avgpool2d(a->val, pool_h, pool_w, stride_h, stride_w);
+    if (!v) return NULL;
+    AGNode *n = node_new(v, a->requires_grad);
+    if (!n) return NULL;
+    n->parents[0] = ag_retain(a);
+    n->nparents = 1;
+    n->kind = OP_AVGPOOL2D;
+    n->params[0] = pool_h;   n->params[1] = pool_w;
+    n->params[2] = stride_h; n->params[3] = stride_w;
+    return n;
+}
+
 /* ---------- accessors ---------- */
 
 Tensor *ag_value(const AGNode *n) { return n ? n->val : NULL; }
@@ -282,6 +350,185 @@ static void backward_padones(AGNode *n) {
     tt_release(t);
 }
 
+static void backward_reshape(AGNode *n) {
+    if (!n->parents[0]->requires_grad) return;
+    long orig_shape[8];
+    for (int i = 0; i < n->parents[0]->val->ndim; i++)
+        orig_shape[i] = n->parents[0]->val->shape[i];
+    Tensor *g_reshaped = tt_reshape(n->grad, orig_shape, n->parents[0]->val->ndim);
+    accum(n->parents[0], g_reshaped);
+    tt_release(g_reshaped);
+}
+
+static void backward_conv2d(AGNode *n) {
+    AGNode *a = n->parents[0], *w = n->parents[1];
+    AGNode *b = n->nparents > 2 ? n->parents[2] : NULL;
+    int sh = n->params[0], sw = n->params[1], ph = n->params[2], pw = n->params[3];
+    Tensor *g = n->grad;
+
+    int N = a->val->shape[0], C = a->val->shape[1], H = a->val->shape[2], W_in = a->val->shape[3];
+    int F = w->val->shape[0], HH = w->val->shape[2], WW = w->val->shape[3];
+    int Hout = g->shape[2], Wout = g->shape[3];
+
+    if (b && b->requires_grad) {
+        long b_shp[1] = {F};
+        Tensor *gb = tt_new(b_shp, 1);
+        if (gb) {
+            for (int f = 0; f < F; f++) {
+                float sum = 0.0f;
+                for (int n_idx = 0; n_idx < N; n_idx++)
+                    for (int ho = 0; ho < Hout; ho++)
+                        for (int wo = 0; wo < Wout; wo++)
+                            sum += g->data[((long)n_idx * F + f) * Hout * Wout + (long)ho * Wout + wo];
+                gb->data[f] = sum;
+            }
+            accum(b, gb);
+            tt_release(gb);
+        }
+    }
+
+    if (w->requires_grad) {
+        long w_shp[4] = {F, C, HH, WW};
+        Tensor *gw = tt_new(w_shp, 4);
+        if (gw) {
+            for (int f = 0; f < F; f++) {
+                for (int c = 0; c < C; c++) {
+                    for (int kh = 0; kh < HH; kh++) {
+                        for (int kw = 0; kw < WW; kw++) {
+                            float sum = 0.0f;
+                            for (int n_idx = 0; n_idx < N; n_idx++) {
+                                for (int ho = 0; ho < Hout; ho++) {
+                                    int h_in = ho * sh - ph + kh;
+                                    if (h_in < 0 || h_in >= H) continue;
+                                    for (int wo = 0; wo < Wout; wo++) {
+                                        int w_in = wo * sw - pw + kw;
+                                        if (w_in < 0 || w_in >= W_in) continue;
+                                        float g_val = g->data[((long)n_idx * F + f) * Hout * Wout + (long)ho * Wout + wo];
+                                        float a_val = a->val->data[((long)n_idx * C + c) * H * W_in + (long)h_in * W_in + w_in];
+                                        sum += g_val * a_val;
+                                    }
+                                }
+                            }
+                            gw->data[((long)f * C + c) * HH * WW + (long)kh * WW + kw] = sum;
+                        }
+                    }
+                }
+            }
+            accum(w, gw);
+            tt_release(gw);
+        }
+    }
+
+    if (a->requires_grad) {
+        long a_numel = a->val->numel;
+        double *ga_dbl = (double *)calloc((size_t)a_numel, sizeof(double));
+        long a_shp[4] = {N, C, H, W_in};
+        Tensor *ga = tt_new(a_shp, 4);
+        if (ga_dbl && ga) {
+            for (int n_idx = 0; n_idx < N; n_idx++) {
+                for (int f = 0; f < F; f++) {
+                    for (int ho = 0; ho < Hout; ho++) {
+                        int h_start = ho * sh - ph;
+                        for (int wo = 0; wo < Wout; wo++) {
+                            int w_start = wo * sw - pw;
+                            double g_val = (double)g->data[((long)n_idx * F + f) * Hout * Wout + (long)ho * Wout + wo];
+                            for (int c = 0; c < C; c++) {
+                                for (int kh = 0; kh < HH; kh++) {
+                                    int h_in = h_start + kh;
+                                    if (h_in < 0 || h_in >= H) continue;
+                                    for (int kw = 0; kw < WW; kw++) {
+                                        int w_in = w_start + kw;
+                                        if (w_in < 0 || w_in >= W_in) continue;
+                                        double w_val = (double)w->val->data[((long)f * C + c) * HH * WW + (long)kh * WW + kw];
+                                        ga_dbl[((long)n_idx * C + c) * H * W_in + (long)h_in * W_in + w_in] += g_val * w_val;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (long i = 0; i < a_numel; i++) ga->data[i] = (float)ga_dbl[i];
+            accum(a, ga);
+            tt_release(ga);
+        }
+        free(ga_dbl);
+    }
+}
+
+static void backward_maxpool2d(AGNode *n) {
+    AGNode *a = n->parents[0];
+    if (!a->requires_grad) return;
+    int ph = n->params[0], pw = n->params[1], sh = n->params[2], sw = n->params[3];
+    Tensor *g = n->grad;
+    int N = a->val->shape[0], C = a->val->shape[1], H = a->val->shape[2], W = a->val->shape[3];
+    int Hout = g->shape[2], Wout = g->shape[3];
+
+    long a_shp[4] = {N, C, H, W};
+    Tensor *ga = tt_new(a_shp, 4);
+    if (!ga) return;
+
+    for (int n_idx = 0; n_idx < N; n_idx++) {
+        for (int c = 0; c < C; c++) {
+            for (int ho = 0; ho < Hout; ho++) {
+                int h_start = ho * sh;
+                for (int wo = 0; wo < Wout; wo++) {
+                    int w_start = wo * sw;
+                    float g_val = g->data[((long)n_idx * C + c) * Hout * Wout + (long)ho * Wout + wo];
+                    float max_val = -1e30f;
+                    int max_h = h_start, max_w = w_start;
+                    for (int kh = 0; kh < ph; kh++) {
+                        for (int kw = 0; kw < pw; kw++) {
+                            float v = a->val->data[((long)n_idx * C + c) * H * W + (long)(h_start + kh) * W + (w_start + kw)];
+                            if (v > max_val) {
+                                max_val = v;
+                                max_h = h_start + kh;
+                                max_w = w_start + kw;
+                            }
+                        }
+                    }
+                    ga->data[((long)n_idx * C + c) * H * W + (long)max_h * W + max_w] += g_val;
+                }
+            }
+        }
+    }
+    accum(a, ga);
+    tt_release(ga);
+}
+
+static void backward_avgpool2d(AGNode *n) {
+    AGNode *a = n->parents[0];
+    if (!a->requires_grad) return;
+    int ph = n->params[0], pw = n->params[1], sh = n->params[2], sw = n->params[3];
+    Tensor *g = n->grad;
+    int N = a->val->shape[0], C = a->val->shape[1], H = a->val->shape[2], W = a->val->shape[3];
+    int Hout = g->shape[2], Wout = g->shape[3];
+    float norm = 1.0f / (float)(ph * pw);
+
+    long a_shp[4] = {N, C, H, W};
+    Tensor *ga = tt_new(a_shp, 4);
+    if (!ga) return;
+
+    for (int n_idx = 0; n_idx < N; n_idx++) {
+        for (int c = 0; c < C; c++) {
+            for (int ho = 0; ho < Hout; ho++) {
+                int h_start = ho * sh;
+                for (int wo = 0; wo < Wout; wo++) {
+                    int w_start = wo * sw;
+                    float g_val = g->data[((long)n_idx * C + c) * Hout * Wout + (long)ho * Wout + wo] * norm;
+                    for (int kh = 0; kh < ph; kh++) {
+                        for (int kw = 0; kw < pw; kw++) {
+                            ga->data[((long)n_idx * C + c) * H * W + (long)(h_start + kh) * W + (w_start + kw)] += g_val;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    accum(a, ga);
+    tt_release(ga);
+}
+
 /* ---------- topological sort + propagation ---------- */
 
 typedef struct {
@@ -347,6 +594,10 @@ static void propagate(NodeList *order) {
             case OP_RELU:      backward_relu(n); break;
             case OP_SOFTMAX:   backward_softmax(n); break;
             case OP_PADONES:   backward_padones(n); break;
+            case OP_RESHAPE:   backward_reshape(n); break;
+            case OP_CONV2D:    backward_conv2d(n); break;
+            case OP_MAXPOOL2D: backward_maxpool2d(n); break;
+            case OP_AVGPOOL2D: backward_avgpool2d(n); break;
             default: break;
         }
     }
