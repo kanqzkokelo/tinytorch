@@ -29,10 +29,14 @@ lib.tt_ndim.restype = ctypes.c_int
 lib.tt_ndim.argtypes = [ctypes.c_void_p]
 lib.tt_shape.argtypes = [ctypes.c_void_p, I64P]
 lib.tt_strides.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
-for name in ("tt_add", "tt_mul", "tt_matmul", "tt_relu", "tt_softmax"):
+for name in ("tt_add", "tt_mul", "tt_matmul", "tt_relu", "tt_softmax",
+             "tt_matmul_fast"):
     f = getattr(lib, name)
     f.restype = ctypes.c_void_p
     f.argtypes = [ctypes.c_void_p]
+lib.tt_matmul_omp.restype = ctypes.c_void_p
+lib.tt_matmul_omp.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                              ctypes.c_int]
 for name in ("tt_addscalar", "tt_mulscalar"):
     f = getattr(lib, name)
     f.restype = ctypes.c_void_p
@@ -152,6 +156,25 @@ run_matmul(rng.standard_normal((3, 4)), rng.standard_normal((4, 5)))
 run_matmul(rng.standard_normal((16, 16)), rng.standard_normal((16, 16)))
 run_matmul(rng.standard_normal((1, 7)), rng.standard_normal((7, 1)))
 run_matmul(rng.standard_normal((32, 64)), rng.standard_normal((64, 17)))
+
+print("== matmul fast/omp (AVX2 kernel incl. edge sizes) ==")
+for shape_a, shape_b in [((3, 4), (4, 5)), ((17, 13), (13, 5)),
+                         ((7, 7), (7, 7)), ((5, 300), (300, 3)),
+                         ((9, 256), (256, 33)), ((64, 512), (512, 16))]:
+    a = rng.standard_normal(shape_a)
+    b = rng.standard_normal(shape_b)
+    ref = a @ b
+    for name, fn in (("fast", lib.tt_matmul_fast),
+                     ("omp", lambda x, y: lib.tt_matmul_omp(x, y, 4))):
+        ta, tb = make(a), make(b)
+        t_out = fn(ta, tb)
+        got = to_np(t_out, ref.shape)
+        ok = np.allclose(got, ref, atol=1e-4, rtol=1e-4)
+        check(f"matmul-{name}{list(shape_a)}x{list(shape_b)}", ok,
+              f"max_err={np.abs(got - ref).max():.3e}" if not ok else "")
+        lib.tt_release(ta)
+        lib.tt_release(tb)
+        lib.tt_release(t_out)
 
 print("== softmax ==")
 run_softmax(rng.standard_normal((5,)))

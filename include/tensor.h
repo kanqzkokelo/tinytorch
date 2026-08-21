@@ -35,6 +35,8 @@ Tensor *tt_mul(const Tensor *a, const Tensor *b);
 Tensor *tt_addscalar(const Tensor *a, float s);
 Tensor *tt_mulscalar(const Tensor *a, float s);
 Tensor *tt_matmul(const Tensor *a, const Tensor *b);  /* 2D @ 2D naive */
+Tensor *tt_matmul_fast(const Tensor *a, const Tensor *b);   /* AVX2+FMA, 1 thread */
+Tensor *tt_matmul_omp(const Tensor *a, const Tensor *b, int nthreads);
 Tensor *tt_relu(const Tensor *a);
 Tensor *tt_softmax(const Tensor *a);                  /* along last axis */
 

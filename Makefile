@@ -1,5 +1,5 @@
 CC      ?= gcc
-CFLAGS  ?= -O2 -Wall -Wextra -std=c11 -fPIC
+CFLAGS  ?= -O3 -mavx2 -mfma -fopenmp -Wall -Wextra -std=c11 -fPIC -DTT_IN_LIB
 BUILD   := build
 SRCS    := $(wildcard src/*.c)
 HDRS    := $(wildcard include/*.h)
