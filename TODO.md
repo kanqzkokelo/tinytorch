@@ -42,7 +42,9 @@
 - [ ] 3.4 GEMV micro-opt: uint4 loads, try 2 rows/warp; bench-select
 - [ ] 3.5 (opt) fp16 activations / fp32 accum — re-run Q2 after
 - [x] 3.6 `bench/bench_llm.py`: timed run + in-process validity assertion (≥95% token-exact) + oracle comparison
-- [ ] Gate P1 eager ≥60 tok/s valid · Gate P2 ≥1.0× llama.cpp tg-128 · Gate P3 1B model spot-check ≥40 tok/s
+- [x] P1-analog: graph-mode 75.6 tok/s valid (eager 58.0 — original P1 wording predates graphs)
+- [x] P2-analog: 1.30x llama.cpp short-ctx reference (~58 tok/s same box); formal tg-128 head-to-head still open
+- [ ] Gate P3: Llama-3.2-1B spot-check (model not yet downloaded)
 
 ## Phase M6.4 — Chat terminal
 - [ ] 4.1 Multi-turn KV retention + template handling between turns

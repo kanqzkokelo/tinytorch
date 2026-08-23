@@ -38,7 +38,9 @@ GFLOPS. Gate (AVX2 1T >= NumPy 1T @ 1024^3): FAIL
 |------|--------|--------------|--------|
 | 2026-08-23 | eager (post stream-unify) | 58.0 | 7/7 top1 |
 | 2026-08-23 | + cudaGraph replay | 59.1 | 7/7 top1 |
-| 2026-08-23 | + lm-head q8_0 vectorize (float4 x, uint32 W) | **75.6** | 7/7 top1 |
+| 2026-08-23 | + lm-head q8_0 vectorize (float4 x, uint32 W) | **75.6** (min 75.0 / max 75.9, 5x128) | 7/7 top1 |
+| — | lm-head V1 (rows/block 16→32) | reverted: slower (1.45 vs 1.31 ms kernel) | — |
+| — | lm-head W-vectorize alone | reverted: +1.5%, under bar | — |
 | — | fused add+rmsnorm | reverted (0% post-graphs) | — |
 | — | rmsnorm multi-block | skipped (measured <1% share) | — |
 | ref | llama.cpp tg (short ctx, this box) | ~58 | n/a |
@@ -50,3 +52,9 @@ Final: **75.6 tok/s decode** (median of 5x128 tokens), 1.30x llama.cpp reference
 below the 2% action bar. Multi-block rewrite would touch the reduction for <0.5%
 realistic gain. Revisit only if a future profile shows rmsnorm >2%.
 
+
+### Accepted shortfall note (2026-08-23)
+Plan target was >=100 tok/s; shipped 75.6 tok/s = 1.30x the llama.cpp reference on
+this box but below plan goal. Remaining bottleneck is per-kernel bandwidth (~110 of
+176 GB/s) across ~400 small GEMV launches; next levers are cp.async staging or
+persistent-block schemes (documented in tools review). Parity maintained at every step.

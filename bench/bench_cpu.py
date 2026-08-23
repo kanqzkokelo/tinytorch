@@ -169,8 +169,10 @@ def main():
             f"| {r['avx2']/r['naive']:.1f}x | {r['avx2']/r['np1']:.2f}x |")
     lines += ["", f"GFLOPS. Gate (AVX2 1T >= NumPy 1T @ {GATE_SIZE}^3): "
               f"{'PASS' if gate_ok else 'FAIL'}", ""]
+    # NEVER clobber tracked results.md (it holds the M6.3 decode ladder).
+    # CPU ladder goes to its own untracked side file; humans merge manually.
     out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "results.md")
+                            "results_cpu.md")
     with open(out_path, "w") as f:
         f.write("\n".join(lines))
     print("\n".join(lines))
