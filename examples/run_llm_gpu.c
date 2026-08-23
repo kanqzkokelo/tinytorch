@@ -73,6 +73,7 @@ int main(int argc, char **argv) {
     const double tot = (t1.tv_sec - tp0.tv_sec) + (t1.tv_nsec - tp0.tv_nsec) * 1e-9;
     printf("\"\n[gen: %d tokens | decode %.1f tok/s | incl prefill %.1f tok/s | greedy]\n",
            gen_count, gen_count / dec, gen_count / tot);
+    printf("STATS tokens=%d prefill=%d decode_us=%.0f\n", gen_count, n_prompt, dec * 1e6);
 
     qwen2_engine_free(eng);
     bpe_tokenizer_free(tok);

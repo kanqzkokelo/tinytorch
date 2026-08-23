@@ -32,3 +32,9 @@ GFLOPS. Gate (AVX2 1T >= NumPy 1T @ 1024^3): FAIL
 | 1024 | 116.1 | 4560.6 | 1555.3 | 4529.5 | 39.3x | 100.7% | 34.3% |
 | 2048 | 116.4 | 4085.8 | 2809.0 | 4188.1 | 35.1x | 97.6% | 67.1% |
 
+
+## LLM decode ladder (M6.3)
+
+| Date | GPU | Config | Median decode tok/s | Parity |
+|------|-----|--------|---------------------|--------|
+| 2026-08-23 | RTX 3050 laptop | eager (post stream-unify) | 58.0 (96 tok, 5 runs, min 57.9 / max 58.1) | 7/7 top1 |
