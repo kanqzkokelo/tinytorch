@@ -122,6 +122,7 @@ __global__ void k_flash_gqa(const float *__restrict__ q,
     float m_prev = -1e30f, l_prev = 0.0f;
     float oreg[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
+    /* INVARIANT: callers enforce pos < max_ctx (no ring wraparound in this loop) */
     for (int t = 0; t <= pos; t++) {
         /* slot-major layout: [slot][kv_head*head_dim], matches GEMV writes */
         const long off = ((long)t * n_kv_heads + kvh) * head_dim + lane * elems;
