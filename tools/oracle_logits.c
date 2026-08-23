@@ -21,6 +21,7 @@ int main(int argc, char **argv) {
     // tokenize prompt (no BOS for qwen)
     int toks[512];
     int n = llama_tokenize(vocab, argv[2], strlen(argv[2]), toks, 512, false, false);
+    if (n < 0) { fprintf(stderr, "tokenize failed (%d): prompt too long or invalid\n", n); return 1; }
     fprintf(stderr, "[oracle] %d tokens:", n);
     for (int i = 0; i < n; i++) fprintf(stderr, " %d", toks[i]);
     fprintf(stderr, "\n");
@@ -47,7 +48,9 @@ int main(int argc, char **argv) {
     printf("\n");
     // full logits dump option
     if (argc > 3 && !strcmp(argv[3], "--dump")) {
+        if (argc <= 4) { fprintf(stderr, "--dump requires output path: %s MODEL PROMPT --dump OUT.bin\n", argv[0]); return 1; }
         FILE *f = fopen(argv[4], "wb");
+        if (!f) { fprintf(stderr, "cannot open dump file: %s\n", argv[4]); return 1; }
         fwrite(logits, sizeof(float), nv, f);
         fclose(f);
         printf("DUMPED %d logits\n", nv);

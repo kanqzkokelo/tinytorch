@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 #include <cuda_runtime.h>
 #include "loader_gguf.h"
 #include "qwen2_engine.h"
@@ -13,7 +14,10 @@ int qwen2_debug_copy_xn(Qwen2Engine*, float*, int);
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s id,id,.. [out.bin]\n", argv[0]); return 1; }
-    GGUFModel *m = gguf_load("data/models/qwen2.5-0.5b-instruct-q4_0.gguf");
+    const char *model_path = "data/models/qwen2.5-0.5b-instruct-q4_0.gguf";
+    GGUFModel *m = gguf_load(model_path);
+    if (!m) { fprintf(stderr, "gguf load failed: %s\n", model_path); return 1; }
+    printf("model: %s\n", model_path);
     TTConfig cfg = tt_config_from_gguf(m, 1024);
     if (cfg.dim == 0) { fprintf(stderr, "config failed\n"); return 1; }
     Qwen2Engine *e = qwen2_engine_create(&cfg, m);
@@ -21,7 +25,17 @@ int main(int argc, char **argv) {
 
     int toks[512], n = 0;
     char *save = NULL, *p = strtok_r(argv[1], ",", &save);
-    while (p && n < 512) { toks[n++] = atoi(p); p = strtok_r(NULL, ",", &save); }
+    while (p && n < 512) {
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (!end || *end != '\0' || end == p || v < 0 || v > INT32_MAX) {
+            fprintf(stderr, "invalid token id: '%s' (expected integer)\n", p);
+            qwen2_engine_free(e);
+            return 1;
+        }
+        toks[n++] = (int)v;
+        p = strtok_r(NULL, ",", &save);
+    }
 
     // prefill all but last; then run final norm+logits manually via next() path
     // NOTE: next() also advances; we instead replicate its norm+logits stage here

@@ -14,17 +14,47 @@ env["LD_LIBRARY_PATH"] = ":".join(filter(None, [
     os.path.expanduser("~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"),
     env.get("LD_LIBRARY_PATH", "")]))
 
+def fail(i, d, why):
+    print(f"[FAIL] {d['prompt'][:40]!r:44s} {why}")
+
+
 data = json.load(open(f"{FIX}/parity_set.json"))
 npass = 0
 for i, d in enumerate(data):
     ids = ",".join(map(str, d["tokens"]))
-    r = subprocess.run(["build/dump_logits", ids, f"/tmp/ours_lg_{i}.bin"],
-                       capture_output=True, text=True, timeout=300, env=env)
-    am_line = next(l for l in r.stdout.splitlines() if l.startswith("ARGMAX"))
-    parts = am_line.split()
+    try:
+        r = subprocess.run(["build/dump_logits", ids, f"/tmp/ours_lg_{i}.bin"],
+                           capture_output=True, text=True, timeout=300, env=env)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        fail(i, d, f"engine did not run: {exc}")
+        continue
+    if r.returncode != 0:
+        tail = "\n".join(r.stderr.splitlines()[-5:]) or "(no stderr)"
+        hint = ("build/dump_logits missing? build first"
+                if not os.path.exists("build/dump_logits")
+                else "GPU or driver issue?")
+        fail(i, d, f"exit={r.returncode}\n  stderr tail:\n{tail}\n  hint: {hint}")
+        continue
+    am_lines = [l for l in r.stdout.splitlines() if l.startswith("ARGMAX")]
+    if not am_lines:
+        tail = "\n".join(r.stderr.splitlines()[-5:]) or "(no stderr)"
+        hint = ("build/dump_logits missing? build first"
+                if not os.path.exists("build/dump_logits")
+                else "GPU or driver issue?")
+        fail(i, d, f"no ARGMAX line\n  stderr tail:\n{tail}\n  hint: {hint}")
+        continue
+    parts = am_lines[0].split()
     ours_am, ours_v = int(parts[1]), float(parts[2])
     ref = np.fromfile(f"{FIX}/oracle_lg_{i}.bin", dtype="<f4")
-    ours = np.fromfile(f"/tmp/ours_lg_{i}.bin", dtype="<f4")[:len(ref)]
+    if not os.path.exists(f"/tmp/ours_lg_{i}.bin"):
+        fail(i, d, "no logits dump written by engine")
+        continue
+    ours_full = np.fromfile(f"/tmp/ours_lg_{i}.bin", dtype="<f4")
+    if len(ours_full) < len(ref):
+        fail(i, d, f"vocab-size mismatch: ours={len(ours_full)} ref={len(ref)} "
+                   f"(oracle vocab {len(ref)} vs engine vocab {len(ours_full)})")
+        continue
+    ours = ours_full[:len(ref)]
     med = float(np.median(np.abs(ours - ref)))
     am_d = abs(ours_v - d["oracle_val"])
     top1_ok = ours_am == d["oracle_argmax"]
