@@ -118,6 +118,14 @@ typedef struct {
 } BlockQ8_0;
 
 // LM head over q8_0 weights (output.weight in some GGUF conversions).
+// V2: vectorized weight streaming. Row stride is nb*34 bytes; for K=896
+// (nb=28) that is 952 bytes = 4-byte aligned, so the whole row can be
+// viewed as an array of uint32 words. A block's qs payload starts at byte
+// 34*b+2, which is 4-byte aligned only for odd b, so even-b blocks merge
+// two adjacent aligned words with __byte_perm. When merging, one extra
+// trailing word is touched (next block's scale) - in-row for every block
+// except possibly the last; nb even guarantees the last block is odd-b
+// (aligned path), so no out-of-row access. Requires nb even.
 __global__ void k_logits_q8_0(const BlockQ8_0 *__restrict__ W,
                               const float *__restrict__ x,
                               float *__restrict__ logits,
@@ -126,15 +134,26 @@ __global__ void k_logits_q8_0(const BlockQ8_0 *__restrict__ W,
     if (v >= vocab) return;
     const int lane = threadIdx.x;
     const int nb = K / 32;
-    const BlockQ8_0 *rowW = W + (long)v * nb;
+    const uint32_t *roww = (const uint32_t *)((const char *)W + (long)v * nb * 34);
     float sum = 0.0f;
     for (int b = lane; b < nb; b += 32) {
-        BlockQ8_0 blk = rowW[b];
-        const float d = __half2float(blk.d);
-        const float *xb = x + b * 32;
+        const int wsc = (34 * b) >> 2;                 // word holding blk.d
+        const unsigned short d16 = (unsigned short)
+            (((34 * b) & 2) ? (roww[wsc] >> 16) : (roww[wsc] & 0xFFFFu));
+        const float d = __half2float(__ushort_as_half(d16));
+        const int a0 = (34 * b + 2) >> 2;              // first qs word
+        const int sh  = (34 * b + 2) & 2;              // 2 => misaligned merge
+        const float4 *x4 = (const float4 *)(x + b * 32);
 #pragma unroll
-        for (int i = 0; i < 32; i++)
-            sum += ((float)blk.qs[i]) * d * xb[i];
+        for (int k = 0; k < 8; k++) {
+            const uint32_t lo = roww[a0 + k];
+            const uint32_t vv = sh ? __byte_perm(lo, roww[a0 + k + 1], 0x5432) : lo;
+            const float4 xv = x4[k];
+            sum += ((float)((int)(vv << 24) >> 24)) * d * xv.x;
+            sum += ((float)((int)(vv << 16) >> 24)) * d * xv.y;
+            sum += ((float)((int)(vv <<  8) >> 24)) * d * xv.z;
+            sum += ((float)((int)(vv       ) >> 24)) * d * xv.w;
+        }
     }
     sum = warp_reduce_sum(sum);
     if (lane == 0) logits[v] = sum;
