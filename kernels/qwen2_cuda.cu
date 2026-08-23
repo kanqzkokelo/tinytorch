@@ -195,6 +195,33 @@ __global__ void k_argmax_final(const float *__restrict__ bvals, const int *__res
     *out = bi;
 }
 
+/* Dynamic-token embedding for cudaGraph replay: the token id is read from
+ * device memory, so one captured graph can decode any token. Body is a copy
+ * of k_embed_q4_0 (kernels/gemv_q4_cuda.cu) — cross-TU kernel launches would
+ * need relocatable device code, so it is inlined here instead. */
+__global__ void k_embed_q4_0_dyn(const BlockQ4_0 *__restrict__ W, const int *__restrict__ d_tok,
+                                 float *__restrict__ dx, int dim) {
+    const int tok = *d_tok;
+    const int b = threadIdx.x + blockIdx.x * blockDim.x;
+    const int nb = dim / 32;
+    if (b >= nb) return;
+    BlockQ4_0 blk = W[(long)tok * nb + b];
+    /* NOTE: loader_gguf.h stores d as uint16_t raw fp16 bits — must
+     * bit-reinterpret, NOT integer-convert (implicit uint16_t→__half
+     * conversion silently produces huge scales). */
+    const float d = __half2float(*(const __half *)&blk.d);
+    float *out = dx + b * 32;
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+        out[i]      = ((blk.qs[i] & 0x0F) - 8) * d;
+        out[i + 16] = ((blk.qs[i] >> 4) - 8) * d;
+    }
+}
+
+/* Position increment INSIDE the captured region: each replay advances the
+ * device position scalar exactly once (host mirror does e->pos++ in lockstep). */
+__global__ void k_pos_inc(int *d_pos) { (*d_pos)++; }
+
 /* ---------------- host-side engine ---------------- */
 
 #define MAX_LAYERS 128
@@ -223,6 +250,13 @@ struct Qwen2Engine {
     int *d_pos;
     /* argmax scratch */
     float *d_bvals; int *d_bidxs, *d_out;
+    /* cudaGraph replay of the decode step (M6.3) */
+    cudaGraphExec_t graph_exec;   /* instantiated decode-step graph */
+    int graph_ready;              /* nonzero once capture+instantiate succeeded */
+    int no_graph;                 /* TT_NO_GRAPH=1: eager path forever */
+    int *d_next_tok;              /* device token fed by the next replay */
+    int *h_sampled;               /* pinned staging for async D2H argmax result */
+    int pending_tok;              /* sampled token not yet fed through layers */
     int pos;
     cudaStream_t stream;
 };
@@ -349,6 +383,13 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     cudaMalloc(&e->d_bvals, nb * sizeof(float));
     cudaMalloc(&e->d_bidxs, nb * sizeof(int));
     cudaMalloc(&e->d_out, sizeof(int));
+    /* graph replay state */
+    e->graph_exec = NULL;
+    e->graph_ready = 0;
+    e->no_graph = getenv("TT_NO_GRAPH") ? 1 : 0;
+    e->pending_tok = -1;
+    cudaMalloc(&e->d_next_tok, sizeof(int));
+    cudaHostAlloc(&e->h_sampled, sizeof(int), cudaHostAllocDefault);
     return e;
 }
 
@@ -361,12 +402,18 @@ void qwen2_engine_free(Qwen2Engine *e) {
     cudaFree(e->d_logits); cudaFree(e->d_kc); cudaFree(e->d_vc);
     cudaFree(e->d_k_stage); cudaFree(e->d_v_stage); cudaFree(e->d_pos);
     cudaFree(e->d_bvals); cudaFree(e->d_bidxs); cudaFree(e->d_out);
+    cudaFree(e->d_next_tok);
+    if (e->h_sampled) cudaFreeHost(e->h_sampled);
+    if (e->graph_exec) cudaGraphExecDestroy(e->graph_exec);
     /* NOTE: per-weight cudaFree calls are intentionally not tracked here; they are
      * leaked until process exit by design (engine lifetime == process lifetime).
      * Tracked as known limitation in PLAN_M6 M6.1. */
     if (e->stream) cudaStreamDestroy(e->stream);
     free(e);
 }
+
+/* 0 while running eagerly; 1 while a cudaStream capture is in flight. */
+static int g_capturing = 0;
 
 static int forward_layers(Qwen2Engine *e) {
     const TTConfig *c = &e->cfg;
@@ -444,8 +491,10 @@ static int forward_layers(Qwen2Engine *e) {
 
         {
             static const char *dump_env = NULL;
+            /* never dump while a stream capture is in progress: the blocking
+             * D2H copies below would be illegal inside a captured region */
             if (!dump_env) dump_env = getenv("TT_DUMP_LAYER");
-            if (dump_env && atoi(dump_env) == -100 - l) {
+            if (dump_env && !g_capturing && atoi(dump_env) == -100 - l) {
                 /* dump raw K cache for this layer: slots [0..pos] */
                 char fn[128];
                 snprintf(fn, sizeof(fn), "/tmp/eng_kcache_layer%d.bin", l);
@@ -459,7 +508,7 @@ static int forward_layers(Qwen2Engine *e) {
                     fprintf(stderr, "[qwen2-engine] dumped %s\n", fn);
                 }
             }
-            if (dump_env && atoi(dump_env) == l) {
+            if (dump_env && !g_capturing && atoi(dump_env) == l) {
                 const int tok_slot = e->pos - 1;
                 char fn[128];
                 snprintf(fn, sizeof(fn), "/tmp/eng_layer%d_tok%d.bin", l, tok_slot);
@@ -494,6 +543,13 @@ static int advance(Qwen2Engine *e, int tok) {
 int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
     if (!e || !toks || n <= 0) return -1;
     if (e->pos + n > e->cfg.max_ctx) return -2;          /* context overflow */
+    /* Graph replay leaves the most recently SAMPLED token unfed (the caller
+     * stopped asking). Flush it through the layers so the KV cache matches
+     * the eager state machine before the new prompt lands. */
+    if (e->graph_ready && e->pending_tok >= 0) {
+        if (advance(e, e->pending_tok)) return -3;
+        e->pending_tok = -1;
+    }
     /* resync device position scalar before any forward work */
     cudaMemcpyAsync(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice, e->stream);
     for (int i = 0; i < n; i++) {
@@ -504,11 +560,11 @@ int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
     return 0;
 }
 
-int qwen2_engine_next(Qwen2Engine *e) {
+/* Eager sampling tail shared by all paths: final rmsnorm -> logits ->
+ * greedy argmax -> D2H sync. Returns token id, or negative on error.
+ * d_logits stays valid afterwards (dump_logits relies on this). */
+static int sample_eager(Qwen2Engine *e) {
     const TTConfig *c = &e->cfg;
-    if (!e || e->pos >= c->max_ctx - 1) return -2;
-
-    /* final norm -> logits -> greedy argmax ; exactly one sync per token */
     k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
         e->d_x, e->d_out_norm, e->d_xn, c->dim, c->rms_eps);
     int rc = tt_logits_dispatch(e->d_out_w, e->out_is_q8, e->d_xn,
@@ -522,9 +578,135 @@ int qwen2_engine_next(Qwen2Engine *e) {
     int id = 0;
     cudaMemcpyAsync(&id, e->d_out, sizeof(int), cudaMemcpyDeviceToHost, e->stream);
     cudaStreamSynchronize(e->stream);
-    if (id < 0 || id >= c->vocab) return -3;
+    return id;
+}
 
-    if (advance(e, id)) return -4;                       /* feed back for next step */
+/* Capture the whole decode step into a single-launch graph:
+ *   embed(d_next_tok) -> forward_layers -> rmsnorm -> logits -> argmax -> pos_inc
+ * All nodes on e->stream. The captured embed reads whatever token sits in
+ * d_next_tok at REPLAY time (set per-call via async H2D before the launch).
+ * On success sets graph_ready and returns 0; leaves graph_ready=0 otherwise. */
+static int qwen2_engine_graph_capture(Qwen2Engine *e) {
+    const TTConfig *c = &e->cfg;
+
+    /* dummy valid token before capture begins (plain, uncaptured copy) */
+    const int dummy = e->pending_tok >= 0 ? e->pending_tok : 0;
+    cudaMemcpy(e->d_next_tok, &dummy, sizeof(int), cudaMemcpyHostToDevice);
+    cudaStreamSynchronize(e->stream);
+
+    /* warm up graph-only kernels eagerly (lazy module load must not happen
+     * implicitly during capture). Save/restore engine state they touch. */
+    {
+        const int threads = c->dim / 32;
+        float *xsave = NULL;
+        cudaMalloc(&xsave, c->dim * sizeof(float));
+        cudaMemcpy(xsave, e->d_x, c->dim * sizeof(float), cudaMemcpyDeviceToHost);
+        const int pos_before = e->pos;
+        k_embed_q4_0_dyn<<<(threads + 255) / 256, 256, 0, e->stream>>>(
+            e->d_embd, e->d_next_tok, e->d_x, c->dim);
+        k_pos_inc<<<1, 1, 0, e->stream>>>(e->d_pos);
+        cudaStreamSynchronize(e->stream);
+        /* restore state the warmup perturbed */
+        cudaMemcpy(e->d_x, xsave, c->dim * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(e->d_pos, &pos_before, sizeof(int), cudaMemcpyHostToDevice);
+        cudaFree(xsave);
+    }
+
+    g_capturing = 1;
+    if (cudaStreamBeginCapture(e->stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        g_capturing = 0;
+        return -1;
+    }
+
+    {   /* dynamic-token embedding (device-side id) */
+        const int threads = c->dim / 32;
+        k_embed_q4_0_dyn<<<(threads + 255) / 256, 256, 0, e->stream>>>(
+            e->d_embd, e->d_next_tok, e->d_x, c->dim);
+    }
+    const int frc = forward_layers(e);          /* all layers at *d_pos */
+    k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
+        e->d_x, e->d_out_norm, e->d_xn, c->dim, c->rms_eps);
+    const int lrc = tt_logits_dispatch(e->d_out_w, e->out_is_q8, e->d_xn,
+                                       e->d_logits, c->vocab, c->dim, e->stream);
+    const int nb = 256;
+    k_argmax_partial<<<nb, 128, 0, e->stream>>>(e->d_logits, c->vocab, e->d_bvals, e->d_bidxs);
+    k_argmax_final<<<1, 1, 0, e->stream>>>(e->d_bvals, e->d_bidxs, nb, e->d_out);
+    k_pos_inc<<<1, 1, 0, e->stream>>>(e->d_pos);
+
+    cudaGraph_t graph = NULL;
+    const cudaError_t enderr = cudaStreamEndCapture(e->stream, &graph);
+    g_capturing = 0;
+    if (enderr != cudaSuccess || !graph || frc || lrc) {
+        if (graph) cudaGraphDestroy(graph);
+        return -1;
+    }
+
+    /* CUDA 12 signature: flags as unsigned long long (cuda_runtime_api.h).
+     * The legacy 5-arg form is an inline wrapper in cuda_runtime.h that
+     * delegates to this same 3-arg entry. */
+    const cudaError_t ie = cudaGraphInstantiate(&e->graph_exec, graph, 0);
+    cudaGraphDestroy(graph);
+    if (ie != cudaSuccess || !e->graph_exec) {
+        e->graph_exec = NULL;
+        return -1;
+    }
+    e->graph_ready = 1;
+    fprintf(stderr, "[qwen2-engine] decode-step graph captured (cudaGraph replay ON)\n");
+    return 0;
+}
+
+int qwen2_engine_next(Qwen2Engine *e) {
+    const TTConfig *c = &e->cfg;
+    if (!e || e->pos >= c->max_ctx - 1) return -2;
+
+    /* TT_NO_GRAPH=1: legacy eager path forever (sample AND advance). */
+    if (!e->graph_ready && !e->no_graph) {
+        /* First call after prefill: eager sample WITHOUT advancing — x still
+         * holds the hidden state of the last fed token, exactly like the eager
+         * path's sampling stage. Also warms up norm/logits/argmax kernels. */
+        const int id = sample_eager(e);
+        if (id < 0 || id >= c->vocab) return id < 0 ? id : -3;
+        e->pending_tok = id;
+        if (qwen2_engine_graph_capture(e) == 0)
+            return id;               /* graph will feed `id` on next call */
+        fprintf(stderr, "[qwen2-engine] graph capture failed — falling back to eager permanently\n");
+        e->no_graph = 1;
+        e->pending_tok = -1;
+        if (advance(e, id)) return -4;   /* exact legacy behavior */
+        return id;
+    }
+
+    if (e->no_graph) {
+        const int id = sample_eager(e);
+        if (id < 0 || id >= c->vocab) return id < 0 ? id : -3;
+        if (advance(e, id)) return -4;
+        return id;
+    }
+
+    if (e->pending_tok < 0) {
+        /* Freshly after a prefill that flushed the old pending: x holds the
+         * hidden state of the last fed token — eager sample WITHOUT advancing,
+         * stash result as the token the next replay will feed. */
+        const int id = sample_eager(e);
+        if (id < 0 || id >= c->vocab) return id < 0 ? id : -3;
+        e->pending_tok = id;
+        return id;
+    }
+
+    /* Graph replay: feed pending_tok through the full step, sample the NEXT
+     * token, advance d_pos exactly once inside the graph. Returned sequence
+     * is identical to eager: s1 (first call above), then s2, s3, ... */
+    cudaMemcpyAsync(e->d_next_tok, &e->pending_tok, sizeof(int),
+                    cudaMemcpyHostToDevice, e->stream);   /* same stream, before launch */
+    cudaGraphLaunch(e->graph_exec, e->stream);
+    cudaMemcpyAsync(e->h_sampled, e->d_out, sizeof(int),
+                    cudaMemcpyDeviceToHost, e->stream);
+    cudaStreamSynchronize(e->stream);                     /* read h_sampled only after sync */
+
+    const int id = e->h_sampled[0];
+    if (id < 0 || id >= c->vocab) return -3;
+    e->pos++;                /* host mirror of k_pos_inc (bookkeeping/guards) */
+    e->pending_tok = id;     /* already sampled internally — one step ahead */
     return id;
 }
 

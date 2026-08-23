@@ -76,8 +76,6 @@ $(BUILD)/chat_llm_gpu: examples/chat_llm_gpu.c src/loader_gguf.c src/tokenizer_b
 
 chat_llm_gpu: $(BUILD)/chat_llm_gpu
 
-.PHONY: run_llm_gpu chat_llm_gpu
-
 # Oracle logits tool against the vendored llama.cpp build (parity fixtures).
 $(BUILD)/oracle_logits: tools/oracle_logits.c | $(BUILD)
 	gcc -O2 -Wno-deprecated-declarations \
@@ -88,4 +86,16 @@ $(BUILD)/oracle_logits: tools/oracle_logits.c | $(BUILD)
 
 oracle_logits: $(BUILD)/oracle_logits
 
-.PHONY: oracle_logits
+.PHONY: run_llm_gpu chat_llm_gpu
+
+$(BUILD)/dump_logits: tools/dump_logits.c src/loader_gguf.c kernels/gemv_q4_cuda.cu kernels/qwen2_cuda.cu | $(BUILD)
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
+	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
+	  -o $@ \
+	  tools/dump_logits.c src/loader_gguf.c kernels/gemv_q4_cuda.cu kernels/qwen2_cuda.cu \
+	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
+
+dump_logits: $(BUILD)/dump_logits
+
+.PHONY: dump_logits
