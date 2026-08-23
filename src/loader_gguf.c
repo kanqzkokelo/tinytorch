@@ -128,12 +128,16 @@ GGUFModel *gguf_load(const char *filepath) {
             model->max_seq_len = *(const int32_t *)p;
         } else if (strcmp(key, "llama.attention.layer_norm_rms_epsilon") == 0 || strcmp(key, "qwen2.attention.layer_norm_rms_epsilon") == 0) {
             model->rms_norm_eps = *(const float *)p;
+        } else if (strcmp(key, "llama.rope.freq_base") == 0 || strcmp(key, "qwen2.rope.freq_base") == 0 ||
+                   strcmp(key, "llama.rope_freq_base") == 0) {
+            model->rope_freq_base = *(const float *)p;
         }
 
         skip_kv_value(&p, value_type);
     }
 
     if (model->rms_norm_eps == 0.0f) model->rms_norm_eps = 1e-6f;
+    if (model->rope_freq_base == 0.0f) model->rope_freq_base = 10000.0f;
     if (model->n_kv_heads == 0) model->n_kv_heads = model->n_heads;
     if (model->max_seq_len == 0) model->max_seq_len = 2048;
 
@@ -157,6 +161,7 @@ GGUFModel *gguf_load(const char *filepath) {
         if (t->type == GGUF_TYPE_F32) t->size_bytes = numel * 4;
         else if (t->type == GGUF_TYPE_F16) t->size_bytes = numel * 2;
         else if (t->type == GGUF_TYPE_Q4_0) t->size_bytes = (numel / 32) * sizeof(BlockQ4_0);
+        else if (t->type == GGUF_TYPE_Q8_0) t->size_bytes = (numel / 32) * 34; /* fp16 d + 32 i8 */
         else t->size_bytes = numel;
     }
 

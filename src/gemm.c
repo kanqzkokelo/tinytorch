@@ -229,7 +229,9 @@ static void micro_kernel(const float *A, const float *bp0, float *C,
           [a3] "+r"(a3), [a4] "+r"(a4), [a5] "+r"(a5), [k] "+r"(k),
           [ix] "=&r"(ix), [c] "+r"(C)
         : [cs] "r"((long)ldc * 4)
-        : "memory");
+        : "%ymm0", "%ymm1", "%ymm2", "%ymm3", "%ymm4", "%ymm5", "%ymm6",
+          "%ymm7", "%ymm8", "%ymm9", "%ymm10", "%ymm11", "%ymm12", "%ymm13",
+          "%ymm14", "memory", "cc");
     } else {
         __asm__ __volatile__(
             "vmovups (%[c]), %%ymm0\n\t"
@@ -392,7 +394,9 @@ static void micro_kernel(const float *A, const float *bp0, float *C,
               [a3] "+r"(a3), [a4] "+r"(a4), [a5] "+r"(a5), [k] "+r"(k),
               [ix] "=&r"(ix), [c] "+r"(C)
             : [cs] "r"((long)ldc * 4)
-            : "memory");
+            : "%ymm0", "%ymm1", "%ymm2", "%ymm3", "%ymm4", "%ymm5", "%ymm6",
+          "%ymm7", "%ymm8", "%ymm9", "%ymm10", "%ymm11", "%ymm12", "%ymm13",
+          "%ymm14", "memory", "cc");
     }
 }
 

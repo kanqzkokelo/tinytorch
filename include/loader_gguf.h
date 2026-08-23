@@ -53,7 +53,6 @@ typedef struct {
 
 GGUFModel *gguf_load(const char *filepath);
 GGUFTensor *gguf_get_tensor(GGUFModel *model, const char *name);
-int gguf_upload_to_gpu(GGUFModel *model);
 void gguf_free(GGUFModel *model);
 
 #ifdef __cplusplus
