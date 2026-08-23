@@ -77,3 +77,15 @@ $(BUILD)/chat_llm_gpu: examples/chat_llm_gpu.c src/loader_gguf.c src/tokenizer_b
 chat_llm_gpu: $(BUILD)/chat_llm_gpu
 
 .PHONY: run_llm_gpu chat_llm_gpu
+
+# Oracle logits tool against the vendored llama.cpp build (parity fixtures).
+$(BUILD)/oracle_logits: tools/oracle_logits.c | $(BUILD)
+	gcc -O2 -Wno-deprecated-declarations \
+	  -I oracle/llama.cpp/include -I oracle/llama.cpp/ggml/include \
+	  -o $@ tools/oracle_logits.c \
+	  -L oracle/llama.cpp/build/bin -lllama \
+	  -Wl,-rpath=$(CURDIR)/oracle/llama.cpp/build/bin
+
+oracle_logits: $(BUILD)/oracle_logits
+
+.PHONY: oracle_logits

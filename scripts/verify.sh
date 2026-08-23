@@ -14,6 +14,7 @@ run() { # run <name> <cmd...>
 }
 
 case "$GATE" in
+  m61) run "m6-logits-parity" python3 tests/gate_m6_logit_parity.py ;;
   m0)  run "unit-vs-numpy"   python3 tests/test_ops.py ;;
   m1)  run "gradcheck"       python3 tests/test_grad.py
        run "mnist-mlp"       python3 tests/gate_mnist_mlp.py ;;

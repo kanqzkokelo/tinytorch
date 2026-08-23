@@ -1,0 +1,101 @@
+[
+ {
+  "prompt": "The capital of France is",
+  "tokens": [
+   785,
+   6722,
+   315,
+   9625,
+   374
+  ],
+  "oracle_argmax": 12095,
+  "oracle_val": 17.4606
+ },
+ {
+  "prompt": "Water boils at a temperature of",
+  "tokens": [
+   28253,
+   88955,
+   518,
+   264,
+   9315,
+   315
+  ],
+  "oracle_argmax": 220,
+  "oracle_val": 21.2021
+ },
+ {
+  "prompt": "My name is Maria. I like to eat",
+  "tokens": [
+   5050,
+   829,
+   374,
+   23016,
+   13,
+   358,
+   1075,
+   311,
+   8180
+  ],
+  "oracle_argmax": 9853,
+  "oracle_val": 15.5118
+ },
+ {
+  "prompt": "The three primary colors are red,",
+  "tokens": [
+   785,
+   2326,
+   6028,
+   7987,
+   525,
+   2518,
+   11
+  ],
+  "oracle_argmax": 6176,
+  "oracle_val": 23.0117
+ },
+ {
+  "prompt": "Once upon a time in a distant kingdom",
+  "tokens": [
+   12522,
+   5193,
+   264,
+   882,
+   304,
+   264,
+   28727,
+   25079
+  ],
+  "oracle_argmax": 11,
+  "oracle_val": 19.6632
+ },
+ {
+  "prompt": "The largest planet in the solar system is",
+  "tokens": [
+   785,
+   7772,
+   11580,
+   304,
+   279,
+   12941,
+   1849,
+   374
+  ],
+  "oracle_argmax": 1304,
+  "oracle_val": 16.3142
+ },
+ {
+  "prompt": "Photosynthesis is the process by which",
+  "tokens": [
+   31772,
+   73667,
+   374,
+   279,
+   1882,
+   553,
+   892
+  ],
+  "oracle_argmax": 10779,
+  "oracle_val": 19.6608
+ }
+]
