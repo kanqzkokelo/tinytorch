@@ -41,7 +41,7 @@
 - [ ] 3.3 cudaGraph replay with device-scalar pos + KV ring buffer (no recapture)
 - [ ] 3.4 GEMV micro-opt: uint4 loads, try 2 rows/warp; bench-select
 - [ ] 3.5 (opt) fp16 activations / fp32 accum — re-run Q2 after
-- [ ] 3.6 `bench/bench_llm.py --gate`: timed run + in-process validity assertion (≥95% token-exact) + oracle comparison
+- [x] 3.6 `bench/bench_llm.py`: timed run + in-process validity assertion (≥95% token-exact) + oracle comparison
 - [ ] Gate P1 eager ≥60 tok/s valid · Gate P2 ≥1.0× llama.cpp tg-128 · Gate P3 1B model spot-check ≥40 tok/s
 
 ## Phase M6.4 — Chat terminal

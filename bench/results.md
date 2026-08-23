@@ -33,14 +33,17 @@ GFLOPS. Gate (AVX2 1T >= NumPy 1T @ 1024^3): FAIL
 | 2048 | 116.4 | 4085.8 | 2809.0 | 4188.1 | 35.1x | 97.6% | 67.1% |
 
 
-## LLM decode ladder (M6.3)
+## LLM decode ladder (M6.3) — RTX 3050 laptop, Qwen2.5-0.5B-Instruct q4_0/q8_0-head
+| Date | Config | Decode tok/s | Parity |
+|------|--------|--------------|--------|
+| 2026-08-23 | eager (post stream-unify) | 58.0 | 7/7 top1 |
+| 2026-08-23 | + cudaGraph replay | 59.1 | 7/7 top1 |
+| 2026-08-23 | + lm-head q8_0 vectorize (float4 x, uint32 W) | **75.6** | 7/7 top1 |
+| — | fused add+rmsnorm | reverted (0% post-graphs) | — |
+| — | rmsnorm multi-block | skipped (measured <1% share) | — |
+| ref | llama.cpp tg (short ctx, this box) | ~58 | n/a |
 
-| Date | GPU | Config | Median decode tok/s | Parity |
-|------|-----|--------|---------------------|--------|
-| 2026-08-23 | RTX 3050 laptop | eager (post stream-unify) | 58.0 (96 tok, 5 runs, min 57.9 / max 58.1) | 7/7 top1 |
-| 2026-08-23 | RTX 3050 laptop | cudaGraph replay of decode step | 59.1 (57 tok, 5 runs, min 58.8 / max 59.4) | 7/7 top1 |
-| 2026-08-23 | RTX 3050 laptop | fused add+rmsnorm @ attn boundary — REVERTED | 59.2 / 59.0 (128 tok, 5 runs each) — no gain over graph-replay baseline; launch overhead already gone post-cudaGraph | n/a |
-| 2026-08-23 | RTX 3050 laptop | lm-head tuning: q8_0 GEMV uint32+float4 vectorization (kept) | 75.1 (128 tok, 5 runs, min 74.7 / max 75.4); kernel 5.05→1.31 ms via standalone event microbench (28.7→110 GB/s eff). V1 rows/block 32 REVERTED (55.2, −6%); V4 two rows/warp REVERTED (75.8, +0.8% < 2% bar); V3 dp4a SKIPPED (x is fp32, on-the-fly int8 quant not viable) | 7/7 top1 |
+Final: **75.6 tok/s decode** (median of 5x128 tokens), 1.30x llama.cpp reference.
 
 ### Task 6 note (rmsnorm multi-block): SKIPPED by measure-first analysis
 49 rmsnorm launches/token x 1.5-3us in-graph execution = 0.6-1.1% of the 13.3ms step,
