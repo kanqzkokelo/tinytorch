@@ -21,8 +21,13 @@ rates = []
 for run in range(args.runs):
     r = subprocess.run(["build/run_llm_gpu", args.prompt, str(args.tokens)],
                        capture_output=True, text=True, timeout=600, env=env)
+    if r.returncode != 0:
+        print(f"run {run}: engine exit {r.returncode}\n{r.stderr[-300:]}")
+        sys.exit(1)
     stats = [l for l in r.stdout.splitlines() if l.startswith("STATS")]
-    assert stats, f"run {run}: no STATS line\n{r.stdout[-500:]}"
+    if not stats:
+        print(f"run {run}: no STATS line\n{r.stdout[-500:]}")
+        sys.exit(1)
     fields = dict(kv.split("=", 1) for kv in stats[0].split()[1:])
     tokens_actual = int(fields["tokens"])
     decode_us = float(fields["decode_us"])
