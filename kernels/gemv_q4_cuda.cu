@@ -164,41 +164,43 @@ static void gemv_dims(int M, dim3 *grid, dim3 *block) {
     grid->x = (M + block->y - 1) / block->y; grid->y = 1; grid->z = 1;
 }
 
-int tt_gemv_q4_0(const void *dW, const float *dx, float *dy, int M, int K) {
+/* stream-aware launchers: keeps the whole step on one non-blocking stream */
+int tt_gemv_q4_0(const void *dW, const float *dx, float *dy, int M, int K,
+                 cudaStream_t stream) {
     dim3 g, b; gemv_dims(M, &g, &b);
-    k_gemv_q4_0<<<g, b>>>((const BlockQ4_0 *)dW, dx, dy, M, K);
+    k_gemv_q4_0<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW, dx, dy, M, K);
     return (int)cudaGetLastError();
 }
 
 int tt_swiglu_q4_0(const void *dGate, const void *dUp, const float *dx,
-                   float *dh, int M, int K) {
+                   float *dh, int M, int K, cudaStream_t stream) {
     dim3 g, b; gemv_dims(M, &g, &b);
-    k_fused_swiglu_q4_0<<<g, b>>>((const BlockQ4_0 *)dGate, (const BlockQ4_0 *)dUp,
-                                  dx, dh, M, K);
+    k_fused_swiglu_q4_0<<<g, b, 0, stream>>>((const BlockQ4_0 *)dGate, (const BlockQ4_0 *)dUp,
+                                             dx, dh, M, K);
     return (int)cudaGetLastError();
 }
 
 int tt_logits_q4_0(const void *dW, const float *dx, float *dlogits,
-                   int vocab, int K) {
+                   int vocab, int K, cudaStream_t stream) {
     dim3 g, b; gemv_dims(vocab, &g, &b);
-    k_logits_q4_0<<<g, b>>>((const BlockQ4_0 *)dW, dx, dlogits, vocab, K);
+    k_logits_q4_0<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW, dx, dlogits, vocab, K);
     return (int)cudaGetLastError();
 }
 
-int tt_embed_q4_0(const void *dW, int tok, float *dx, int dim) {
+int tt_embed_q4_0(const void *dW, int tok, float *dx, int dim, cudaStream_t stream) {
     const int threads = dim / 32;
-    k_embed_q4_0<<<(threads + 255) / 256, 256>>>((const BlockQ4_0 *)dW, tok, dx, dim);
+    k_embed_q4_0<<<(threads + 255) / 256, 256, 0, stream>>>((const BlockQ4_0 *)dW, tok, dx, dim);
     return (int)cudaGetLastError();
 }
 
 /* dtype-dispatching logits projection: is_q8 selects the q8_0 kernel */
 int tt_logits_dispatch(const void *dW, int is_q8, const float *dx,
-                       float *dlogits, int vocab, int K) {
+                       float *dlogits, int vocab, int K, cudaStream_t stream) {
     dim3 g, b; gemv_dims(vocab, &g, &b);
     if (is_q8)
-        k_logits_q8_0<<<g, b>>>((const BlockQ8_0 *)dW, dx, dlogits, vocab, K);
+        k_logits_q8_0<<<g, b, 0, stream>>>((const BlockQ8_0 *)dW, dx, dlogits, vocab, K);
     else
-        k_logits_q4_0<<<g, b>>>((const BlockQ4_0 *)dW, dx, dlogits, vocab, K);
+        k_logits_q4_0<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW, dx, dlogits, vocab, K);
     return (int)cudaGetLastError();
 }
 

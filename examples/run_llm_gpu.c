@@ -47,13 +47,14 @@ int main(int argc, char **argv) {
     printf("[run] prompt: %d tokens\n", n_prompt);
     if (n_prompt <= 0) return 1;
 
-    struct timespec t0, t1;
+    struct timespec t0, t1, tp0, tp1;
     AsyncPrinter *ap = async_printer_start();
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    clock_gettime(CLOCK_MONOTONIC, &tp0);
 
     if (qwen2_engine_prefill(eng, prompt_tokens, n_prompt)) {
         fprintf(stderr, "prefill failed\n"); return 1;
     }
+    clock_gettime(CLOCK_MONOTONIC, &t0);   /* decode-only window starts here */
 
     int gen_count = 0;
     for (int s = 0; s < target_tokens && qwen2_engine_pos(eng) < MAX_CTX - 1; s++) {
@@ -68,9 +69,10 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t1);
     async_printer_stop_and_flush(ap);
 
-    const double sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
-    printf("\"\n[gen: %d tokens | %.1f tok/s | prefill+decode, greedy]\n",
-           gen_count, gen_count / sec);
+    const double dec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+    const double tot = (t1.tv_sec - tp0.tv_sec) + (t1.tv_nsec - tp0.tv_nsec) * 1e-9;
+    printf("\"\n[gen: %d tokens | decode %.1f tok/s | incl prefill %.1f tok/s | greedy]\n",
+           gen_count, gen_count / dec, gen_count / tot);
 
     qwen2_engine_free(eng);
     bpe_tokenizer_free(tok);

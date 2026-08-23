@@ -34,14 +34,16 @@
 
 /* launchers implemented in kernels/gemv_q4_cuda.cu */
 extern "C" {
-int tt_gemv_q4_0(const void *dW, const float *dx, float *dy, int M, int K);
+typedef struct CUstream_st *cudaStream_t;
+int tt_gemv_q4_0(const void *dW, const float *dx, float *dy, int M, int K,
+                 cudaStream_t stream);
 int tt_swiglu_q4_0(const void *dGate, const void *dUp, const float *dx,
-                   float *dh, int M, int K);
+                   float *dh, int M, int K, cudaStream_t stream);
 int tt_logits_q4_0(const void *dW, const float *dx, float *dlogits,
-                   int vocab, int K);
+                   int vocab, int K, cudaStream_t stream);
 int tt_logits_dispatch(const void *dW, int is_q8, const float *dx,
-                       float *dlogits, int vocab, int K);
-int tt_embed_q4_0(const void *dW, int tok, float *dx, int dim);
+                       float *dlogits, int vocab, int K, cudaStream_t stream);
+int tt_embed_q4_0(const void *dW, int tok, float *dx, int dim, cudaStream_t stream);
 }
 
 static size_t q4_bytes(long numel) { return (size_t)(numel / Q4_VALS_PER_BLOCK) * Q4_BYTES_PER_BLOCK; }
@@ -362,9 +364,9 @@ static int forward_layers(Qwen2Engine *e) {
             e->d_x, w->attn_norm, e->d_xn, c->dim, c->rms_eps);
 
         /* 2. projections: q -> d_q ; k,v -> KV cache slot pos */
-        tt_gemv_q4_0(w->q, e->d_xn, e->d_q, c->dim, c->dim);
-        tt_gemv_q4_0(w->k, e->d_xn, k_slot, c->n_kv_heads * HD, c->dim);
-        tt_gemv_q4_0(w->v, e->d_xn, v_slot, c->n_kv_heads * HD, c->dim);
+        tt_gemv_q4_0(w->q, e->d_xn, e->d_q, c->dim, c->dim, e->stream);
+        tt_gemv_q4_0(w->k, e->d_xn, k_slot, c->n_kv_heads * HD, c->dim, e->stream);
+        tt_gemv_q4_0(w->v, e->d_xn, v_slot, c->n_kv_heads * HD, c->dim, e->stream);
         /* QKV biases present in some GGUF conversions of Qwen2 (applied by
          * llama.cpp whenever the tensors exist). Optional by design. */
         const int kvdim = c->n_kv_heads * HD;
@@ -394,7 +396,7 @@ static int forward_layers(Qwen2Engine *e) {
             1.0f / sqrtf((float)HD));
 
         /* 5. Wo projection + residual: x += att @ Wo^T */
-        tt_gemv_q4_0(w->o, e->d_att, e->d_xn, c->dim, c->dim);
+        tt_gemv_q4_0(w->o, e->d_att, e->d_xn, c->dim, c->dim, e->stream);
         k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
 
         /* 6. ffn norm */
@@ -402,10 +404,10 @@ static int forward_layers(Qwen2Engine *e) {
             e->d_x, w->ffn_norm, e->d_xn, c->dim, c->rms_eps);
 
         /* 7. fused SwiGLU MLP */
-        tt_swiglu_q4_0(w->gate, w->up, e->d_xn, e->d_h, c->hidden_dim, c->dim);
+        tt_swiglu_q4_0(w->gate, w->up, e->d_xn, e->d_h, c->hidden_dim, c->dim, e->stream);
 
         /* 8. down projection + residual */
-        tt_gemv_q4_0(w->down, e->d_h, e->d_xn, c->dim, c->hidden_dim);
+        tt_gemv_q4_0(w->down, e->d_h, e->d_xn, c->dim, c->hidden_dim, e->stream);
         k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
 
         {
@@ -444,7 +446,7 @@ static int forward_layers(Qwen2Engine *e) {
 }
 
 static int embed_token(Qwen2Engine *e, int tok) {
-    return tt_embed_q4_0(e->d_embd, tok, e->d_x, e->cfg.dim);
+    return tt_embed_q4_0(e->d_embd, tok, e->d_x, e->cfg.dim, e->stream);
 }
 
 static int advance(Qwen2Engine *e, int tok) {
@@ -475,7 +477,7 @@ int qwen2_engine_next(Qwen2Engine *e) {
     k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
         e->d_x, e->d_out_norm, e->d_xn, c->dim, c->rms_eps);
     int rc = tt_logits_dispatch(e->d_out_w, e->out_is_q8, e->d_xn,
-                                e->d_logits, c->vocab, c->dim);
+                                e->d_logits, c->vocab, c->dim, e->stream);
     if (rc) return -1;
 
     const int nb = 256;
