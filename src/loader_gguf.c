@@ -1,0 +1,195 @@
+#include "loader_gguf.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+
+#define GGUF_MAGIC 0x46554747 // "GGUF"
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t tensor_count;
+    uint64_t metadata_kv_count;
+} GGUFHeader;
+
+static uint32_t read_u32(const uint8_t **p) {
+    uint32_t val;
+    memcpy(&val, *p, sizeof(val));
+    *p += sizeof(val);
+    return val;
+}
+
+static uint64_t read_u64(const uint8_t **p) {
+    uint64_t val;
+    memcpy(&val, *p, sizeof(val));
+    *p += sizeof(val);
+    return val;
+}
+
+static void read_string(const uint8_t **p, char *buf, size_t max_len) {
+    uint64_t len = read_u64(p);
+    size_t copy_len = len < max_len - 1 ? len : max_len - 1;
+    memcpy(buf, *p, copy_len);
+    buf[copy_len] = '\0';
+    *p += len;
+}
+
+static void skip_kv_value(const uint8_t **p, uint32_t type) {
+    switch (type) {
+        case 0: *p += 1; break; // UINT8
+        case 1: *p += 1; break; // INT8
+        case 2: *p += 2; break; // UINT16
+        case 3: *p += 2; break; // INT16
+        case 4: *p += 4; break; // UINT32
+        case 5: *p += 4; break; // INT32
+        case 6: *p += 4; break; // FLOAT32
+        case 7: *p += 1; break; // BOOL
+        case 8: { // STRING
+            uint64_t len = read_u64(p);
+            *p += len;
+            break;
+        }
+        case 9: { // ARRAY
+            uint32_t item_type = read_u32(p);
+            uint64_t array_len = read_u64(p);
+            for (uint64_t i = 0; i < array_len; i++) {
+                skip_kv_value(p, item_type);
+            }
+            break;
+        }
+        case 10: *p += 8; break; // UINT64
+        case 11: *p += 8; break; // INT64
+        case 12: *p += 8; break; // FLOAT64
+        default: break;
+    }
+}
+
+GGUFModel *gguf_load(const char *filepath) {
+    int fd = open(filepath, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "[GGUF] Failed to open file: %s\n", filepath);
+        return NULL;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return NULL;
+    }
+
+    size_t file_size = st.st_size;
+    void *mmap_addr = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+
+    if (mmap_addr == MAP_FAILED) {
+        fprintf(stderr, "[GGUF] mmap failed for %s\n", filepath);
+        return NULL;
+    }
+
+    const uint8_t *p = (const uint8_t *)mmap_addr;
+    GGUFHeader header;
+    header.magic = read_u32(&p);
+    header.version = read_u32(&p);
+    header.tensor_count = read_u64(&p);
+    header.metadata_kv_count = read_u64(&p);
+
+    if (header.magic != GGUF_MAGIC) {
+        fprintf(stderr, "[GGUF] Invalid magic header: 0x%08x\n", header.magic);
+        munmap(mmap_addr, file_size);
+        return NULL;
+    }
+
+    GGUFModel *model = (GGUFModel *)calloc(1, sizeof(GGUFModel));
+    model->mmap_addr = mmap_addr;
+    model->mmap_size = file_size;
+    model->tensor_count = (int)header.tensor_count;
+
+    // Parse KV metadata
+    char key[128];
+    for (uint64_t i = 0; i < header.metadata_kv_count; i++) {
+        read_string(&p, key, sizeof(key));
+        uint32_t value_type = read_u32(&p);
+
+        if (strcmp(key, "llama.embedding_length") == 0 || strcmp(key, "qwen2.embedding_length") == 0) {
+            model->dim = *(const int32_t *)p;
+        } else if (strcmp(key, "llama.feed_forward_length") == 0 || strcmp(key, "qwen2.feed_forward_length") == 0) {
+            model->hidden_dim = *(const int32_t *)p;
+        } else if (strcmp(key, "llama.block_count") == 0 || strcmp(key, "qwen2.block_count") == 0) {
+            model->n_layers = *(const int32_t *)p;
+        } else if (strcmp(key, "llama.attention.head_count") == 0 || strcmp(key, "qwen2.attention.head_count") == 0) {
+            model->n_heads = *(const int32_t *)p;
+        } else if (strcmp(key, "llama.attention.head_count_kv") == 0 || strcmp(key, "qwen2.attention.head_count_kv") == 0) {
+            model->n_kv_heads = *(const int32_t *)p;
+        } else if (strcmp(key, "llama.context_length") == 0 || strcmp(key, "qwen2.context_length") == 0) {
+            model->max_seq_len = *(const int32_t *)p;
+        } else if (strcmp(key, "llama.attention.layer_norm_rms_epsilon") == 0 || strcmp(key, "qwen2.attention.layer_norm_rms_epsilon") == 0) {
+            model->rms_norm_eps = *(const float *)p;
+        }
+
+        skip_kv_value(&p, value_type);
+    }
+
+    if (model->rms_norm_eps == 0.0f) model->rms_norm_eps = 1e-6f;
+    if (model->n_kv_heads == 0) model->n_kv_heads = model->n_heads;
+    if (model->max_seq_len == 0) model->max_seq_len = 2048;
+
+    // Parse Tensor headers
+    model->tensors = (GGUFTensor *)calloc(model->tensor_count, sizeof(GGUFTensor));
+    for (int i = 0; i < model->tensor_count; i++) {
+        GGUFTensor *t = &model->tensors[i];
+        read_string(&p, t->name, sizeof(t->name));
+        t->ndim = read_u32(&p);
+        for (int d = 0; d < t->ndim; d++) {
+            t->shape[d] = (int64_t)read_u64(&p);
+        }
+        t->type = (GGUFType)read_u32(&p);
+        t->offset = read_u64(&p);
+        t->data = NULL; // will be resolved after alignment
+
+        // Calculate size in bytes
+        int64_t numel = 1;
+        for (int d = 0; d < t->ndim; d++) numel *= t->shape[d];
+
+        if (t->type == GGUF_TYPE_F32) t->size_bytes = numel * 4;
+        else if (t->type == GGUF_TYPE_F16) t->size_bytes = numel * 2;
+        else if (t->type == GGUF_TYPE_Q4_0) t->size_bytes = (numel / 32) * sizeof(BlockQ4_0);
+        else t->size_bytes = numel;
+    }
+
+    // Align p to 32 bytes for binary payload base
+    uintptr_t current_pos = (uintptr_t)p;
+    uintptr_t base_pos = (uintptr_t)mmap_addr;
+    uintptr_t offset_from_base = current_pos - base_pos;
+    uintptr_t aligned_offset = (offset_from_base + 31) & ~31;
+    const uint8_t *binary_base = (const uint8_t *)mmap_addr + aligned_offset;
+
+    // Resolve binary data pointers using GGUF tensor offsets
+    for (int i = 0; i < model->tensor_count; i++) {
+        GGUFTensor *t = &model->tensors[i];
+        t->data = (void *)(binary_base + t->offset);
+    }
+
+    printf("[GGUF] Loaded model: dim=%d, hidden=%d, layers=%d, heads=%d, kv_heads=%d, tensors=%d\n",
+           model->dim, model->hidden_dim, model->n_layers, model->n_heads, model->n_kv_heads, model->tensor_count);
+
+    return model;
+}
+
+GGUFTensor *gguf_get_tensor(GGUFModel *model, const char *name) {
+    if (!model) return NULL;
+    for (int i = 0; i < model->tensor_count; i++) {
+        if (strcmp(model->tensors[i].name, name) == 0) return &model->tensors[i];
+    }
+    return NULL;
+}
+
+void gguf_free(GGUFModel *model) {
+    if (!model) return;
+    if (model->mmap_addr) munmap(model->mmap_addr, model->mmap_size);
+    if (model->tensors) free(model->tensors);
+    free(model);
+}

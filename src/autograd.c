@@ -67,6 +67,9 @@ static Tensor *matmul_nt(const Tensor *x, const Tensor *y) {
     const long shp[2] = {M, N};
     Tensor *r = tt_new(shp, 2);
     if (!r) return NULL;
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int m = 0; m < M; m++)
         for (int n = 0; n < N; n++) {
             const float *xr = x->data + (long)m * K;
@@ -84,8 +87,11 @@ static Tensor *matmul_tn(const Tensor *x, const Tensor *y) {
     const long shp[2] = {M, N};
     Tensor *r = tt_new(shp, 2);
     if (!r) return NULL;
-    for (int k = 0; k < K; k++)
-        for (int m = 0; m < M; m++) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int m = 0; m < M; m++)
+        for (int k = 0; k < K; k++) {
             float xv = x->data[(long)k * M + m];
             const float *yrow = y->data + (long)k * N;
             float *rrow = r->data + (long)m * N;
@@ -159,7 +165,7 @@ AGNode *ag_mulscalar(AGNode *a, float s) {
 
 AGNode *ag_matmul(AGNode *a, AGNode *b) {
     if (!a || !b) return NULL;
-    return node_binary(a, b, tt_matmul(a->val, b->val), OP_MATMUL);
+    return node_binary(a, b, tt_matmul_omp(a->val, b->val, 12), OP_MATMUL);
 }
 
 AGNode *ag_relu(AGNode *a) {
@@ -360,6 +366,69 @@ static void backward_reshape(AGNode *n) {
     tt_release(g_reshaped);
 }
 
+static void batched_im2col_local(const float *data_im, int N, int C, int H, int W_in,
+                                 int HH, int WW, int pad_h, int pad_w,
+                                 int stride_h, int stride_w, float *data_col) {
+    int Hout = (H + 2 * pad_h - HH) / stride_h + 1;
+    int Wout = (W_in + 2 * pad_w - WW) / stride_w + 1;
+    int channels_col = C * HH * WW;
+    int N_spatial = Hout * Wout;
+
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int c = 0; c < channels_col; c++) {
+        for (int n = 0; n < N; n++) {
+            int w_offset = c % WW;
+            int h_offset = (c / WW) % HH;
+            int c_im = c / (HH * WW);
+            const float *im_n = data_im + (long)n * C * H * W_in + (long)c_im * H * W_in;
+            float *col_c_n = data_col + (long)c * (N * N_spatial) + (long)n * N_spatial;
+
+            for (int ho = 0; ho < Hout; ho++) {
+                int im_row = ho * stride_h - pad_h + h_offset;
+                for (int wo = 0; wo < Wout; wo++) {
+                    int im_col = wo * stride_w - pad_w + w_offset;
+                    int out_idx = ho * Wout + wo;
+                    if (im_row >= 0 && im_row < H && im_col >= 0 && im_col < W_in)
+                        col_c_n[out_idx] = im_n[(long)im_row * W_in + im_col];
+                    else
+                        col_c_n[out_idx] = 0.0f;
+                }
+            }
+        }
+    }
+}
+
+static void batched_col2im_local(const float *data_col, int N, int C, int H, int W_in,
+                                 int HH, int WW, int pad_h, int pad_w,
+                                 int stride_h, int stride_w, float *data_im) {
+    memset(data_im, 0, sizeof(float) * (size_t)N * C * H * W_in);
+    int Hout = (H + 2 * pad_h - HH) / stride_h + 1;
+    int Wout = (W_in + 2 * pad_w - WW) / stride_w + 1;
+    int channels_col = C * HH * WW;
+    int N_spatial = Hout * Wout;
+
+    for (int c = 0; c < channels_col; c++) {
+        int w_offset = c % WW;
+        int h_offset = (c / WW) % HH;
+        int c_im = c / (HH * WW);
+        for (int n = 0; n < N; n++) {
+            float *im_n_c = data_im + (long)n * C * H * W_in + (long)c_im * H * W_in;
+            const float *col_c_n = data_col + (long)c * (N * N_spatial) + (long)n * N_spatial;
+            for (int ho = 0; ho < Hout; ho++) {
+                int im_row = ho * stride_h - pad_h + h_offset;
+                for (int wo = 0; wo < Wout; wo++) {
+                    int im_col = wo * stride_w - pad_w + w_offset;
+                    if (im_row >= 0 && im_row < H && im_col >= 0 && im_col < W_in) {
+                        im_n_c[(long)im_row * W_in + im_col] += col_c_n[ho * Wout + wo];
+                    }
+                }
+            }
+        }
+    }
+}
+
 static void backward_conv2d(AGNode *n) {
     AGNode *a = n->parents[0], *w = n->parents[1];
     AGNode *b = n->nparents > 2 ? n->parents[2] : NULL;
@@ -387,72 +456,89 @@ static void backward_conv2d(AGNode *n) {
         }
     }
 
+    int K_col = C * HH * WW;
+    long N_col = (long)N * Hout * Wout;
+
     if (w->requires_grad) {
         long w_shp[4] = {F, C, HH, WW};
         Tensor *gw = tt_new(w_shp, 4);
-        if (gw) {
-            for (int f = 0; f < F; f++) {
-                for (int c = 0; c < C; c++) {
-                    for (int kh = 0; kh < HH; kh++) {
-                        for (int kw = 0; kw < WW; kw++) {
-                            float sum = 0.0f;
-                            for (int n_idx = 0; n_idx < N; n_idx++) {
-                                for (int ho = 0; ho < Hout; ho++) {
-                                    int h_in = ho * sh - ph + kh;
-                                    if (h_in < 0 || h_in >= H) continue;
-                                    for (int wo = 0; wo < Wout; wo++) {
-                                        int w_in = wo * sw - pw + kw;
-                                        if (w_in < 0 || w_in >= W_in) continue;
-                                        float g_val = g->data[((long)n_idx * F + f) * Hout * Wout + (long)ho * Wout + wo];
-                                        float a_val = a->val->data[((long)n_idx * C + c) * H * W_in + (long)h_in * W_in + w_in];
-                                        sum += g_val * a_val;
-                                    }
-                                }
-                            }
-                            gw->data[((long)f * C + c) * HH * WW + (long)kh * WW + kw] = sum;
-                        }
+        float *data_col = (float *)malloc(sizeof(float) * (size_t)K_col * N_col);
+        if (gw && data_col) {
+            batched_im2col_local(a->val->data, N, C, H, W_in, HH, WW, ph, pw, sh, sw, data_col);
+
+            float *g_perm = (float *)malloc(sizeof(float) * (size_t)F * N_col);
+            float *data_col_t = (float *)malloc(sizeof(float) * (size_t)K_col * N_col);
+
+            if (g_perm && data_col_t) {
+                long N_spatial = Hout * Wout;
+                for (int f = 0; f < F; f++) {
+                    for (int n_idx = 0; n_idx < N; n_idx++) {
+                        const float *src = g->data + ((long)n_idx * F + f) * N_spatial;
+                        float *dst = g_perm + (long)f * N_col + (long)n_idx * N_spatial;
+                        memcpy(dst, src, sizeof(float) * N_spatial);
                     }
                 }
+                for (int r = 0; r < K_col; r++)
+                    for (long c_idx = 0; c_idx < N_col; c_idx++)
+                        data_col_t[c_idx * K_col + r] = data_col[r * N_col + c_idx];
+
+                long shape_g_mat[2] = {F, N_col};
+                long shape_col_t[2] = {N_col, K_col};
+                Tensor *g_mat = tt_fromdata(g_perm, shape_g_mat, 2);
+                Tensor *col_t = tt_fromdata(data_col_t, shape_col_t, 2);
+                Tensor *gw_mat = tt_matmul_omp(g_mat, col_t, 12);
+                if (gw_mat) {
+                    memcpy(gw->data, gw_mat->data, sizeof(float) * (size_t)gw->numel);
+                    tt_release(gw_mat);
+                }
+                tt_release(g_mat);
+                tt_release(col_t);
             }
+            free(g_perm);
+            free(data_col_t);
             accum(w, gw);
             tt_release(gw);
         }
+        free(data_col);
     }
 
     if (a->requires_grad) {
-        long a_numel = a->val->numel;
-        double *ga_dbl = (double *)calloc((size_t)a_numel, sizeof(double));
         long a_shp[4] = {N, C, H, W_in};
         Tensor *ga = tt_new(a_shp, 4);
-        if (ga_dbl && ga) {
-            for (int n_idx = 0; n_idx < N; n_idx++) {
-                for (int f = 0; f < F; f++) {
-                    for (int ho = 0; ho < Hout; ho++) {
-                        int h_start = ho * sh - ph;
-                        for (int wo = 0; wo < Wout; wo++) {
-                            int w_start = wo * sw - pw;
-                            double g_val = (double)g->data[((long)n_idx * F + f) * Hout * Wout + (long)ho * Wout + wo];
-                            for (int c = 0; c < C; c++) {
-                                for (int kh = 0; kh < HH; kh++) {
-                                    int h_in = h_start + kh;
-                                    if (h_in < 0 || h_in >= H) continue;
-                                    for (int kw = 0; kw < WW; kw++) {
-                                        int w_in = w_start + kw;
-                                        if (w_in < 0 || w_in >= W_in) continue;
-                                        double w_val = (double)w->val->data[((long)f * C + c) * HH * WW + (long)kh * WW + kw];
-                                        ga_dbl[((long)n_idx * C + c) * H * W_in + (long)h_in * W_in + w_in] += g_val * w_val;
-                                    }
-                                }
-                            }
-                        }
-                    }
+        float *w_mat_t = (float *)malloc(sizeof(float) * (size_t)F * K_col);
+        float *g_perm = (float *)malloc(sizeof(float) * (size_t)F * N_col);
+
+        if (ga && w_mat_t && g_perm) {
+            for (int f = 0; f < F; f++)
+                for (int k = 0; k < K_col; k++)
+                    w_mat_t[k * F + f] = w->val->data[f * K_col + k];
+
+            long N_spatial = Hout * Wout;
+            for (int f = 0; f < F; f++) {
+                for (int n_idx = 0; n_idx < N; n_idx++) {
+                    const float *src = g->data + ((long)n_idx * F + f) * N_spatial;
+                    float *dst = g_perm + (long)f * N_col + (long)n_idx * N_spatial;
+                    memcpy(dst, src, sizeof(float) * N_spatial);
                 }
             }
-            for (long i = 0; i < a_numel; i++) ga->data[i] = (float)ga_dbl[i];
+
+            long shape_w_t[2] = {K_col, F};
+            long shape_g_mat[2] = {F, N_col};
+            Tensor *w_t = tt_fromdata(w_mat_t, shape_w_t, 2);
+            Tensor *g_mat = tt_fromdata(g_perm, shape_g_mat, 2);
+            Tensor *d_col = tt_matmul_omp(w_t, g_mat, 12);
+
+            if (d_col) {
+                batched_col2im_local(d_col->data, N, C, H, W_in, HH, WW, ph, pw, sh, sw, ga->data);
+                tt_release(d_col);
+            }
+            tt_release(w_t);
+            tt_release(g_mat);
             accum(a, ga);
             tt_release(ga);
         }
-        free(ga_dbl);
+        free(w_mat_t);
+        free(g_perm);
     }
 }
 

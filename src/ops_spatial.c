@@ -1,8 +1,12 @@
-/* spatial & shape ops for M4 */
+/* spatial & shape ops for M4 with batched im2col + single GEMM acceleration */
 #include "tensor.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 Tensor *tt_reshape(const Tensor *a, const long *new_shape, int new_ndim) {
     if (!a || !new_shape || new_ndim <= 0 || new_ndim > 8) return NULL;
@@ -16,6 +20,41 @@ Tensor *tt_reshape(const Tensor *a, const long *new_shape, int new_ndim) {
     if (!out) return NULL;
     memcpy(out->data, a->data, sizeof(float) * (size_t)numel);
     return out;
+}
+
+/* Batched im2col: fills data_col of shape (C * HH * WW, N * Hout * Wout) */
+static void batched_im2col(const float *data_im, int N, int C, int H, int W_in,
+                           int HH, int WW, int pad_h, int pad_w,
+                           int stride_h, int stride_w, float *data_col) {
+    int Hout = (H + 2 * pad_h - HH) / stride_h + 1;
+    int Wout = (W_in + 2 * pad_w - WW) / stride_w + 1;
+    int channels_col = C * HH * WW;
+    int N_spatial = Hout * Wout;
+
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int c = 0; c < channels_col; c++) {
+        for (int n = 0; n < N; n++) {
+            int w_offset = c % WW;
+            int h_offset = (c / WW) % HH;
+            int c_im = c / (HH * WW);
+            const float *im_n = data_im + (long)n * C * H * W_in + (long)c_im * H * W_in;
+            float *col_c_n = data_col + (long)c * (N * N_spatial) + (long)n * N_spatial;
+
+            for (int ho = 0; ho < Hout; ho++) {
+                int im_row = ho * stride_h - pad_h + h_offset;
+                for (int wo = 0; wo < Wout; wo++) {
+                    int im_col = wo * stride_w - pad_w + w_offset;
+                    int out_idx = ho * Wout + wo;
+                    if (im_row >= 0 && im_row < H && im_col >= 0 && im_col < W_in)
+                        col_c_n[out_idx] = im_n[(long)im_row * W_in + im_col];
+                    else
+                        col_c_n[out_idx] = 0.0f;
+                }
+            }
+        }
+    }
 }
 
 Tensor *tt_conv2d(const Tensor *a, const Tensor *w, const Tensor *b,
@@ -34,32 +73,44 @@ Tensor *tt_conv2d(const Tensor *a, const Tensor *w, const Tensor *b,
     Tensor *out = tt_new(shp, 4);
     if (!out) return NULL;
 
-    for (int n = 0; n < N; n++) {
-        for (int f = 0; f < F; f++) {
-            float bias_val = b ? b->data[f] : 0.0f;
-            for (int ho = 0; ho < Hout; ho++) {
-                int h_start = ho * stride_h - pad_h;
-                for (int wo = 0; wo < Wout; wo++) {
-                    int w_start = wo * stride_w - pad_w;
-                    float sum = bias_val;
-                    for (int c = 0; c < C; c++) {
-                        for (int kh = 0; kh < HH; kh++) {
-                            int h_in = h_start + kh;
-                            if (h_in < 0 || h_in >= H) continue;
-                            for (int kw = 0; kw < WW; kw++) {
-                                int w_in = w_start + kw;
-                                if (w_in < 0 || w_in >= W_in) continue;
-                                float a_val = a->data[((long)n * C + c) * H * W_in + (long)h_in * W_in + w_in];
-                                float w_val = w->data[((long)f * C + c) * HH * WW + (long)kh * WW + kw];
-                                sum += a_val * w_val;
-                            }
-                        }
-                    }
-                    out->data[((long)n * F + f) * Hout * Wout + (long)ho * Wout + wo] = sum;
+    int K_col = C * HH * WW;
+    long N_col = (long)N * Hout * Wout;
+    float *data_col = (float *)malloc(sizeof(float) * (size_t)K_col * N_col);
+    if (!data_col) {
+        tt_release(out);
+        return NULL;
+    }
+
+    batched_im2col(a->data, N, C, H, W_in, HH, WW, pad_h, pad_w, stride_h, stride_w, data_col);
+
+    long shape_w_mat[2] = {F, K_col};
+    long shape_col_mat[2] = {K_col, N_col};
+    Tensor *w_mat = tt_fromdata(w->data, shape_w_mat, 2);
+    Tensor *col_mat = tt_fromdata(data_col, shape_col_mat, 2);
+
+    Tensor *out_mat = tt_matmul_omp(w_mat, col_mat, 12);
+
+    if (out_mat) {
+        long N_spatial = Hout * Wout;
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+        for (int n = 0; n < N; n++) {
+            for (int f = 0; f < F; f++) {
+                float bias_val = b ? b->data[f] : 0.0f;
+                const float *src = out_mat->data + (long)f * N_col + (long)n * N_spatial;
+                float *dst = out->data + ((long)n * F + f) * N_spatial;
+                for (long i = 0; i < N_spatial; i++) {
+                    dst[i] = src[i] + bias_val;
                 }
             }
         }
+        tt_release(out_mat);
     }
+
+    tt_release(w_mat);
+    tt_release(col_mat);
+    free(data_col);
     return out;
 }
 
@@ -75,6 +126,9 @@ Tensor *tt_maxpool2d(const Tensor *a, int pool_h, int pool_w,
     Tensor *out = tt_new(shp, 4);
     if (!out) return NULL;
 
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {
             for (int ho = 0; ho < Hout; ho++) {
@@ -109,6 +163,9 @@ Tensor *tt_avgpool2d(const Tensor *a, int pool_h, int pool_w,
     if (!out) return NULL;
     float norm = 1.0f / (float)(pool_h * pool_w);
 
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {
             for (int ho = 0; ho < Hout; ho++) {

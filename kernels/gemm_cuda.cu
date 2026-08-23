@@ -22,108 +22,103 @@ __global__ void k_sgemm_naive(const float *__restrict__ A,
     C[(long)i * N + j] = s;
 }
 
-/* ------- 2D register-tiled 64x64 tile, 8x8 subtile per thread, BK=16 ------- */
-#define BM 64
-#define BN 64
+/* ------- 2D register-tiled 128x128 tile, 8x8 subtile per thread, BK=16, Double Buffered ------- */
+#define BM 128
+#define BN 128
 #define BK 16
 
-__global__ void k_sgemm_tiled_64x64(const float *__restrict__ A,
-                                    const float *__restrict__ B,
-                                    float *__restrict__ C,
-                                    int M, int N, int K) {
-    // 8x8 threads per block = 64 threads
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
-    const int tid = ty * 8 + tx; // 0..63
-
-    // Shared memory for 64x16 A tile and 16x64 B tile
-    __shared__ float As[BK][BM + 4]; // padded to avoid bank conflicts
-    __shared__ float Bs[BK][BN + 4];
-
-    // 8x8 register accumulator tile per thread (64 floats)
-    float accum[8][8] = {0.0f};
-
-    // Load coordinates: 64 threads load 64x16 = 1024 floats -> 4 float4s per thread (16 floats per thread)
-    // A tile is BK=16 rows, BM=64 cols
-    // B tile is BK=16 rows, BN=64 cols
-
+__global__ void k_sgemm_tiled_128x128_db(const float *__restrict__ A,
+                                         const float *__restrict__ B,
+                                         float *__restrict__ C,
+                                         int M, int N, int K) {
     const int by = blockIdx.y;
     const int bx = blockIdx.x;
+    const int tid = threadIdx.y * 16 + threadIdx.x; // 256 threads
 
-    for (int bk = 0; bk < K; bk += BK) {
-        // Load A: 64 threads load 16x64 floats (1024 floats)
-        // Each thread loads 4 float4s (16 floats)
+    __shared__ alignas(16) float As[2][BK][BM + 4];
+    __shared__ alignas(16) float Bs[2][BK][BN + 16];
+
+    float accum[8][8] = {0.0f};
+    int write_stage = 0;
+
+    const int a_load_row = tid / 4;       // 0..63
+    const int a_load_col = (tid % 4) * 4; // 0,4,8,12
+
+    const int b_load_row = tid / 32;      // 0..7
+    const int b_load_col = (tid % 32) * 4;// 0,4,8..124
+
+    // Initial stage 0 load using float4
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        int r = a_load_row + i * 64;
+        int c = a_load_col;
+        int gr = by * BM + r;
+        int gc = c;
+        float4 vA = (gr < M && gc + 3 < K) ? *reinterpret_cast<const float4*>(&A[(long)gr * K + gc]) : make_float4(0,0,0,0);
+        As[0][c + 0][r] = vA.x;
+        As[0][c + 1][r] = vA.y;
+        As[0][c + 2][r] = vA.z;
+        As[0][c + 3][r] = vA.w;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        int r = b_load_row + i * 8;
+        int c = b_load_col;
+        int gr = r;
+        int gc = bx * BN + c;
+        float4 vB = (gr < K && gc + 3 < N) ? *reinterpret_cast<const float4*>(&B[(long)gr * N + gc]) : make_float4(0,0,0,0);
+        Bs[0][r][c + 0] = vB.x;
+        Bs[0][r][c + 1] = vB.y;
+        Bs[0][r][c + 2] = vB.z;
+        Bs[0][r][c + 3] = vB.w;
+    }
+
+    __syncthreads();
+
+    // Main K Loop
+    for (int bk = BK; bk < K; bk += BK) {
+        int read_stage = write_stage;
+        write_stage = 1 - write_stage;
+
+        // Prefetch next tile with float4
         #pragma unroll
-        for (int p = 0; p < 4; p++) {
-            int e = p * 64 + tid; // 0..255 (in units of float4) -> 256 float4s
-            int a_row = e / 16;   // 0..15 (k-index)
-            int a_col = (e % 16) * 4; // 0..60 (m-index)
-
-            int g_a_row = by * BM + a_col;
-            int g_a_col = bk + a_row;
-            if (g_a_row < M && g_a_col < K) {
-                As[a_row][a_col] = A[(long)g_a_row * K + g_a_col];
-            } else {
-                As[a_row][a_col] = 0.0f;
-            }
-            if (g_a_row + 1 < M && g_a_col < K) {
-                As[a_row][a_col + 1] = A[(long)(g_a_row + 1) * K + g_a_col];
-            } else {
-                As[a_row][a_col + 1] = 0.0f;
-            }
-            if (g_a_row + 2 < M && g_a_col < K) {
-                As[a_row][a_col + 2] = A[(long)(g_a_row + 2) * K + g_a_col];
-            } else {
-                As[a_row][a_col + 2] = 0.0f;
-            }
-            if (g_a_row + 3 < M && g_a_col < K) {
-                As[a_row][a_col + 3] = A[(long)(g_a_row + 3) * K + g_a_col];
-            } else {
-                As[a_row][a_col + 3] = 0.0f;
-            }
+        for (int i = 0; i < 2; i++) {
+            int r = a_load_row + i * 64;
+            int c = a_load_col;
+            int gr = by * BM + r;
+            int gc = bk + c;
+            float4 vA = (gr < M && gc + 3 < K) ? *reinterpret_cast<const float4*>(&A[(long)gr * K + gc]) : make_float4(0,0,0,0);
+            As[write_stage][c + 0][r] = vA.x;
+            As[write_stage][c + 1][r] = vA.y;
+            As[write_stage][c + 2][r] = vA.z;
+            As[write_stage][c + 3][r] = vA.w;
         }
 
-        // Load B: 64 threads load 16x64 floats (1024 floats)
         #pragma unroll
-        for (int p = 0; p < 4; p++) {
-            int e = p * 64 + tid; // 0..255 (units of 4 floats)
-            int b_row = e / 16;   // 0..15 (k-index)
-            int b_col = (e % 16) * 4; // 0..60 (n-index)
-
-            int g_b_row = bk + b_row;
-            int g_b_col = bx * BN + b_col;
-
-            if (g_b_row < K && g_b_col + 3 < N) {
-                float4 tmpB = *reinterpret_cast<const float4*>(&B[(long)g_b_row * N + g_b_col]);
-                Bs[b_row][b_col + 0] = tmpB.x;
-                Bs[b_row][b_col + 1] = tmpB.y;
-                Bs[b_row][b_col + 2] = tmpB.z;
-                Bs[b_row][b_col + 3] = tmpB.w;
-            } else {
-                #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    Bs[b_row][b_col + j] = (g_b_row < K && g_b_col + j < N)
-                                              ? B[(long)g_b_row * N + g_b_col + j] : 0.0f;
-                }
-            }
+        for (int i = 0; i < 2; i++) {
+            int r = b_load_row + i * 8;
+            int c = b_load_col;
+            int gr = bk + r;
+            int gc = bx * BN + c;
+            float4 vB = (gr < K && gc + 3 < N) ? *reinterpret_cast<const float4*>(&B[(long)gr * N + gc]) : make_float4(0,0,0,0);
+            Bs[write_stage][r][c + 0] = vB.x;
+            Bs[write_stage][r][c + 1] = vB.y;
+            Bs[write_stage][r][c + 2] = vB.z;
+            Bs[write_stage][r][c + 3] = vB.w;
         }
 
-        __syncthreads();
-
-        // Inner tile computation: BK=16 k-steps
+        // Compute current stage
         #pragma unroll
         for (int k = 0; k < BK; k++) {
             float regA[8];
             float regB[8];
 
             #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                regA[i] = As[k][ty * 8 + i];
-            }
+            for (int i = 0; i < 8; i++) regA[i] = As[read_stage][k][threadIdx.y * 8 + i];
+            
             #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                regB[j] = Bs[k][tx * 8 + j];
-            }
+            for (int j = 0; j < 8; j++) regB[j] = Bs[read_stage][k][threadIdx.x * 8 + j];
 
             #pragma unroll
             for (int i = 0; i < 8; i++) {
@@ -137,19 +132,40 @@ __global__ void k_sgemm_tiled_64x64(const float *__restrict__ A,
         __syncthreads();
     }
 
-    // Write back 8x8 subtile to C
-    const int c_row_base = by * BM + ty * 8;
-    const int c_col_base = bx * BN + tx * 8;
+    // Compute last stage
+    #pragma unroll
+    for (int k = 0; k < BK; k++) {
+        float regA[8];
+        float regB[8];
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) regA[i] = As[write_stage][k][threadIdx.y * 8 + i];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) regB[j] = Bs[write_stage][k][threadIdx.x * 8 + j];
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                accum[i][j] += regA[i] * regB[j];
+            }
+        }
+    }
+
+    // Write back to C with float4
+    const int c_row_base = by * BM + threadIdx.y * 8;
+    const int c_col_base = bx * BN + threadIdx.x * 8;
 
     #pragma unroll
     for (int i = 0; i < 8; i++) {
-        int g_c_row = c_row_base + i;
-        if (g_c_row < M) {
+        int gr = c_row_base + i;
+        if (gr < M) {
             #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                int g_c_col = c_col_base + j;
-                if (g_c_col < N) {
-                    C[(long)g_c_row * N + g_c_col] = accum[i][j];
+            for (int j = 0; j < 8; j += 4) {
+                int gc = c_col_base + j;
+                if (gc + 3 < N) {
+                    float4 vC = make_float4(accum[i][j], accum[i][j+1], accum[i][j+2], accum[i][j+3]);
+                    *reinterpret_cast<float4*>(&C[(long)gr * N + gc]) = vC;
                 }
             }
         }
@@ -198,8 +214,8 @@ static int run_naive(const float *dA, const float *dB, float *dC,
 
 static int run_tiled(const float *dA, const float *dB, float *dC,
                      int M, int N, int K) {
-    dim3 b(8, 8), g((N + BN - 1) / BN, (M + BM - 1) / BM);
-    k_sgemm_tiled_64x64<<<g, b>>>(dA, dB, dC, M, N, K);
+    dim3 b(16, 16), g((N + BN - 1) / BN, (M + BM - 1) / BM);
+    k_sgemm_tiled_128x128_db<<<g, b>>>(dA, dB, dC, M, N, K);
     return (int)cudaGetLastError();
 }
 
