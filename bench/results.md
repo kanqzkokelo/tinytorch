@@ -39,3 +39,4 @@ GFLOPS. Gate (AVX2 1T >= NumPy 1T @ 1024^3): FAIL
 |------|-----|--------|---------------------|--------|
 | 2026-08-23 | RTX 3050 laptop | eager (post stream-unify) | 58.0 (96 tok, 5 runs, min 57.9 / max 58.1) | 7/7 top1 |
 | 2026-08-23 | RTX 3050 laptop | cudaGraph replay of decode step | 59.1 (57 tok, 5 runs, min 58.8 / max 59.4) | 7/7 top1 |
+| 2026-08-23 | RTX 3050 laptop | fused add+rmsnorm @ attn boundary — REVERTED | 59.2 / 59.0 (128 tok, 5 runs each) — no gain over graph-replay baseline; launch overhead already gone post-cudaGraph | n/a |
