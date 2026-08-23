@@ -78,7 +78,8 @@ __global__ void k_rmsnorm(const float *__restrict__ x, const float *__restrict__
 
 /* RoPE in-place on rows [n_heads, head_dim]; one thread per half-dim pair. */
 __global__ void k_rope(float *__restrict__ q, int n_heads, int head_dim,
-                       int pos, float base) {
+                       const int *__restrict__ d_pos, float base) {
+    const int pos = *d_pos;
     const int i = threadIdx.x + blockIdx.x * blockDim.x;   /* 0..head_dim/2 */
     const int h = blockIdx.y;
     if (h >= n_heads || i >= head_dim / 2) return;
@@ -103,9 +104,10 @@ __global__ void k_flash_gqa(const float *__restrict__ q,
                             const float *__restrict__ Kc,
                             const float *__restrict__ Vc,
                             float *__restrict__ out,
-                            int pos,            /* inclusive: attend to 0..pos */
+                            const int *__restrict__ d_pos, /* inclusive: attend to 0..*d_pos */
                             int n_heads, int n_kv_heads, int head_dim,
                             int max_ctx, float scale) {
+    const int pos = *d_pos;
     const int h = blockIdx.x;
     if (h >= n_heads) return;
     const int lane = threadIdx.x;
@@ -147,6 +149,19 @@ __global__ void k_flash_gqa(const float *__restrict__ q,
 #pragma unroll
     for (int i = 0; i < 8; i++)
         if (i < elems) oh[i] = oreg[i] * inv_l;
+}
+
+/* Scatter staged K/V rows into the cache slot given by the device position
+ * scalar. Runs after K staging (+bias+RoPE), so the cache holds post-RoPE K. */
+__global__ void k_kv_scatter(const float *__restrict__ kst, const float *__restrict__ vst,
+                             float *__restrict__ Kc, float *__restrict__ Vc,
+                             const int *__restrict__ d_pos, int n_kv_heads, int head_dim, int max_ctx) {
+    const int i = threadIdx.x + blockIdx.x*blockDim.x;
+    const int kvdim = n_kv_heads*head_dim;
+    if (i >= kvdim) return;
+    const int slot = (*d_pos) % max_ctx;
+    Kc[(long)slot*kvdim + i] = kst[i];
+    Vc[(long)slot*kvdim + i] = vst[i];
 }
 
 /* Two-stage argmax over vocab. */
@@ -201,6 +216,10 @@ struct Qwen2Engine {
     float *d_x, *d_xn, *d_q, *d_att, *d_h, *d_logits;
     /* caches: [layer][kv_head][slot][head_dim] */
     float *d_kc, *d_vc;
+    /* KV staging rows (pre-scatter) */
+    float *d_k_stage, *d_v_stage;
+    /* device mirror of pos: kernels read position from here (graph-readiness) */
+    int *d_pos;
     /* argmax scratch */
     float *d_bvals; int *d_bidxs, *d_out;
     int pos;
@@ -320,6 +339,11 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     cudaMalloc(&e->d_kc, cache_per * cfg->n_layers * sizeof(float));
     cudaMalloc(&e->d_vc, cache_per * cfg->n_layers * sizeof(float));
     cudaMemset(e->d_x, 0, D * sizeof(float));
+    const long kvdim_alloc = (long)cfg->n_kv_heads * cfg->head_dim;
+    cudaMalloc(&e->d_k_stage, kvdim_alloc * sizeof(float));
+    cudaMalloc(&e->d_v_stage, kvdim_alloc * sizeof(float));
+    cudaMalloc(&e->d_pos, sizeof(int));
+    cudaMemsetAsync(e->d_pos, 0, sizeof(int), e->stream);   /* pos starts at 0 on device */
     const int nb = 256;
     cudaMalloc(&e->d_bvals, nb * sizeof(float));
     cudaMalloc(&e->d_bidxs, nb * sizeof(int));
@@ -334,6 +358,7 @@ void qwen2_engine_free(Qwen2Engine *e) {
      * Device allocations freed here: */
     cudaFree(e->d_x); cudaFree(e->d_xn); cudaFree(e->d_q); cudaFree(e->d_att); cudaFree(e->d_h);
     cudaFree(e->d_logits); cudaFree(e->d_kc); cudaFree(e->d_vc);
+    cudaFree(e->d_k_stage); cudaFree(e->d_v_stage); cudaFree(e->d_pos);
     cudaFree(e->d_bvals); cudaFree(e->d_bidxs); cudaFree(e->d_out);
     /* NOTE: per-weight cudaFree calls are intentionally not tracked here; they are
      * leaked until process exit by design (engine lifetime == process lifetime).
@@ -355,9 +380,9 @@ static int forward_layers(Qwen2Engine *e) {
 
         /* Cache layout: [slot][kv_head * head_dim] so each GEMV output of
          * width n_kv_heads*HD lands contiguously per slot.
-         * Flash kernel indexes K(t,kvh,i) = Kl_f[(t*n_kv_heads + kvh)*HD + i]. */
-        float *k_slot = Kl_f + (long)(e->pos % c->max_ctx) * c->n_kv_heads * HD;
-        float *v_slot = Vl_f + (long)(e->pos % c->max_ctx) * c->n_kv_heads * HD;
+         * Flash kernel indexes K(t,kvh,i) = Kl_f[(t*n_kv_heads + kvh)*HD + i].
+         * K/V are computed into staging buffers, then scattered to the slot
+         * selected by the DEVICE position scalar (*e->d_pos). */
 
         /* 1. xn = rmsnorm(x) * attn_norm */
         k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
@@ -365,33 +390,39 @@ static int forward_layers(Qwen2Engine *e) {
 
         /* 2. projections: q -> d_q ; k,v -> KV cache slot pos */
         tt_gemv_q4_0(w->q, e->d_xn, e->d_q, c->dim, c->dim, e->stream);
-        tt_gemv_q4_0(w->k, e->d_xn, k_slot, c->n_kv_heads * HD, c->dim, e->stream);
-        tt_gemv_q4_0(w->v, e->d_xn, v_slot, c->n_kv_heads * HD, c->dim, e->stream);
+        tt_gemv_q4_0(w->k, e->d_xn, e->d_k_stage, c->n_kv_heads * HD, c->dim, e->stream);
         /* QKV biases present in some GGUF conversions of Qwen2 (applied by
          * llama.cpp whenever the tensors exist). Optional by design. */
         const int kvdim = c->n_kv_heads * HD;
         if (w->q_bias)
             k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_q, w->q_bias, c->dim);
         if (w->k_bias)
-            k_add<<<(kvdim + 255) / 256, 256, 0, e->stream>>>(k_slot, w->k_bias, kvdim);
-        if (w->v_bias)
-            k_add<<<(kvdim + 255) / 256, 256, 0, e->stream>>>(v_slot, w->v_bias, kvdim);
+            k_add<<<(kvdim + 255) / 256, 256, 0, e->stream>>>(e->d_k_stage, w->k_bias, kvdim);
 
-        /* 3. RoPE on q (all heads) and on the k rows just written */
+        /* 3. RoPE on q (all heads) and on the staged k row (in-place, pre-scatter) */
         static int no_rope = -1;
         if (no_rope < 0) no_rope = getenv("TT_NO_ROPE") ? 1 : 0;
         if (!no_rope) {
             g.x = (HD / 2 + 63) / 64; g.y = c->n_heads; g.z = 1;
             b.x = 64; b.y = 1; b.z = 1;
-            k_rope<<<g, b, 0, e->stream>>>(e->d_q, c->n_heads, HD, e->pos, c->rope_base);
+            k_rope<<<g, b, 0, e->stream>>>(e->d_q, c->n_heads, HD, e->d_pos, c->rope_base);
             g.x = (HD / 2 + 63) / 64; g.y = c->n_kv_heads; g.z = 1;
-            k_rope<<<g, b, 0, e->stream>>>(k_slot, c->n_kv_heads, HD, e->pos, c->rope_base);
+            k_rope<<<g, b, 0, e->stream>>>(e->d_k_stage, c->n_kv_heads, HD, e->d_pos, c->rope_base);
         }
+
+        /* v projection + bias, then scatter staged K/V into the cache slot
+         * chosen by *d_pos. Must precede flash attention. */
+        tt_gemv_q4_0(w->v, e->d_xn, e->d_v_stage, c->n_kv_heads * HD, c->dim, e->stream);
+        if (w->v_bias)
+            k_add<<<(kvdim + 255) / 256, 256, 0, e->stream>>>(e->d_v_stage, w->v_bias, kvdim);
+        k_kv_scatter<<<(kvdim + 255) / 256, 256, 0, e->stream>>>(
+            e->d_k_stage, e->d_v_stage, Kl_f, Vl_f, e->d_pos,
+            c->n_kv_heads, HD, c->max_ctx);
 
         /* 4. GQA flash attention over slots [0..pos] */
         k_flash_gqa<<<c->n_heads, 32, 0, e->stream>>>(
             e->d_q, Kl_f, Vl_f, e->d_att,
-            e->pos % c->max_ctx,
+            e->d_pos,
             c->n_heads, c->n_kv_heads, HD, c->max_ctx,
             1.0f / sqrtf((float)HD));
 
@@ -452,15 +483,18 @@ static int embed_token(Qwen2Engine *e, int tok) {
 static int advance(Qwen2Engine *e, int tok) {
     int rc = embed_token(e, tok);
     if (rc) return rc;
-    rc = forward_layers(e);
+    rc = forward_layers(e);      /* runs while *d_pos == current slot */
     if (rc) return rc;
     e->pos++;
+    cudaMemcpyAsync(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice, e->stream);
     return 0;
 }
 
 int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
     if (!e || !toks || n <= 0) return -1;
     if (e->pos + n > e->cfg.max_ctx) return -2;          /* context overflow */
+    /* resync device position scalar before any forward work */
+    cudaMemcpyAsync(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice, e->stream);
     for (int i = 0; i < n; i++) {
         int rc = advance(e, toks[i]);
         if (rc) return rc;
