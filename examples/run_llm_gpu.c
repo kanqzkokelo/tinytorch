@@ -57,11 +57,29 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t0);   /* decode-only window starts here */
 
     int gen_count = 0;
+    char turn_text[8192];
+    size_t tl = 0;
     for (int s = 0; s < target_tokens && qwen2_engine_pos(eng) < MAX_CTX - 1; s++) {
         const int id = qwen2_engine_next(eng);
         if (id < 0 || id == tok->eos_id || id == 151643 || id == 151645) break;
         int out_len = 0;
         const char *txt = bpe_decode_token(tok, id, &out_len);
+        if (tl + (size_t)out_len < sizeof(turn_text)) {
+            memcpy(turn_text + tl, txt, (size_t)out_len);
+            tl += (size_t)out_len;
+            turn_text[tl] = '\0';
+        }
+        const char *cut = NULL;
+        static const char *markers[] = {"<|im_end|>", "<|endoftext|>", NULL};
+        for (int mi = 0; markers[mi]; mi++)
+            if ((cut = strstr(turn_text, markers[mi]))) break;
+        if (cut) {
+            const size_t keep = (size_t)(cut - turn_text);
+            if (keep > tl - (size_t)out_len)
+                async_printer_push(ap, turn_text + (tl - (size_t)out_len),
+                                   (int)(keep - (tl - (size_t)out_len)));
+            break;
+        }
         async_printer_push(ap, txt, out_len);
         gen_count++;
     }

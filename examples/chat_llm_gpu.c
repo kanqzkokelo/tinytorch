@@ -70,6 +70,8 @@ int main(void) {
         }
 
         int gen_count = 0;
+        char turn_text[8192];
+        size_t tl = 0;
         for (int step = 0; step < 256 && qwen2_engine_pos(eng) < MAX_CTX - 1; step++) {
             const int next_tok = qwen2_engine_next(eng);
             if (next_tok < 0 || next_tok == tok->eos_id ||
@@ -78,6 +80,25 @@ int main(void) {
                 break;
             int out_len = 0;
             const char *s = bpe_decode_token(tok, next_tok, &out_len);
+            /* stop-string guard: model sometimes spells control tokens as BPE
+             * pieces instead of emitting their ids — truncate at the marker */
+            if (tl + (size_t)out_len < sizeof(turn_text)) {
+                memcpy(turn_text + tl, s, (size_t)out_len);
+                tl += (size_t)out_len;
+                turn_text[tl] = '\0';
+            }
+            const char *cut = NULL;
+            static const char *markers[] = {"<|im_end|>", "<|endoftext|>",
+                                            "<|im_start|>", NULL};
+            for (int mi = 0; markers[mi]; mi++)
+                if ((cut = strstr(turn_text, markers[mi]))) break;
+            if (cut) {
+                const size_t keep = (size_t)(cut - turn_text);
+                if (keep > tl - (size_t)out_len)          /* marker inside this token */
+                    async_printer_push(ap, turn_text + (tl - (size_t)out_len),
+                                       (int)(keep - (tl - (size_t)out_len)));
+                break;
+            }
             async_printer_push(ap, s, out_len);
             gen_count++;
         }

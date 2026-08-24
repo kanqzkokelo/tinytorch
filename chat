@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# tinytorch interactive chat — one command, no setup
+cd "$(dirname "$0")"
+export LD_LIBRARY_PATH="$HOME/mmcuda/lib:$HOME/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+MODEL="data/models/qwen2.5-0.5b-instruct-q4_0.gguf"
+[ -f "$MODEL" ] || { echo "model missing: $MODEL"; exit 1; }
+exec ./build/chat_llm_gpu
