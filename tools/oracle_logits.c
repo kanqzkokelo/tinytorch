@@ -20,7 +20,7 @@ int main(int argc, char **argv) {
 
     // tokenize prompt (no BOS for qwen)
     int toks[512];
-    int n = llama_tokenize(vocab, argv[2], strlen(argv[2]), toks, 512, false, false);
+    int n = llama_tokenize(vocab, argv[2], strlen(argv[2]), toks, 512, false, true);   /* parse_special=true: match engine chat-template handling */
     if (n < 0) { fprintf(stderr, "tokenize failed (%d): prompt too long or invalid\n", n); return 1; }
     fprintf(stderr, "[oracle] %d tokens:", n);
     for (int i = 0; i < n; i++) fprintf(stderr, " %d", toks[i]);

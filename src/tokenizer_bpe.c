@@ -345,8 +345,38 @@ int bpe_encode(const BPETokenizer *tok_, const char *text, int *out_tokens, int 
     int pos = 0;
 
     while (pos < len && n_out < max_tokens) {
+        /* Special/control tokens have the literal form "<|name|>" and live in
+         * the vocab table but NOT in the merge ranks, so the normal chunk+BPE
+         * path can never produce them. Match them verbatim first, else chat
+         * templates degrade into BPE pieces ([<][|][im][_][start][|][>]) and
+         * the model sees a garbled prompt. */
+        if (text[pos] == '<' && pos + 2 < len && text[pos + 1] == '|') {
+            const char *close = NULL;
+            for (const char *q = text + pos + 2; q + 1 < text + len; q++)
+                if (q[0] == '|' && q[1] == '>') { close = q; break; }
+            if (close) {
+                const int slen = (int)(close - (text + pos)) + 2;
+                if (slen < 128) {
+                    char buf[128];
+                    memcpy(buf, text + pos, (size_t)slen);
+                    const int id = hm_get(&t->tok2id, buf, slen);
+                    if (id >= 0) {
+                        out_tokens[n_out++] = id;
+                        pos += slen;
+                        continue;
+                    }
+                }
+            }
+        }
         int clen = chunk_len(text + pos, len - pos);
         if (clen <= 0) clen = 1;
+        /* A punct/symbol run can swallow the start of a following special
+         * token ("hi!" -> chunk "!<|"). Cut the chunk right before "<|"
+         * so the next iteration's verbatim special-token match can fire. */
+        for (int k = 1; k < clen; k++) {
+            if (text[pos + k] == '<' && pos + k + 1 < len &&
+                text[pos + k + 1] == '|') { clen = k; break; }
+        }
         const char *chunk = text + pos;
         pos += clen;
 

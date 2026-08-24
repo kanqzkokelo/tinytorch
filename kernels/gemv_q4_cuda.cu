@@ -68,24 +68,29 @@ __global__ void k_gemv_q4_0(const BlockQ4_0 *__restrict__ W,
             const uint32_t lb = rw1[a0 + k];
             const uint32_t va = sh ? __byte_perm(la, rw0[a0 + k + 1], 0x5432) : la;
             const uint32_t vb = sh ? __byte_perm(lb, rw1[a0 + k + 1], 0x5432) : lb;
-            const float4 xa = x4[k];       // x[4k .. 4k+3]   <- low nibbles
-            const float4 xb = x4[k + 4];   // x[16+4k .. +3]  <- high nibbles
-            s0 += (float)((va         & 0xFu) - 8u) * da * xa.x;
-            s0 += (float)(((va >>  4) & 0xFu) - 8u) * da * xa.y;
-            s0 += (float)(((va >>  8) & 0xFu) - 8u) * da * xa.z;
-            s0 += (float)(((va >> 12) & 0xFu) - 8u) * da * xa.w;
-            s0 += (float)(((va >> 16) & 0xFu) - 8u) * da * xb.x;
-            s0 += (float)(((va >> 20) & 0xFu) - 8u) * da * xb.y;
-            s0 += (float)(((va >> 24) & 0xFu) - 8u) * da * xb.z;
-            s0 += (float)( (va >> 28)         - 8u) * da * xb.w;
-            s1 += (float)((vb         & 0xFu) - 8u) * db * xa.x;
-            s1 += (float)(((vb >>  4) & 0xFu) - 8u) * db * xa.y;
-            s1 += (float)(((vb >>  8) & 0xFu) - 8u) * db * xa.z;
-            s1 += (float)(((vb >> 12) & 0xFu) - 8u) * db * xa.w;
-            s1 += (float)(((vb >> 16) & 0xFu) - 8u) * db * xb.x;
-            s1 += (float)(((vb >> 20) & 0xFu) - 8u) * db * xb.y;
-            s1 += (float)(((vb >> 24) & 0xFu) - 8u) * db * xb.z;
-            s1 += (float)( (vb >> 28)         - 8u) * db * xb.w;
+            const float4 xa = x4[k];       // x[4k .. 4k+3]   <- low nibbles of bytes 4k..4k+3
+            const float4 xb = x4[k + 4];   // x[16+4k .. +3]  <- high nibbles of bytes 4k..4k+3
+            /* q4_0 byte j packs weight j (low nibble) and weight j+16 (high
+             * nibble); word k holds bytes 4k..4k+3, so each byte's LOW nibble
+             * pairs with xa and the SAME BYTE's HIGH nibble pairs with xb.
+             * The previous version paired consecutive nibbles against
+             * xa.x..xb.w, scrambling weight->x mapping => garbage output. */
+            s0 += (float)((int)(va         & 0xFu) - 8) * da * xa.x;
+            s0 += (float)((int)((va >>  4) & 0xFu) - 8) * da * xb.x;
+            s0 += (float)((int)((va >>  8) & 0xFu) - 8) * da * xa.y;
+            s0 += (float)((int)((va >> 12) & 0xFu) - 8) * da * xb.y;
+            s0 += (float)((int)((va >> 16) & 0xFu) - 8) * da * xa.z;
+            s0 += (float)((int)((va >> 20) & 0xFu) - 8) * da * xb.z;
+            s0 += (float)((int)((va >> 24) & 0xFu) - 8) * da * xa.w;
+            s0 += (float)((int)(va >> 28) - 8) * da * xb.w;
+            s1 += (float)((int)(vb         & 0xFu) - 8) * db * xa.x;
+            s1 += (float)((int)((vb >>  4) & 0xFu) - 8) * db * xb.x;
+            s1 += (float)((int)((vb >>  8) & 0xFu) - 8) * db * xa.y;
+            s1 += (float)((int)((vb >> 12) & 0xFu) - 8) * db * xb.y;
+            s1 += (float)((int)((vb >> 16) & 0xFu) - 8) * db * xa.z;
+            s1 += (float)((int)((vb >> 20) & 0xFu) - 8) * db * xb.z;
+            s1 += (float)((int)((vb >> 24) & 0xFu) - 8) * db * xa.w;
+            s1 += (float)((int)(vb >> 28) - 8) * db * xb.w;
         }
     }
     s0 = warp_reduce_sum(s0);
@@ -142,38 +147,39 @@ __global__ void k_fused_swiglu_q4_0(const BlockQ4_0 *__restrict__ W_gate,
             const uint32_t uvb = sh ? __byte_perm(ulb, uw1[g0 + k + 1], 0x5432) : ulb;
             const float4 xa = x4[k];
             const float4 xb = x4[k + 4];
-            sg0 += (float)((gva         & 0xFu) - 8u) * dga_ * xa.x;
-            sg0 += (float)(((gva >>  4) & 0xFu) - 8u) * dga_ * xa.y;
-            sg0 += (float)(((gva >>  8) & 0xFu) - 8u) * dga_ * xa.z;
-            sg0 += (float)(((gva >> 12) & 0xFu) - 8u) * dga_ * xa.w;
-            sg0 += (float)(((gva >> 16) & 0xFu) - 8u) * dga_ * xb.x;
-            sg0 += (float)(((gva >> 20) & 0xFu) - 8u) * dga_ * xb.y;
-            sg0 += (float)(((gva >> 24) & 0xFu) - 8u) * dga_ * xb.z;
-            sg0 += (float)( (gva >> 28)         - 8u) * dga_ * xb.w;
-            su0 += (float)((uva         & 0xFu) - 8u) * dua_ * xa.x;
-            su0 += (float)(((uva >>  4) & 0xFu) - 8u) * dua_ * xa.y;
-            su0 += (float)(((uva >>  8) & 0xFu) - 8u) * dua_ * xa.z;
-            su0 += (float)(((uva >> 12) & 0xFu) - 8u) * dua_ * xa.w;
-            su0 += (float)(((uva >> 16) & 0xFu) - 8u) * dua_ * xb.x;
-            su0 += (float)(((uva >> 20) & 0xFu) - 8u) * dua_ * xb.y;
-            su0 += (float)(((uva >> 24) & 0xFu) - 8u) * dua_ * xb.z;
-            su0 += (float)( (uva >> 28)         - 8u) * dua_ * xb.w;
-            sg1 += (float)((gvb         & 0xFu) - 8u) * dgb_ * xa.x;
-            sg1 += (float)(((gvb >>  4) & 0xFu) - 8u) * dgb_ * xa.y;
-            sg1 += (float)(((gvb >>  8) & 0xFu) - 8u) * dgb_ * xa.z;
-            sg1 += (float)(((gvb >> 12) & 0xFu) - 8u) * dgb_ * xa.w;
-            sg1 += (float)(((gvb >> 16) & 0xFu) - 8u) * dgb_ * xb.x;
-            sg1 += (float)(((gvb >> 20) & 0xFu) - 8u) * dgb_ * xb.y;
-            sg1 += (float)(((gvb >> 24) & 0xFu) - 8u) * dgb_ * xb.z;
-            sg1 += (float)( (gvb >> 28)         - 8u) * dgb_ * xb.w;
-            su1 += (float)((uvb         & 0xFu) - 8u) * dub_ * xa.x;
-            su1 += (float)(((uvb >>  4) & 0xFu) - 8u) * dub_ * xa.y;
-            su1 += (float)(((uvb >>  8) & 0xFu) - 8u) * dub_ * xa.z;
-            su1 += (float)(((uvb >> 12) & 0xFu) - 8u) * dub_ * xa.w;
-            su1 += (float)(((uvb >> 16) & 0xFu) - 8u) * dub_ * xb.x;
-            su1 += (float)(((uvb >> 20) & 0xFu) - 8u) * dub_ * xb.y;
-            su1 += (float)(((uvb >> 24) & 0xFu) - 8u) * dub_ * xb.z;
-            su1 += (float)( (uvb >> 28)         - 8u) * dub_ * xb.w;
+            /* same per-byte low->xa / high->xb pairing fix as k_gemv_q4_0 */
+            sg0 += (float)((int)(gva         & 0xFu) - 8) * dga_ * xa.x;
+            sg0 += (float)((int)((gva >>  4) & 0xFu) - 8) * dga_ * xb.x;
+            sg0 += (float)((int)((gva >>  8) & 0xFu) - 8) * dga_ * xa.y;
+            sg0 += (float)((int)((gva >> 12) & 0xFu) - 8) * dga_ * xb.y;
+            sg0 += (float)((int)((gva >> 16) & 0xFu) - 8) * dga_ * xa.z;
+            sg0 += (float)((int)((gva >> 20) & 0xFu) - 8) * dga_ * xb.z;
+            sg0 += (float)((int)((gva >> 24) & 0xFu) - 8) * dga_ * xa.w;
+            sg0 += (float)((int)(gva >> 28) - 8) * dga_ * xb.w;
+            su0 += (float)((int)(uva         & 0xFu) - 8) * dua_ * xa.x;
+            su0 += (float)((int)((uva >>  4) & 0xFu) - 8) * dua_ * xb.x;
+            su0 += (float)((int)((uva >>  8) & 0xFu) - 8) * dua_ * xa.y;
+            su0 += (float)((int)((uva >> 12) & 0xFu) - 8) * dua_ * xb.y;
+            su0 += (float)((int)((uva >> 16) & 0xFu) - 8) * dua_ * xa.z;
+            su0 += (float)((int)((uva >> 20) & 0xFu) - 8) * dua_ * xb.z;
+            su0 += (float)((int)((uva >> 24) & 0xFu) - 8) * dua_ * xa.w;
+            su0 += (float)((int)(uva >> 28) - 8) * dua_ * xb.w;
+            sg1 += (float)((int)(gvb         & 0xFu) - 8) * dgb_ * xa.x;
+            sg1 += (float)((int)((gvb >>  4) & 0xFu) - 8) * dgb_ * xb.x;
+            sg1 += (float)((int)((gvb >>  8) & 0xFu) - 8) * dgb_ * xa.y;
+            sg1 += (float)((int)((gvb >> 12) & 0xFu) - 8) * dgb_ * xb.y;
+            sg1 += (float)((int)((gvb >> 16) & 0xFu) - 8) * dgb_ * xa.z;
+            sg1 += (float)((int)((gvb >> 20) & 0xFu) - 8) * dgb_ * xb.z;
+            sg1 += (float)((int)((gvb >> 24) & 0xFu) - 8) * dgb_ * xa.w;
+            sg1 += (float)((int)(gvb >> 28) - 8) * dgb_ * xb.w;
+            su1 += (float)((int)(uvb         & 0xFu) - 8) * dub_ * xa.x;
+            su1 += (float)((int)((uvb >>  4) & 0xFu) - 8) * dub_ * xb.x;
+            su1 += (float)((int)((uvb >>  8) & 0xFu) - 8) * dub_ * xa.y;
+            su1 += (float)((int)((uvb >> 12) & 0xFu) - 8) * dub_ * xb.y;
+            su1 += (float)((int)((uvb >> 16) & 0xFu) - 8) * dub_ * xa.z;
+            su1 += (float)((int)((uvb >> 20) & 0xFu) - 8) * dub_ * xb.z;
+            su1 += (float)((int)((uvb >> 24) & 0xFu) - 8) * dub_ * xa.w;
+            su1 += (float)((int)(uvb >> 28) - 8) * dub_ * xb.w;
         }
     }
     sg0 = warp_reduce_sum(sg0);
@@ -326,7 +332,15 @@ int tt_embed_q4_0(const void *dW, int tok, float *dx, int dim, cudaStream_t stre
 int tt_logits_dispatch(const void *dW, int is_q8, const float *dx,
                        float *dlogits, int vocab, int K, cudaStream_t stream) {
     dim3 g, b; gemv_dims(vocab, &g, &b);
-    if (is_q8) b.y = 1;   /* M6.3b: one warp per block for the head (y sweep 16->8->4->2->1 monotone win) */
+    if (is_q8) {
+        /* M6.3b: one warp per block for the head (y sweep 16->8->4->2->1
+         * monotone win). Grid MUST be recomputed for the smaller block or
+         * rows >= grid.x*b.y never get written (stale logits -> degenerate
+         * sampling). The original sweep shipped without this and silently
+         * zeroed every token id >= vocab/16. */
+        b.y = 1;
+        g.x = (vocab + b.y - 1) / b.y;
+    }
     if (is_q8)
         k_logits_q8_0<<<g, b, 0, stream>>>((const BlockQ8_0 *)dW, dx, dlogits, vocab, K);
     else
