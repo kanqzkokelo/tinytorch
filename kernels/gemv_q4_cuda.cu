@@ -34,105 +34,159 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 // block's scale) - in-row for every block except possibly the last;
 // nb even guarantees the last block is odd-b (aligned path), so no
 // out-of-row access. Requires nb even.
+// V2: two rows per warp. Each warp computes output rows 2r and 2r+1,
+// sharing every x float4 load between them (x re-read pressure halves;
+// weight bytes in flight double per lane). Same nb-even contract as V2.
 __global__ void k_gemv_q4_0(const BlockQ4_0 *__restrict__ W,
                             const float *__restrict__ x,
                             float *__restrict__ y,
                             int M, int K) {
-    const int row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= M) return;
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 2;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;                    // caller pads M to even
 
     const int lane = threadIdx.x;
     const int nb = K / 32;                    // q4_0 blocks per row
-    const uint32_t *roww = (const uint32_t *)((const char *)W + (long)row * nb * 18);
-    float sum = 0.0f;
+    const uint32_t *rw0 = (const uint32_t *)((const char *)W + (long)row0 * nb * 18);
+    const uint32_t *rw1 = (const uint32_t *)((const char *)W + (long)row1 * nb * 18);
+    float s0 = 0.0f, s1 = 0.0f;
 
     for (int b = lane; b < nb; b += 32) {
         const int wsc = (18 * b) >> 2;                 // word holding blk.d
-        const unsigned short d16 = (unsigned short)
-            (((18 * b) & 2) ? (roww[wsc] >> 16) : (roww[wsc] & 0xFFFFu));
-        const float d = __half2float(__ushort_as_half(d16));
+        const unsigned short d16a = (unsigned short)
+            (((18 * b) & 2) ? (rw0[wsc] >> 16) : (rw0[wsc] & 0xFFFFu));
+        const unsigned short d16b = (unsigned short)
+            (((18 * b) & 2) ? (rw1[wsc] >> 16) : (rw1[wsc] & 0xFFFFu));
+        const float da = __half2float(__ushort_as_half(d16a));
+        const float db = __half2float(__ushort_as_half(d16b));
         const int a0 = (18 * b + 2) >> 2;              // first qs word
         const int sh  = (18 * b + 2) & 2;              // 2 => misaligned merge
         const float4 *x4 = (const float4 *)(x + b * 32);
 #pragma unroll
         for (int k = 0; k < 4; k++) {
-            const uint32_t lo = roww[a0 + k];
-            const uint32_t vv = sh ? __byte_perm(lo, roww[a0 + k + 1], 0x5432) : lo;
+            const uint32_t la = rw0[a0 + k];
+            const uint32_t lb = rw1[a0 + k];
+            const uint32_t va = sh ? __byte_perm(la, rw0[a0 + k + 1], 0x5432) : la;
+            const uint32_t vb = sh ? __byte_perm(lb, rw1[a0 + k + 1], 0x5432) : lb;
             const float4 xa = x4[k];       // x[4k .. 4k+3]   <- low nibbles
             const float4 xb = x4[k + 4];   // x[16+4k .. +3]  <- high nibbles
-            sum += (float)((vv         & 0xFu) - 8u) * d * xa.x;
-            sum += (float)(((vv >>  4) & 0xFu) - 8u) * d * xa.y;
-            sum += (float)(((vv >>  8) & 0xFu) - 8u) * d * xa.z;
-            sum += (float)(((vv >> 12) & 0xFu) - 8u) * d * xa.w;
-            sum += (float)(((vv >> 16) & 0xFu) - 8u) * d * xb.x;
-            sum += (float)(((vv >> 20) & 0xFu) - 8u) * d * xb.y;
-            sum += (float)(((vv >> 24) & 0xFu) - 8u) * d * xb.z;
-            sum += (float)( (vv >> 28)         - 8u) * d * xb.w;
+            s0 += (float)((va         & 0xFu) - 8u) * da * xa.x;
+            s0 += (float)(((va >>  4) & 0xFu) - 8u) * da * xa.y;
+            s0 += (float)(((va >>  8) & 0xFu) - 8u) * da * xa.z;
+            s0 += (float)(((va >> 12) & 0xFu) - 8u) * da * xa.w;
+            s0 += (float)(((va >> 16) & 0xFu) - 8u) * da * xb.x;
+            s0 += (float)(((va >> 20) & 0xFu) - 8u) * da * xb.y;
+            s0 += (float)(((va >> 24) & 0xFu) - 8u) * da * xb.z;
+            s0 += (float)( (va >> 28)         - 8u) * da * xb.w;
+            s1 += (float)((vb         & 0xFu) - 8u) * db * xa.x;
+            s1 += (float)(((vb >>  4) & 0xFu) - 8u) * db * xa.y;
+            s1 += (float)(((vb >>  8) & 0xFu) - 8u) * db * xa.z;
+            s1 += (float)(((vb >> 12) & 0xFu) - 8u) * db * xa.w;
+            s1 += (float)(((vb >> 16) & 0xFu) - 8u) * db * xb.x;
+            s1 += (float)(((vb >> 20) & 0xFu) - 8u) * db * xb.y;
+            s1 += (float)(((vb >> 24) & 0xFu) - 8u) * db * xb.z;
+            s1 += (float)( (vb >> 28)         - 8u) * db * xb.w;
         }
     }
-    sum = warp_reduce_sum(sum);
-    if (lane == 0) y[row] = sum;
+    s0 = warp_reduce_sum(s0);
+    s1 = warp_reduce_sum(s1);
+    if (lane == 0) {
+        y[row0] = s0;
+        if (row1 < M) y[row1] = s1;
+    }
 }
 
 // Fused MLP up-projection: h[m] = silu(W_gate[m,:] @ x) * (W_up[m,:] @ x).
-// V2: same vectorized streaming as k_gemv_q4_0 above (same nb-even contract).
+// V2: two rows per warp (same sharing scheme as k_gemv_q4_0; nb-even contract).
 __global__ void k_fused_swiglu_q4_0(const BlockQ4_0 *__restrict__ W_gate,
                                     const BlockQ4_0 *__restrict__ W_up,
                                     const float *__restrict__ x,
                                     float *__restrict__ out,
                                     int M, int K) {
-    const int row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= M) return;
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 2;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;
 
     const int lane = threadIdx.x;
     const int nb = K / 32;
-    const uint32_t *gw = (const uint32_t *)((const char *)W_gate + (long)row * nb * 18);
-    const uint32_t *uw = (const uint32_t *)((const char *)W_up   + (long)row * nb * 18);
-    float sg = 0.0f, su = 0.0f;
+    const uint32_t *gw0 = (const uint32_t *)((const char *)W_gate + (long)row0 * nb * 18);
+    const uint32_t *gw1 = (const uint32_t *)((const char *)W_gate + (long)row1 * nb * 18);
+    const uint32_t *uw0 = (const uint32_t *)((const char *)W_up   + (long)row0 * nb * 18);
+    const uint32_t *uw1 = (const uint32_t *)((const char *)W_up   + (long)row1 * nb * 18);
+    float sg0 = 0.0f, su0 = 0.0f, sg1 = 0.0f, su1 = 0.0f;
 
     for (int b = lane; b < nb; b += 32) {
         const int wsc = (18 * b) >> 2;
         const int sh  = (18 * b + 2) & 2;
-        const unsigned short dg16 = (unsigned short)
-            (((18 * b) & 2) ? (gw[wsc] >> 16) : (gw[wsc] & 0xFFFFu));
-        const unsigned short du16 = (unsigned short)
-            (((18 * b) & 2) ? (uw[wsc] >> 16) : (uw[wsc] & 0xFFFFu));
-        const float dg = __half2float(__ushort_as_half(dg16));
-        const float du = __half2float(__ushort_as_half(du16));
+        const unsigned short dga = (unsigned short)
+            (((18 * b) & 2) ? (gw0[wsc] >> 16) : (gw0[wsc] & 0xFFFFu));
+        const unsigned short dgb = (unsigned short)
+            (((18 * b) & 2) ? (gw1[wsc] >> 16) : (gw1[wsc] & 0xFFFFu));
+        const unsigned short dua = (unsigned short)
+            (((18 * b) & 2) ? (uw0[wsc] >> 16) : (uw0[wsc] & 0xFFFFu));
+        const unsigned short dub = (unsigned short)
+            (((18 * b) & 2) ? (uw1[wsc] >> 16) : (uw1[wsc] & 0xFFFFu));
+        const float dga_ = __half2float(__ushort_as_half(dga));
+        const float dgb_ = __half2float(__ushort_as_half(dgb));
+        const float dua_ = __half2float(__ushort_as_half(dua));
+        const float dub_ = __half2float(__ushort_as_half(dub));
         const int g0 = (18 * b + 2) >> 2;
-        const int u0 = g0;                           // same layout both rows
         const float4 *x4 = (const float4 *)(x + b * 32);
 #pragma unroll
         for (int k = 0; k < 4; k++) {
-            const uint32_t glo = gw[g0 + k];
-            const uint32_t ulo = uw[u0 + k];
-            const uint32_t gvv = sh ? __byte_perm(glo, gw[g0 + k + 1], 0x5432) : glo;
-            const uint32_t uvv = sh ? __byte_perm(ulo, uw[u0 + k + 1], 0x5432) : ulo;
+            const uint32_t gla = gw0[g0 + k], glb = gw1[g0 + k];
+            const uint32_t ula = uw0[g0 + k], ulb = uw1[g0 + k];
+            const uint32_t gva = sh ? __byte_perm(gla, gw0[g0 + k + 1], 0x5432) : gla;
+            const uint32_t gvb = sh ? __byte_perm(glb, gw1[g0 + k + 1], 0x5432) : glb;
+            const uint32_t uva = sh ? __byte_perm(ula, uw0[g0 + k + 1], 0x5432) : ula;
+            const uint32_t uvb = sh ? __byte_perm(ulb, uw1[g0 + k + 1], 0x5432) : ulb;
             const float4 xa = x4[k];
             const float4 xb = x4[k + 4];
-            sg += (float)((gvv         & 0xFu) - 8u) * dg * xa.x;
-            sg += (float)(((gvv >>  4) & 0xFu) - 8u) * dg * xa.y;
-            sg += (float)(((gvv >>  8) & 0xFu) - 8u) * dg * xa.z;
-            sg += (float)(((gvv >> 12) & 0xFu) - 8u) * dg * xa.w;
-            sg += (float)(((gvv >> 16) & 0xFu) - 8u) * dg * xb.x;
-            sg += (float)(((gvv >> 20) & 0xFu) - 8u) * dg * xb.y;
-            sg += (float)(((gvv >> 24) & 0xFu) - 8u) * dg * xb.z;
-            sg += (float)( (gvv >> 28)         - 8u) * dg * xb.w;
-            su += (float)((uvv         & 0xFu) - 8u) * du * xa.x;
-            su += (float)(((uvv >>  4) & 0xFu) - 8u) * du * xa.y;
-            su += (float)(((uvv >>  8) & 0xFu) - 8u) * du * xa.z;
-            su += (float)(((uvv >> 12) & 0xFu) - 8u) * du * xa.w;
-            su += (float)(((uvv >> 16) & 0xFu) - 8u) * du * xb.x;
-            su += (float)(((uvv >> 20) & 0xFu) - 8u) * du * xb.y;
-            su += (float)(((uvv >> 24) & 0xFu) - 8u) * du * xb.z;
-            su += (float)( (uvv >> 28)         - 8u) * du * xb.w;
+            sg0 += (float)((gva         & 0xFu) - 8u) * dga_ * xa.x;
+            sg0 += (float)(((gva >>  4) & 0xFu) - 8u) * dga_ * xa.y;
+            sg0 += (float)(((gva >>  8) & 0xFu) - 8u) * dga_ * xa.z;
+            sg0 += (float)(((gva >> 12) & 0xFu) - 8u) * dga_ * xa.w;
+            sg0 += (float)(((gva >> 16) & 0xFu) - 8u) * dga_ * xb.x;
+            sg0 += (float)(((gva >> 20) & 0xFu) - 8u) * dga_ * xb.y;
+            sg0 += (float)(((gva >> 24) & 0xFu) - 8u) * dga_ * xb.z;
+            sg0 += (float)( (gva >> 28)         - 8u) * dga_ * xb.w;
+            su0 += (float)((uva         & 0xFu) - 8u) * dua_ * xa.x;
+            su0 += (float)(((uva >>  4) & 0xFu) - 8u) * dua_ * xa.y;
+            su0 += (float)(((uva >>  8) & 0xFu) - 8u) * dua_ * xa.z;
+            su0 += (float)(((uva >> 12) & 0xFu) - 8u) * dua_ * xa.w;
+            su0 += (float)(((uva >> 16) & 0xFu) - 8u) * dua_ * xb.x;
+            su0 += (float)(((uva >> 20) & 0xFu) - 8u) * dua_ * xb.y;
+            su0 += (float)(((uva >> 24) & 0xFu) - 8u) * dua_ * xb.z;
+            su0 += (float)( (uva >> 28)         - 8u) * dua_ * xb.w;
+            sg1 += (float)((gvb         & 0xFu) - 8u) * dgb_ * xa.x;
+            sg1 += (float)(((gvb >>  4) & 0xFu) - 8u) * dgb_ * xa.y;
+            sg1 += (float)(((gvb >>  8) & 0xFu) - 8u) * dgb_ * xa.z;
+            sg1 += (float)(((gvb >> 12) & 0xFu) - 8u) * dgb_ * xa.w;
+            sg1 += (float)(((gvb >> 16) & 0xFu) - 8u) * dgb_ * xb.x;
+            sg1 += (float)(((gvb >> 20) & 0xFu) - 8u) * dgb_ * xb.y;
+            sg1 += (float)(((gvb >> 24) & 0xFu) - 8u) * dgb_ * xb.z;
+            sg1 += (float)( (gvb >> 28)         - 8u) * dgb_ * xb.w;
+            su1 += (float)((uvb         & 0xFu) - 8u) * dub_ * xa.x;
+            su1 += (float)(((uvb >>  4) & 0xFu) - 8u) * dub_ * xa.y;
+            su1 += (float)(((uvb >>  8) & 0xFu) - 8u) * dub_ * xa.z;
+            su1 += (float)(((uvb >> 12) & 0xFu) - 8u) * dub_ * xa.w;
+            su1 += (float)(((uvb >> 16) & 0xFu) - 8u) * dub_ * xb.x;
+            su1 += (float)(((uvb >> 20) & 0xFu) - 8u) * dub_ * xb.y;
+            su1 += (float)(((uvb >> 24) & 0xFu) - 8u) * dub_ * xb.z;
+            su1 += (float)( (uvb >> 28)         - 8u) * dub_ * xb.w;
         }
     }
-    sg = warp_reduce_sum(sg);
-    su = warp_reduce_sum(su);
+    sg0 = warp_reduce_sum(sg0);
+    su0 = warp_reduce_sum(su0);
+    sg1 = warp_reduce_sum(sg1);
+    su1 = warp_reduce_sum(su1);
     if (lane == 0) {
-        const float g = sg;
-        out[row] = (g / (1.0f + expf(-g))) * su;
+        const float ga = sg0;
+        out[row0] = (ga / (1.0f + expf(-ga))) * su0;
+        if (row1 < M) {
+            const float gb = sg1;
+            out[row1] = (gb / (1.0f + expf(-gb))) * su1;
+        }
     }
 }
 
@@ -232,17 +286,24 @@ static void gemv_dims(int M, dim3 *grid, dim3 *block) {
     grid->x = (M + block->y - 1) / block->y; grid->y = 1; grid->z = 1;
 }
 
+// V2 kernels compute TWO rows per warp -> halve the grid accordingly
+// (used by the layer GEMV launchers only; logits stays one-row-per-warp).
+static void gemv_dims2(int M, dim3 *grid, dim3 *block) {
+    block->x = 32; block->y = 16; block->z = 1;
+    grid->x = (M + block->y * 2 - 1) / (block->y * 2); grid->y = 1; grid->z = 1;
+}
+
 /* stream-aware launchers: keeps the whole step on one non-blocking stream */
 int tt_gemv_q4_0(const void *dW, const float *dx, float *dy, int M, int K,
                  cudaStream_t stream) {
-    dim3 g, b; gemv_dims(M, &g, &b);
+    dim3 g, b; gemv_dims2(M, &g, &b);
     k_gemv_q4_0<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW, dx, dy, M, K);
     return (int)cudaGetLastError();
 }
 
 int tt_swiglu_q4_0(const void *dGate, const void *dUp, const float *dx,
                    float *dh, int M, int K, cudaStream_t stream) {
-    dim3 g, b; gemv_dims(M, &g, &b);
+    dim3 g, b; gemv_dims2(M, &g, &b);
     k_fused_swiglu_q4_0<<<g, b, 0, stream>>>((const BlockQ4_0 *)dGate, (const BlockQ4_0 *)dUp,
                                              dx, dh, M, K);
     return (int)cudaGetLastError();
