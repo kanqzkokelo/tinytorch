@@ -165,34 +165,63 @@ __global__ void k_kv_scatter(const float *__restrict__ kst, const float *__restr
     Vc[(long)slot*kvdim + i] = vst[i];
 }
 
-/* Two-stage argmax over vocab. */
+/* Two-stage argmax over vocab. V2: float4 loads + parallel final reduce.
+ * Tie-break stays deterministic: on equal values the smaller index wins
+ * (matches the original scalar kernel and the greedy-sampling oracle). */
 __global__ void k_argmax_partial(const float *__restrict__ x, int n,
                                  float *__restrict__ bvals, int *__restrict__ bidxs) {
-    __shared__ float sv[128];
-    __shared__ int si[128];
+    __shared__ float sv[256];
+    __shared__ int si[256];
     const int tid = threadIdx.x;
+    const int n4 = n >> 2;
+    const float4 *x4 = (const float4 *)(const void *)x;
     float best = -INFINITY; int bi = 0;
-    for (int i = tid; i < n; i += blockDim.x) {
+    for (int i = tid; i < n4; i += blockDim.x) {
+        const float4 v = x4[i];
+        const int base = i << 2;
+        if (v.x > best) { best = v.x; bi = base + 0; }
+        if (v.y > best) { best = v.y; bi = base + 1; }
+        if (v.z > best) { best = v.z; bi = base + 2; }
+        if (v.w > best) { best = v.w; bi = base + 3; }
+    }
+    for (int i = (n4 << 2) + tid; i < n; i += blockDim.x) {
         const float v = x[i];
-        if (v > best || (v == best && i < bi)) { best = v; bi = i; }
+        if (v > best) { best = v; bi = i; }
     }
     sv[tid] = best; si[tid] = bi;
     __syncthreads();
     for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
         if (tid < s2) {
-            if (sv[tid + s2] > sv[tid]) { sv[tid] = sv[tid + s2]; si[tid] = si[tid + s2]; }
+            const float ov = sv[tid + s2]; const int oi = si[tid + s2];
+            if (ov > sv[tid] || (ov == sv[tid] && oi < si[tid])) {
+                sv[tid] = ov; si[tid] = oi;
+            }
         }
         __syncthreads();
     }
     if (tid == 0) { bvals[blockIdx.x] = sv[0]; bidxs[blockIdx.x] = si[0]; }
 }
 
+/* Final reduce over per-block partials: one block of ARGMAX_NB threads,
+ * same value-then-index tie-break as the partial kernel. */
 __global__ void k_argmax_final(const float *__restrict__ bvals, const int *__restrict__ bidxs,
                                int nb, int *__restrict__ out) {
+    __shared__ float sv[64];
+    __shared__ int si[64];
+    const int tid = threadIdx.x;
     float best = -INFINITY; int bi = 0;
-    for (int i = 0; i < nb; i++)
-        if (bvals[i] > best) { best = bvals[i]; bi = bidxs[i]; }
-    *out = bi;
+    if (tid < nb) { best = bvals[tid]; bi = bidxs[tid]; }
+    else { best = -INFINITY; bi = 0; }
+    sv[tid] = best; si[tid] = bi;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (tid < s2) {
+            const float ov = sv[tid + s2]; const int oi = si[tid + s2];
+            if (ov > sv[tid] || (ov == sv[tid] && oi < si[tid])) { sv[tid] = ov; si[tid] = oi; }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) *out = si[0];
 }
 
 /* Dynamic-token embedding for cudaGraph replay: the token id is read from
@@ -682,9 +711,9 @@ static int sample_eager(Qwen2Engine *e) {
     if (tt_profiling()) tt_prof_end(TT_P_LOGITS, e->stream);
 
     if (tt_profiling()) tt_prof_begin(TT_P_ARGMAX, e->stream);
-    const int nb = 256;
-    k_argmax_partial<<<nb, 128, 0, e->stream>>>(e->d_logits, c->vocab, e->d_bvals, e->d_bidxs);
-    k_argmax_final<<<1, 1, 0, e->stream>>>(e->d_bvals, e->d_bidxs, nb, e->d_out);
+    const int nb = 64;
+    k_argmax_partial<<<nb, 256, 0, e->stream>>>(e->d_logits, c->vocab, e->d_bvals, e->d_bidxs);
+    k_argmax_final<<<1, nb, 0, e->stream>>>(e->d_bvals, e->d_bidxs, nb, e->d_out);
 
     int id = 0;
     cudaMemcpyAsync(&id, e->d_out, sizeof(int), cudaMemcpyDeviceToHost, e->stream);
@@ -740,9 +769,9 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
         e->d_x, e->d_out_norm, e->d_xn, c->dim, c->rms_eps);
     const int lrc = tt_logits_dispatch(e->d_out_w, e->out_is_q8, e->d_xn,
                                        e->d_logits, c->vocab, c->dim, e->stream);
-    const int nb = 256;
-    k_argmax_partial<<<nb, 128, 0, e->stream>>>(e->d_logits, c->vocab, e->d_bvals, e->d_bidxs);
-    k_argmax_final<<<1, 1, 0, e->stream>>>(e->d_bvals, e->d_bidxs, nb, e->d_out);
+    const int nb = 64;
+    k_argmax_partial<<<nb, 256, 0, e->stream>>>(e->d_logits, c->vocab, e->d_bvals, e->d_bidxs);
+    k_argmax_final<<<1, nb, 0, e->stream>>>(e->d_bvals, e->d_bidxs, nb, e->d_out);
     k_pos_inc<<<1, 1, 0, e->stream>>>(e->d_pos);
 
     cudaGraph_t graph = NULL;
