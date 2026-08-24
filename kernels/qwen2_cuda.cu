@@ -386,7 +386,9 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     /* graph replay state */
     e->graph_exec = NULL;
     e->graph_ready = 0;
-    e->no_graph = getenv("TT_NO_GRAPH") ? 1 : 0;
+    /* TT_PROFILE forces eager mode: event records inside the captured region
+     * are illegal, so per-stage profiling always runs graph-free. */
+    e->no_graph = (getenv("TT_NO_GRAPH") || getenv("TT_PROFILE")) ? 1 : 0;
     e->pending_tok = -1;
     cudaMalloc(&e->d_next_tok, sizeof(int));
     cudaHostAlloc(&e->h_sampled, sizeof(int), cudaHostAllocDefault);
@@ -415,6 +417,92 @@ void qwen2_engine_free(Qwen2Engine *e) {
 /* 0 while running eagerly; 1 while a cudaStream capture is in flight. */
 static int g_capturing = 0;
 
+/* ---------- TT_PROFILE per-stage instrumentation ----------
+ * Enabled by env TT_PROFILE (which also forces eager/no-graph mode at create:
+ * cudaEvent records are not allowed inside a captured region). Stages bracket
+ * kernel launches with lazy-created event pairs on e->stream; per-invocation
+ * ms is accumulated and stored for a median table printed via
+ * qwen2_debug_profile_report(). */
+typedef enum {
+    TT_P_EMBED = 0, TT_P_QKV, TT_P_OMLP, TT_P_FLASH,
+    TT_P_RMSNORM, TT_P_SCATTER, TT_P_LOGITS, TT_P_ARGMAX,
+    TT_P_NSTAGES
+} TTProfStage;
+
+static const char *tt_prof_names[TT_P_NSTAGES] = {
+    "embed", "qkv-gemv", "o+mlp-gemv", "flash",
+    "rmsnorm", "kv-scatter", "logits-gemv", "argmax"
+};
+
+typedef struct {
+    cudaEvent_t b, e;
+    double sum;
+    int n;
+    float s[8192];   /* per-invocation ms, capped */
+} TTProf;
+
+static TTProf tt_prof[TT_P_NSTAGES];
+static int tt_prof_on = -1;
+
+static int tt_profiling(void) {
+    if (tt_prof_on < 0) tt_prof_on = getenv("TT_PROFILE") ? 1 : 0;
+    return tt_prof_on;
+}
+
+static void tt_prof_begin(TTProfStage st, cudaStream_t stream) {
+    TTProf *p = &tt_prof[st];
+    if (!p->b) { cudaEventCreate(&p->b); cudaEventCreate(&p->e); }
+    cudaEventRecord(p->b, stream);
+}
+
+static void tt_prof_end(TTProfStage st, cudaStream_t stream) {
+    TTProf *p = &tt_prof[st];
+    cudaEventRecord(p->e, stream);
+    cudaEventSynchronize(p->e);
+    float ms = 0.f;
+    if (cudaEventElapsedTime(&ms, p->b, p->e) == cudaSuccess) {
+        p->sum += ms;
+        if (p->n < 8192) p->s[p->n++] = ms;
+    }
+}
+
+void qwen2_debug_profile_reset(void) {
+    for (int i = 0; i < TT_P_NSTAGES; i++) { tt_prof[i].sum = 0; tt_prof[i].n = 0; }
+}
+
+static int tt_flt_cmp(const void *a, const void *b) {
+    const float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+void qwen2_debug_profile_report(int nsteps) {
+    if (!tt_profiling() || nsteps <= 0) return;
+    printf("PROFILE mode=eager\n");
+    double total = 0;
+    for (int i = 0; i < TT_P_NSTAGES; i++) {
+        TTProf *p = &tt_prof[i];
+        if (!p->n) continue;
+        /* per-invocation counts are deterministic per step, so samples split
+         * evenly into per-step groups; sum each group -> per-step totals */
+        const int per = p->n / nsteps;
+        if (per < 1) continue;
+        const int use = (p->n / per) < nsteps ? (p->n / per) : nsteps;
+        float step_tot[512];
+        const int ns = use < 512 ? use : 512;
+        for (int s = 0; s < ns; s++) {
+            float acc = 0.f;
+            for (int j = s * per; j < (s + 1) * per && j < p->n; j++) acc += p->s[j];
+            step_tot[s] = acc;
+        }
+        qsort(step_tot, (size_t)ns, sizeof(float), tt_flt_cmp);
+        const float med = (ns & 1) ? step_tot[ns / 2]
+                                   : 0.5f * (step_tot[ns / 2 - 1] + step_tot[ns / 2]);
+        printf("PROFILE %-12s %8.3f\n", tt_prof_names[i], med);
+        total += med;
+    }
+    printf("PROFILE %-12s %8.3f\n", "TOTAL(med)", total);
+}
+
 static int forward_layers(Qwen2Engine *e) {
     const TTConfig *c = &e->cfg;
     const int HD = c->head_dim;
@@ -433,10 +521,13 @@ static int forward_layers(Qwen2Engine *e) {
          * selected by the DEVICE position scalar (*e->d_pos). */
 
         /* 1. xn = rmsnorm(x) * attn_norm */
+        if (tt_profiling()) tt_prof_begin(TT_P_RMSNORM, e->stream);
         k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
             e->d_x, w->attn_norm, e->d_xn, c->dim, c->rms_eps);
+        if (tt_profiling()) tt_prof_end(TT_P_RMSNORM, e->stream);
 
         /* 2. projections: q -> d_q ; k,v -> KV cache slot pos */
+        if (tt_profiling()) tt_prof_begin(TT_P_QKV, e->stream);
         tt_gemv_q4_0(w->q, e->d_xn, e->d_q, c->dim, c->dim, e->stream);
         tt_gemv_q4_0(w->k, e->d_xn, e->d_k_stage, c->n_kv_heads * HD, c->dim, e->stream);
         /* QKV biases present in some GGUF conversions of Qwen2 (applied by
@@ -458,36 +549,47 @@ static int forward_layers(Qwen2Engine *e) {
             k_rope<<<g, b, 0, e->stream>>>(e->d_k_stage, c->n_kv_heads, HD, e->d_pos, c->rope_base);
         }
 
-        /* v projection + bias, then scatter staged K/V into the cache slot
-         * chosen by *d_pos. Must precede flash attention. */
+        /* v projection + bias (QKV group) */
         tt_gemv_q4_0(w->v, e->d_xn, e->d_v_stage, c->n_kv_heads * HD, c->dim, e->stream);
         if (w->v_bias)
             k_add<<<(kvdim + 255) / 256, 256, 0, e->stream>>>(e->d_v_stage, w->v_bias, kvdim);
+        if (tt_profiling()) tt_prof_end(TT_P_QKV, e->stream);
+
+        /* scatter staged K/V into the cache slot chosen by *d_pos.
+         * Must precede flash attention. */
+        if (tt_profiling()) tt_prof_begin(TT_P_SCATTER, e->stream);
         k_kv_scatter<<<(kvdim + 255) / 256, 256, 0, e->stream>>>(
             e->d_k_stage, e->d_v_stage, Kl_f, Vl_f, e->d_pos,
             c->n_kv_heads, HD, c->max_ctx);
+        if (tt_profiling()) tt_prof_end(TT_P_SCATTER, e->stream);
 
         /* 4. GQA flash attention over slots [0..pos] */
+        if (tt_profiling()) tt_prof_begin(TT_P_FLASH, e->stream);
         k_flash_gqa<<<c->n_heads, 32, 0, e->stream>>>(
             e->d_q, Kl_f, Vl_f, e->d_att,
             e->d_pos,
             c->n_heads, c->n_kv_heads, HD, c->max_ctx,
             1.0f / sqrtf((float)HD));
+        if (tt_profiling()) tt_prof_end(TT_P_FLASH, e->stream);
 
         /* 5. Wo projection + residual: x += att @ Wo^T */
+        if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
         tt_gemv_q4_0(w->o, e->d_att, e->d_xn, c->dim, c->dim, e->stream);
         k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
+        if (tt_profiling()) tt_prof_end(TT_P_OMLP, e->stream);
 
         /* 6. ffn norm */
+        if (tt_profiling()) tt_prof_begin(TT_P_RMSNORM, e->stream);
         k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
             e->d_x, w->ffn_norm, e->d_xn, c->dim, c->rms_eps);
+        if (tt_profiling()) tt_prof_end(TT_P_RMSNORM, e->stream);
 
-        /* 7. fused SwiGLU MLP */
+        /* 7+8. fused SwiGLU MLP + down projection + residual */
+        if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
         tt_swiglu_q4_0(w->gate, w->up, e->d_xn, e->d_h, c->hidden_dim, c->dim, e->stream);
-
-        /* 8. down projection + residual */
         tt_gemv_q4_0(w->down, e->d_h, e->d_xn, c->dim, c->hidden_dim, e->stream);
         k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
+        if (tt_profiling()) tt_prof_end(TT_P_OMLP, e->stream);
 
         {
             static const char *dump_env = NULL;
@@ -527,7 +629,10 @@ static int forward_layers(Qwen2Engine *e) {
 }
 
 static int embed_token(Qwen2Engine *e, int tok) {
-    return tt_embed_q4_0(e->d_embd, tok, e->d_x, e->cfg.dim, e->stream);
+    if (tt_profiling()) tt_prof_begin(TT_P_EMBED, e->stream);
+    const int rc = tt_embed_q4_0(e->d_embd, tok, e->d_x, e->cfg.dim, e->stream);
+    if (tt_profiling()) tt_prof_end(TT_P_EMBED, e->stream);
+    return rc;
 }
 
 static int advance(Qwen2Engine *e, int tok) {
@@ -565,12 +670,18 @@ int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
  * d_logits stays valid afterwards (dump_logits relies on this). */
 static int sample_eager(Qwen2Engine *e) {
     const TTConfig *c = &e->cfg;
+    if (tt_profiling()) tt_prof_begin(TT_P_RMSNORM, e->stream);
     k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
         e->d_x, e->d_out_norm, e->d_xn, c->dim, c->rms_eps);
+    if (tt_profiling()) tt_prof_end(TT_P_RMSNORM, e->stream);
+
+    if (tt_profiling()) tt_prof_begin(TT_P_LOGITS, e->stream);
     int rc = tt_logits_dispatch(e->d_out_w, e->out_is_q8, e->d_xn,
                                 e->d_logits, c->vocab, c->dim, e->stream);
     if (rc) return -1;
+    if (tt_profiling()) tt_prof_end(TT_P_LOGITS, e->stream);
 
+    if (tt_profiling()) tt_prof_begin(TT_P_ARGMAX, e->stream);
     const int nb = 256;
     k_argmax_partial<<<nb, 128, 0, e->stream>>>(e->d_logits, c->vocab, e->d_bvals, e->d_bidxs);
     k_argmax_final<<<1, 1, 0, e->stream>>>(e->d_bvals, e->d_bidxs, nb, e->d_out);
@@ -578,6 +689,7 @@ static int sample_eager(Qwen2Engine *e) {
     int id = 0;
     cudaMemcpyAsync(&id, e->d_out, sizeof(int), cudaMemcpyDeviceToHost, e->stream);
     cudaStreamSynchronize(e->stream);
+    if (tt_profiling()) tt_prof_end(TT_P_ARGMAX, e->stream);
     return id;
 }
 
@@ -696,7 +808,19 @@ int qwen2_engine_next(Qwen2Engine *e) {
     /* Graph replay: feed pending_tok through the full step, sample the NEXT
      * token, advance d_pos exactly once inside the graph. Returned sequence
      * is identical to eager: s1 (first call above), then s2, s3, ... */
-    cudaMemcpyAsync(e->d_next_tok, &e->pending_tok, sizeof(int),
+    return qwen2_debug_replay_step(e, e->pending_tok);
+}
+
+/* One graph-replayed decode step: H2D token -> graph launch -> D2H sample
+ * -> sync, plus pos/pending bookkeeping. Shared by qwen2_engine_next and
+ * tools/profile_step.cu (single code path, no duplication). Returns the
+ * sampled id, or -1 when the graph path is unavailable (eager unsupported
+ * for profiling). */
+int qwen2_debug_replay_step(Qwen2Engine *e, int next_tok) {
+    if (!e || !e->graph_ready || next_tok < 0) return -1;
+    const int vocab = e->cfg.vocab;
+
+    cudaMemcpyAsync(e->d_next_tok, &next_tok, sizeof(int),
                     cudaMemcpyHostToDevice, e->stream);   /* same stream, before launch */
     cudaGraphLaunch(e->graph_exec, e->stream);
     cudaMemcpyAsync(e->h_sampled, e->d_out, sizeof(int),
@@ -704,11 +828,13 @@ int qwen2_engine_next(Qwen2Engine *e) {
     cudaStreamSynchronize(e->stream);                     /* read h_sampled only after sync */
 
     const int id = e->h_sampled[0];
-    if (id < 0 || id >= c->vocab) return -3;
+    if (id < 0 || id >= vocab) return -3;
     e->pos++;                /* host mirror of k_pos_inc (bookkeeping/guards) */
     e->pending_tok = id;     /* already sampled internally — one step ahead */
     return id;
 }
+
+void *qwen2_debug_stream(Qwen2Engine *e) { return e ? (void *)e->stream : NULL; }
 
 int qwen2_engine_pos(const Qwen2Engine *e) { return e ? e->pos : -1; }
 

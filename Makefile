@@ -99,3 +99,15 @@ $(BUILD)/dump_logits: tools/dump_logits.c src/loader_gguf.c kernels/gemv_q4_cuda
 dump_logits: $(BUILD)/dump_logits
 
 .PHONY: dump_logits
+
+$(BUILD)/profile_step: tools/profile_step.cu src/loader_gguf.c kernels/gemv_q4_cuda.cu kernels/qwen2_cuda.cu | $(BUILD)
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
+	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
+	  -o $@ \
+	  tools/profile_step.cu src/loader_gguf.c kernels/gemv_q4_cuda.cu kernels/qwen2_cuda.cu \
+	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
+
+profile_step: $(BUILD)/profile_step
+
+.PHONY: profile_step

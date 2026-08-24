@@ -58,3 +58,28 @@ Plan target was >=100 tok/s; shipped 75.6 tok/s = 1.30x the llama.cpp reference 
 this box but below plan goal. Remaining bottleneck is per-kernel bandwidth (~110 of
 176 GB/s) across ~400 small GEMV launches; next levers are cp.async staging or
 persistent-block schemes (documented in tools review). Parity maintained at every step.
+
+## M6.3b profile baseline
+Date: 2026-08-23 — NVIDIA GeForce RTX 3050 Laptop GPU (sm_86), Qwen2.5-0.5B-Instruct q4_0/q8_0-head, ctx<=6 tokens.
+
+Harness: `tools/profile_step 785,6722,315,9625,374` — K=20 replayed steps, cudaEvents around each `qwen2_debug_replay_step`, MIN reported.
+Per-stage table: `TT_PROFILE=1` forces EAGER mode (event records are illegal inside a captured region); per-stage cudaEvents inside forward_layers + sampling stage; table is median per-step ms over the same K=20 loop.
+
+```
+STEP_MS 12.072            (graph replay, min of 20)
+```
+
+```
+PROFILE mode=eager        (STEP_MS 13.623 eager — launch overhead visible)
+PROFILE embed           0.006
+PROFILE qkv-gemv        1.471
+PROFILE o+mlp-gemv      8.754
+PROFILE flash           0.378
+PROFILE rmsnorm         0.267
+PROFILE kv-scatter      0.080
+PROFILE logits-gemv     1.285
+PROFILE argmax          0.568
+PROFILE TOTAL(med)     12.809   (vs 13.62 eager STEP_MS; remainder = launch gaps + D2H)
+```
+
+Reading: o+mlp GEMVs = 68% of the step (the 253 MB q4_0 layer-weight read — Task 1 target). logits-GEMV 1.29 ms confirms Task 2 relevance (< 1.4 ms bar, marginal). flash 0.38 ms at pos<=6 = 2.9% — healthy. rmsnorm+scatter+embed ≈ 3% — confirmed skip. ncu: NOT available in $HOME/mmcuda/bin (`ls | grep -i ncu` empty, `which ncu` empty) — event timings carry the plan.

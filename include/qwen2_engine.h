@@ -37,6 +37,26 @@ int qwen2_engine_next(Qwen2Engine *e);
 
 int  qwen2_engine_pos(const Qwen2Engine *e);
 
+/* Debug/profiling hooks.
+ * qwen2_debug_replay_step performs exactly the graph-replay body of
+ * qwen2_engine_next: H2D next_tok -> graph launch -> D2H sample -> sync,
+ * plus pos/pending bookkeeping. Returns the sampled id, or -1 when the
+ * graph path is unavailable (eager unsupported for profiling). Used by
+ * tools/profile_step.cu to time one replayed step with cudaEvents. */
+int qwen2_debug_replay_step(Qwen2Engine *e, int next_tok);
+
+/* e->stream as void* so callers can record timing events on the same
+ * stream the decode work runs on (header stays CUDA-type-free). */
+void *qwen2_debug_stream(Qwen2Engine *e);
+
+/* TT_PROFILE per-stage accumulators (see kernels/qwen2_cuda.cu).
+ * reset clears all stage samples; report(nsteps) splits each stage's
+ * samples into nsteps equal-count groups (kernel counts per step are
+ * deterministic), sums each group, and prints the median 'PROFILE'
+ * table of per-step ms. */
+void qwen2_debug_profile_reset(void);
+void qwen2_debug_profile_report(int nsteps);
+
 /* debug/parity helpers */
 int qwen2_debug_copy_x(Qwen2Engine *e, float *host, int n);
 int qwen2_debug_copy_kv(Qwen2Engine*, int layer, float*, long);
