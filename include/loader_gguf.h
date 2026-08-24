@@ -9,13 +9,18 @@
 extern "C" {
 #endif
 
-// GGUF tensor data types
+// GGUF tensor data types (values mirror ggml.h)
 typedef enum {
     GGUF_TYPE_F32  = 0,
     GGUF_TYPE_F16  = 1,
     GGUF_TYPE_Q4_0 = 2,
     GGUF_TYPE_Q4_1 = 3,
+    GGUF_TYPE_Q5_0 = 6,
+    GGUF_TYPE_Q5_1 = 7,
     GGUF_TYPE_Q8_0 = 8,
+    GGUF_TYPE_Q4_K = 12, /* Q4_K_S files use this layout */
+    GGUF_TYPE_Q5_K = 13, /* Q5_K_S files use this layout */
+    GGUF_TYPE_Q6_K = 14,
 } GGUFType;
 
 // Block layout for Q4_0: 32 FP16 values stored in 16 bytes of nibbles + 1 FP16 scale d

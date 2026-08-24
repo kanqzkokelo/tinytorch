@@ -111,3 +111,11 @@ $(BUILD)/profile_step: tools/profile_step.cu src/loader_gguf.c kernels/gemv_q4_c
 profile_step: $(BUILD)/profile_step
 
 .PHONY: profile_step
+
+# CPU golden dequant CLI (validates GGUF quant formats against gguf-py goldens)
+$(BUILD)/dequant_ref: src/dequant_ref.c src/loader_gguf.c include/dequant_ref.h include/loader_gguf.h | $(BUILD)
+	gcc $(CFLAGS) -DTTQ_MAIN -Iinclude -o $@ src/dequant_ref.c src/loader_gguf.c -lm
+
+dequant_ref: $(BUILD)/dequant_ref
+
+.PHONY: dequant_ref

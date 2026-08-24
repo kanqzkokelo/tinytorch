@@ -158,10 +158,34 @@ GGUFModel *gguf_load(const char *filepath) {
         int64_t numel = 1;
         for (int d = 0; d < t->ndim; d++) numel *= t->shape[d];
 
+        /* Block sizes per ggml-common.h (verified vs gguf-py GGML_QUANT_SIZES):
+         *   q4_0: fp16 d + 16 nibble bytes            = 18 B / 32 values
+         *   q4_1: fp16 d, m + 16 nibble bytes          = 20 B / 32
+         *   q5_0: fp16 d + 4 high bits + 16 nibbles     = 22 B / 32
+         *   q5_1: fp16 d, m + 4 high bits + 16 nibbles   = 24 B / 32
+         *   q8_0: fp16 d + 32 int8                      = 34 B / 32
+         * K-quants are super-blocks of 256 values (8 sub-blocks of 32),
+         * requiring n_per_row to be a multiple of 256:
+         *   q4_K/q4_K_S: fp16 d,dmin + scales[12] + qs[128] = 144 B / 256
+         *   q5_K/q5_K_S: ... + qh[32]                        = 176 B / 256
+         *   q6_K: ql[128] + qh[64] + int8 scales[16] + fp16 d = 210 B / 256
+         */
         if (t->type == GGUF_TYPE_F32) t->size_bytes = numel * 4;
         else if (t->type == GGUF_TYPE_F16) t->size_bytes = numel * 2;
-        else if (t->type == GGUF_TYPE_Q4_0) t->size_bytes = (numel / 32) * sizeof(BlockQ4_0);
+        else if (t->type == GGUF_TYPE_Q4_0) t->size_bytes = (numel / 32) * 18;
+        else if (t->type == GGUF_TYPE_Q4_1) t->size_bytes = (numel / 32) * 20;
+        else if (t->type == GGUF_TYPE_Q5_0) t->size_bytes = (numel / 32) * 22;
+        else if (t->type == GGUF_TYPE_Q5_1) t->size_bytes = (numel / 32) * 24;
         else if (t->type == GGUF_TYPE_Q8_0) t->size_bytes = (numel / 32) * 34; /* fp16 d + 32 i8 */
+        else if (t->type == GGUF_TYPE_Q4_K || t->type == GGUF_TYPE_Q5_K || t->type == GGUF_TYPE_Q6_K) {
+            if (numel % 256 != 0)
+                fprintf(stderr, "[GGUF] WARN: %s K-quant numel %lld not multiple of 256\n",
+                        t->name, (long long)numel);
+            long long blocks = numel / 256;
+            if (t->type == GGUF_TYPE_Q4_K)      t->size_bytes = (size_t)(blocks * 144);
+            else if (t->type == GGUF_TYPE_Q5_K) t->size_bytes = (size_t)(blocks * 176);
+            else                                 t->size_bytes = (size_t)(blocks * 210);
+        }
         else t->size_bytes = numel;
     }
 

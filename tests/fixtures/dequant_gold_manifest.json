@@ -1,0 +1,79 @@
+{
+ "F16": {
+  "file": "smollm2-135m-f16.gguf",
+  "tensor": "token_embd.weight",
+  "qtype": 1,
+  "n_full": 28311552,
+  "gold_n": 65536
+ },
+ "Q4_0": {
+  "file": "smollm2-135m-instruct-Q4_0.gguf",
+  "tensor": "blk.0.ffn_down.weight",
+  "qtype": 2,
+  "n_full": 884736,
+  "gold_n": 65536
+ },
+ "Q4_1": {
+  "file": "smollm2-135m-instruct-Q4_1.gguf",
+  "tensor": "blk.0.ffn_down.weight",
+  "qtype": 3,
+  "n_full": 884736,
+  "gold_n": 65536
+ },
+ "Q5_0": {
+  "file": "smollm2-135m-instruct-Q5_0.gguf",
+  "tensor": "blk.0.ffn_down.weight",
+  "qtype": 6,
+  "n_full": 884736,
+  "gold_n": 65536
+ },
+ "Q5_1": {
+  "file": "smollm2-135m-instruct-Q5_1.gguf",
+  "tensor": "blk.0.ffn_down.weight",
+  "qtype": 7,
+  "n_full": 884736,
+  "gold_n": 65536
+ },
+ "Q8_0": {
+  "file": "smollm2-135m-instruct-Q8_0.gguf",
+  "tensor": "token_embd.weight",
+  "qtype": 8,
+  "n_full": 28311552,
+  "gold_n": 65536
+ },
+ "Q4_K": {
+  "file": "smollm2-135m-instruct-Q4_K.gguf",
+  "tensor": "blk.3.ffn_down.weight",
+  "qtype": 12,
+  "n_full": 884736,
+  "gold_n": 65536
+ },
+ "Q4_K_S": {
+  "file": "smollm2-135m-instruct-Q4_K_S.gguf",
+  "tensor": "blk.3.ffn_down.weight",
+  "qtype": 12,
+  "n_full": 884736,
+  "gold_n": 65536
+ },
+ "Q5_K": {
+  "file": "smollm2-135m-instruct-Q5_K.gguf",
+  "tensor": "blk.3.ffn_down.weight",
+  "qtype": 13,
+  "n_full": 884736,
+  "gold_n": 65536
+ },
+ "Q5_K_S": {
+  "file": "smollm2-135m-instruct-Q5_K_S.gguf",
+  "tensor": "blk.0.ffn_down.weight",
+  "qtype": 13,
+  "n_full": 884736,
+  "gold_n": 65536
+ },
+ "Q6_K": {
+  "file": "smollm2-135m-instruct-Q6_K.gguf",
+  "tensor": "blk.0.ffn_down.weight",
+  "qtype": 14,
+  "n_full": 884736,
+  "gold_n": 65536
+ }
+}
