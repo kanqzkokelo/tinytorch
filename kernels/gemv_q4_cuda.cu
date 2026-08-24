@@ -328,11 +328,18 @@ int tt_embed_q4_0(const void *dW, int tok, float *dx, int dim, cudaStream_t stre
     return (int)cudaGetLastError();
 }
 
-/* dtype-dispatching logits projection: is_q8 selects the q8_0 kernel */
-int tt_logits_dispatch(const void *dW, int is_q8, const float *dx,
+/* dtype-dispatching logits projection. M7: takes the GGML type code
+ * directly (q8_0 keeps its tuned one-warp-per-row grid; q4_0 the default;
+ * every other type delegates to kernels/gemv_typed.cu). */
+int tt_logits_dispatch(const void *dW, int dtype, const float *dx,
                        float *dlogits, int vocab, int K, cudaStream_t stream) {
+    if (dtype != 2 /*q4_0*/ && dtype != 8 /*q8_0*/) {
+        extern int tt_logits_typed(const void *, int, const float *,
+                                   float *, int, int, cudaStream_t);
+        return tt_logits_typed(dW, dtype, dx, dlogits, vocab, K, stream);
+    }
     dim3 g, b; gemv_dims(vocab, &g, &b);
-    if (is_q8) {
+    if (dtype == 8) {
         /* M6.3b: one warp per block for the head (y sweep 16->8->4->2->1
          * monotone win). Grid MUST be recomputed for the smaller block or
          * rows >= grid.x*b.y never get written (stale logits -> degenerate
@@ -341,7 +348,7 @@ int tt_logits_dispatch(const void *dW, int is_q8, const float *dx,
         b.y = 1;
         g.x = (vocab + b.y - 1) / b.y;
     }
-    if (is_q8)
+    if (dtype == 8)
         k_logits_q8_0<<<g, b, 0, stream>>>((const BlockQ8_0 *)dW, dx, dlogits, vocab, K);
     else
         k_logits_q4_0<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW, dx, dlogits, vocab, K);

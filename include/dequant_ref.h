@@ -41,6 +41,14 @@ enum {
 long ttq_roundtrip(const char *gguf_path, const char *tensor_name,
                    int type_code, float *out, long out_cap);
 
+/*
+ * Dequantize `numel` values of raw block data (`type_code` = TTQ_*) into
+ * float32 `out` (out must hold numel floats). Reusable entry point for the
+ * golden GPU GEMV tests: same math as ttq_roundtrip without GGUF I/O.
+ * Returns numel, or -5 on unsupported type / bad alignment.
+ */
+long ttq_dequant(const void *data, int type_code, long numel, float *out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -256,6 +256,22 @@ static void dq_q6_K(const void *x, float *y, long k) {
 
 /* ---------------- public API --------------------------------------------- */
 
+long ttq_dequant(const void *data, int type_code, long numel, float *out) {
+    switch (type_code) {
+        case TTQ_F32:  dq_f32(data, out, numel); return numel;
+        case TTQ_F16:  dq_f16(data, out, numel); return numel;
+        case TTQ_Q4_0: dq_q4_0(data, out, numel); return numel;
+        case TTQ_Q4_1: dq_q4_1(data, out, numel); return numel;
+        case TTQ_Q5_0: dq_q5_0(data, out, numel); return numel;
+        case TTQ_Q5_1: dq_q5_1(data, out, numel); return numel;
+        case TTQ_Q8_0: dq_q8_0(data, out, numel); return numel;
+        case TTQ_Q4_K: if (numel % QK_K) return -5; dq_q4_K(data, out, numel); return numel;
+        case TTQ_Q5_K: if (numel % QK_K) return -5; dq_q5_K(data, out, numel); return numel;
+        case TTQ_Q6_K: if (numel % QK_K) return -5; dq_q6_K(data, out, numel); return numel;
+        default: fprintf(stderr, "[dequant_ref] unsupported type %d\n", type_code); return -5;
+    }
+}
+
 long ttq_roundtrip(const char *gguf_path, const char *tensor_name,
                    int type_code, float *out, long out_cap) {
     GGUFModel *m = gguf_load(gguf_path);

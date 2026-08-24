@@ -31,11 +31,11 @@ clean:
 NVCC ?= $(HOME)/mmcuda/bin/nvcc
 CUDA_INC := $(HOME)/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/include
 
-$(BUILD)/libtinytorch_cuda.so: kernels/gemm_cuda.cu kernels/gemv_q4_cuda.cu | $(BUILD)
+$(BUILD)/libtinytorch_cuda.so: kernels/gemm_cuda.cu kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu | $(BUILD)
 	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
 	  -I$(CUDA_INC) -Iinclude -shared -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
-	  -o $@ kernels/gemm_cuda.cu kernels/gemv_q4_cuda.cu \
+	  -o $@ kernels/gemm_cuda.cu kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu \
 	  -Lbuild -lcudart
 
 cuda: $(BUILD)/libtinytorch_cuda.so
@@ -56,22 +56,22 @@ cublas: $(BUILD)/libtt_cublas.so
 
 .PHONY: cublas
 
-$(BUILD)/run_llm_gpu: examples/run_llm_gpu.c src/loader_gguf.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/qwen2_cuda.cu | $(BUILD)
+$(BUILD)/run_llm_gpu: examples/run_llm_gpu.c src/loader_gguf.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
 	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
-	  examples/run_llm_gpu.c src/loader_gguf.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/qwen2_cuda.cu \
+	  examples/run_llm_gpu.c src/loader_gguf.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
 	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
 
 run_llm_gpu: $(BUILD)/run_llm_gpu
 
-$(BUILD)/chat_llm_gpu: examples/chat_llm_gpu.c src/loader_gguf.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/qwen2_cuda.cu | $(BUILD)
+$(BUILD)/chat_llm_gpu: examples/chat_llm_gpu.c src/loader_gguf.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
 	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
-	  examples/chat_llm_gpu.c src/loader_gguf.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/qwen2_cuda.cu \
+	  examples/chat_llm_gpu.c src/loader_gguf.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
 	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
 
 chat_llm_gpu: $(BUILD)/chat_llm_gpu
@@ -88,24 +88,24 @@ oracle_logits: $(BUILD)/oracle_logits
 
 .PHONY: run_llm_gpu chat_llm_gpu
 
-$(BUILD)/dump_logits: tools/dump_logits.c src/loader_gguf.c kernels/gemv_q4_cuda.cu kernels/qwen2_cuda.cu | $(BUILD)
+$(BUILD)/dump_logits: tools/dump_logits.c src/loader_gguf.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
 	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
-	  tools/dump_logits.c src/loader_gguf.c kernels/gemv_q4_cuda.cu kernels/qwen2_cuda.cu \
+	  tools/dump_logits.c src/loader_gguf.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
 	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
 
 dump_logits: $(BUILD)/dump_logits
 
 .PHONY: dump_logits
 
-$(BUILD)/profile_step: tools/profile_step.cu src/loader_gguf.c kernels/gemv_q4_cuda.cu kernels/qwen2_cuda.cu | $(BUILD)
+$(BUILD)/profile_step: tools/profile_step.cu src/loader_gguf.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
 	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
-	  tools/profile_step.cu src/loader_gguf.c kernels/gemv_q4_cuda.cu kernels/qwen2_cuda.cu \
+	  tools/profile_step.cu src/loader_gguf.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
 	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
 
 profile_step: $(BUILD)/profile_step
@@ -119,3 +119,18 @@ $(BUILD)/dequant_ref: src/dequant_ref.c src/loader_gguf.c include/dequant_ref.h 
 dequant_ref: $(BUILD)/dequant_ref
 
 .PHONY: dequant_ref
+
+# M7 task 2: GPU golden GEMV grid for all Tier-1 quant types
+$(BUILD)/test_gemv_typed: tools/test_gemv_typed.cu src/loader_gguf.c src/dequant_ref.c \
+		kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu | $(BUILD)
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	  -I$(CUDA_INC) -Iinclude -Xcompiler -fPIC \
+	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
+	  -o $@ \
+	  tools/test_gemv_typed.cu src/loader_gguf.c src/dequant_ref.c \
+	  kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu \
+	  -L$(HOME)/mmcuda/lib -lcudart -lpthread -lm
+
+test_gemv_typed: $(BUILD)/test_gemv_typed
+
+.PHONY: test_gemv_typed

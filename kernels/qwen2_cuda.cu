@@ -41,12 +41,33 @@ int tt_swiglu_q4_0(const void *dGate, const void *dUp, const float *dx,
                    float *dh, int M, int K, cudaStream_t stream);
 int tt_logits_q4_0(const void *dW, const float *dx, float *dlogits,
                    int vocab, int K, cudaStream_t stream);
-int tt_logits_dispatch(const void *dW, int is_q8, const float *dx,
+/* M7 task 2: typed dispatch (kernels/gemv_typed.cu) */
+int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
+                  int M, int K, cudaStream_t stream);
+int tt_embed_typed(const void *dW, int dtype, int tok, float *dx, int dim,
+                   cudaStream_t stream);
+int tt_logits_dispatch(const void *dW, int dtype, const float *dx,
                        float *dlogits, int vocab, int K, cudaStream_t stream);
 int tt_embed_q4_0(const void *dW, int tok, float *dx, int dim, cudaStream_t stream);
 }
 
 static size_t q4_bytes(long numel) { return (size_t)(numel / Q4_VALS_PER_BLOCK) * Q4_BYTES_PER_BLOCK; }
+
+/* Type-blind weight handle: device pointer + GGML type code for dispatch. */
+typedef struct { void *ptr; int dtype; } TTensor;
+
+/* Upload any tensor type-blind: raw size_bytes memcpy, dtype recorded. */
+static int upload_w(GGUFModel *m, const char *name, TTensor *out) {
+    GGUFTensor *t = gguf_get_tensor(m, name);
+    out->ptr = NULL; out->dtype = -1;
+    if (!t || !t->data) { fprintf(stderr, "[qwen2-engine] weight upload missing: %s\n", name); return -1; }
+    void *d = NULL;
+    if (cudaMalloc(&d, t->size_bytes) != cudaSuccess) { fprintf(stderr, "[qwen2-engine] cudaMalloc fail %s\n", name); return -1; }
+    cudaMemcpy(d, t->data, t->size_bytes, cudaMemcpyHostToDevice);
+    out->ptr = d;
+    out->dtype = (int)t->type;
+    return 0;
+}
 
 /* ---------------- device kernels (engine-local ops) ---------------- */
 
@@ -302,13 +323,24 @@ __global__ void k_pos_inc_recent(int *d_pos, const int *d_next_tok,
     (*d_pos)++;
 }
 
+/* silu(g) * u elementwise: the non-q4_0 MLP path (two plain GEMVs + this)
+ * replaces the fused q4_0 kernel when gate/up are any other dtype. */
+__global__ void k_swiglu_apply(const float *__restrict__ g,
+                               const float *__restrict__ u,
+                               float *__restrict__ h, int n) {
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) { const float gi = g[i]; h[i] = (gi / (1.0f + expf(-gi))) * u[i]; }
+}
+
 /* ---------------- host-side engine ---------------- */
 
 #define MAX_LAYERS 128
 #define MAX_DIM 16384
 
 struct LayerW {
-    const BlockQ4_0 *q, *k, *v, *o, *gate, *up, *down;
+    /* M7 task 2: weights are type-blind {ptr, GGML type} pairs; the GEMV
+     * dispatcher picks the kernel from `dtype`. */
+    TTensor q, k, v, o, gate, up, down;
     float *attn_norm, *ffn_norm;      /* device f32 gammas */
     float *q_bias, *k_bias, *v_bias;  /* this GGUF variant carries QKV biases */
 };
@@ -316,12 +348,14 @@ struct LayerW {
 struct Qwen2Engine {
     TTConfig cfg;
     LayerW L[MAX_LAYERS];
-    const BlockQ4_0 *d_embd;          /* tied or untied lm head below */
-    const BlockQ4_0 *d_out_w;
+    TTensor d_embd;          /* tied or untied lm head below */
+    TTensor d_out_w;
     float *d_out_norm;
-    int out_is_q8;                    /* lm head stored as q8_0 */
     /* activations */
     float *d_x, *d_xn, *d_q, *d_att, *d_h, *d_logits;
+    /* split-SwiGLU staging for non-q4_0 gate/up dtypes (fused q4_0 path
+     * keeps using d_h only) */
+    float *d_g, *d_u;
     /* caches: [layer][kv_head][slot][head_dim] */
     float *d_kc, *d_vc;
     /* KV staging rows (pre-scatter) */
@@ -354,15 +388,6 @@ static float *upload_f32(GGUFModel *m, const char *name) {
     if (cudaMalloc(&d, t->size_bytes) != cudaSuccess) { fprintf(stderr, "[qwen2-engine] cudaMalloc fail %s\n", name); return NULL; }
     cudaMemcpy(d, t->data, t->size_bytes, cudaMemcpyHostToDevice);
     return d;
-}
-
-static const BlockQ4_0 *upload_q4(GGUFModel *m, const char *name) {
-    GGUFTensor *t = gguf_get_tensor(m, name);
-    if (!t || !t->data) { fprintf(stderr, "[qwen2-engine] q4 upload missing: %s\n", name); return NULL; }
-    void *d = NULL;
-    if (cudaMalloc(&d, t->size_bytes) != cudaSuccess) { fprintf(stderr, "[qwen2-engine] cudaMalloc fail %s\n", name); return NULL; }
-    cudaMemcpy(d, t->data, t->size_bytes, cudaMemcpyHostToDevice);
-    return (const BlockQ4_0 *)d;
 }
 
 TTConfig tt_config_from_gguf(const GGUFModel *m, int max_ctx) {
@@ -405,49 +430,47 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     if (!tembd) { fail("token_embd.weight missing"); return NULL; }
     e->cfg.vocab = (int)tembd->shape[tembd->ndim - 1];
 
-    e->d_embd = upload_q4(m, "token_embd.weight");
+    e->d_embd.ptr = NULL;
+    upload_w(m, "token_embd.weight", &e->d_embd);
 
     {
         GGUFTensor *tw = gguf_get_tensor(m, "output.weight");
-        if (tw && tw->data && tw->type == GGUF_TYPE_Q8_0) {
-            e->out_is_q8 = 1;
-            void *d = NULL;
-            cudaMalloc(&d, tw->size_bytes);
-            cudaMemcpy(d, tw->data, tw->size_bytes, cudaMemcpyHostToDevice);
-            e->d_out_w = (const BlockQ4_0 *)d;
+        if (tw && tw->data && upload_w(m, "output.weight", &e->d_out_w) == 0) {
+            /* keep whichever dtype output.weight actually carries */
         } else {
-            e->d_out_w = upload_q4(m, "output.weight");
+            e->d_out_w.ptr = NULL; e->d_out_w.dtype = -1;
         }
     }
-    if (!e->d_out_w || getenv("TT_FORCE_TIED")) {         /* tied embeddings fallback */
+    if (!e->d_out_w.ptr || getenv("TT_FORCE_TIED")) {         /* tied embeddings fallback */
         e->d_out_w = e->d_embd;
-        e->out_is_q8 = 0;
-        fprintf(stderr, "[qwen2-engine] using TIED embedding as lm head\n");
+        fprintf(stderr, "[qwen2-engine] using TIED embedding as lm head (dtype %d)\n", e->d_out_w.dtype);
     }
-    fprintf(stderr, "[qwen2-engine] lm head: %s\n", e->out_is_q8 ? "output.weight(q8_0)" : "tied/token_embd(q4_0)");
+    fprintf(stderr, "[qwen2-engine] lm head dtype: %d (%s)\n", e->d_out_w.dtype,
+            e->d_out_w.dtype == GGUF_TYPE_Q8_0 ? "q8_0" :
+            e->d_out_w.dtype == GGUF_TYPE_Q4_0 ? "q4_0" : "typed dispatch");
     e->d_out_norm = upload_f32(m, "output_norm.weight");
 
     for (int l = 0; l < cfg->n_layers; l++) {
         LayerW *w = &e->L[l];
-        snprintf(name, sizeof(name), "blk.%d.attn_q.weight", l);       w->q    = upload_q4(m, name);
-        snprintf(name, sizeof(name), "blk.%d.attn_k.weight", l);       w->k    = upload_q4(m, name);
-        snprintf(name, sizeof(name), "blk.%d.attn_v.weight", l);       w->v    = upload_q4(m, name);
-        snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);  w->o    = upload_q4(m, name);
-        snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", l);     w->gate = upload_q4(m, name);
-        snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", l);       w->up   = upload_q4(m, name);
-        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", l);     w->down = upload_q4(m, name);
+        snprintf(name, sizeof(name), "blk.%d.attn_q.weight", l);       upload_w(m, name, &w->q);
+        snprintf(name, sizeof(name), "blk.%d.attn_k.weight", l);       upload_w(m, name, &w->k);
+        snprintf(name, sizeof(name), "blk.%d.attn_v.weight", l);       upload_w(m, name, &w->v);
+        snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);  upload_w(m, name, &w->o);
+        snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", l);     upload_w(m, name, &w->gate);
+        snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", l);       upload_w(m, name, &w->up);
+        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", l);     upload_w(m, name, &w->down);
         snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", l);    w->attn_norm = upload_f32(m, name);
         snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", l);     w->ffn_norm  = upload_f32(m, name);
         snprintf(name, sizeof(name), "blk.%d.attn_q.bias", l);         w->q_bias    = upload_f32(m, name); /* optional */
         snprintf(name, sizeof(name), "blk.%d.attn_k.bias", l);         w->k_bias    = upload_f32(m, name); /* optional */
         snprintf(name, sizeof(name), "blk.%d.attn_v.bias", l);         w->v_bias    = upload_f32(m, name); /* optional */
-        if (!w->q || !w->k || !w->v || !w->o || !w->gate || !w->up || !w->down ||
+        if (!w->q.ptr || !w->k.ptr || !w->v.ptr || !w->o.ptr || !w->gate.ptr || !w->up.ptr || !w->down.ptr ||
             !w->attn_norm || !w->ffn_norm) {  /* v_bias optional: absent in stock Qwen2 */
             fprintf(stderr, "[qwen2-engine] missing weights for layer %d\n", l);
             qwen2_engine_free(e); return NULL;
         }
     }
-    if (!e->d_embd || !e->d_out_norm) ABORT_CREATE("missing embedding/output_norm");
+    if (!e->d_embd.ptr || !e->d_out_norm) ABORT_CREATE("missing embedding/output_norm");
 
     /* activations + caches */
     cudaMalloc(&e->d_x,  D * sizeof(float));
@@ -455,6 +478,8 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     cudaMalloc(&e->d_q,  (long)cfg->n_heads * cfg->head_dim * sizeof(float));
     cudaMalloc(&e->d_att, (long)cfg->n_heads * cfg->head_dim * sizeof(float));
     cudaMalloc(&e->d_h,  F * sizeof(float));
+    cudaMalloc(&e->d_g,  F * sizeof(float));   /* split-SwiGLU staging */
+    cudaMalloc(&e->d_u,  F * sizeof(float));
     cudaMalloc(&e->d_logits, (long)e->cfg.vocab * sizeof(float));
     const long cache_per = (long)cfg->n_kv_heads * cfg->max_ctx * cfg->head_dim;
     cudaMalloc(&e->d_kc, cache_per * cfg->n_layers * sizeof(float));
@@ -499,6 +524,8 @@ void qwen2_engine_free(Qwen2Engine *e) {
      * pointers is omitted where ownership aliases mmap (host side frees via gguf_free).
      * Device allocations freed here: */
     cudaFree(e->d_x); cudaFree(e->d_xn); cudaFree(e->d_q); cudaFree(e->d_att); cudaFree(e->d_h);
+    if (e->d_g) cudaFree(e->d_g);
+    if (e->d_u) cudaFree(e->d_u);
     cudaFree(e->d_logits); cudaFree(e->d_kc); cudaFree(e->d_vc);
     cudaFree(e->d_k_stage); cudaFree(e->d_v_stage); cudaFree(e->d_pos);
     cudaFree(e->d_bvals); cudaFree(e->d_bidxs); cudaFree(e->d_out);
@@ -628,8 +655,8 @@ static int forward_layers(Qwen2Engine *e) {
 
         /* 2. projections: q -> d_q ; k,v -> KV cache slot pos */
         if (tt_profiling()) tt_prof_begin(TT_P_QKV, e->stream);
-        tt_gemv_q4_0(w->q, e->d_xn, e->d_q, c->dim, c->dim, e->stream);
-        tt_gemv_q4_0(w->k, e->d_xn, e->d_k_stage, c->n_kv_heads * HD, c->dim, e->stream);
+        tt_gemv_typed(w->q.ptr, w->q.dtype, e->d_xn, e->d_q, c->dim, c->dim, e->stream);
+        tt_gemv_typed(w->k.ptr, w->k.dtype, e->d_xn, e->d_k_stage, c->n_kv_heads * HD, c->dim, e->stream);
         /* QKV biases present in some GGUF conversions of Qwen2 (applied by
          * llama.cpp whenever the tensors exist). Optional by design. */
         const int kvdim = c->n_kv_heads * HD;
@@ -650,7 +677,7 @@ static int forward_layers(Qwen2Engine *e) {
         }
 
         /* v projection + bias (QKV group) */
-        tt_gemv_q4_0(w->v, e->d_xn, e->d_v_stage, c->n_kv_heads * HD, c->dim, e->stream);
+        tt_gemv_typed(w->v.ptr, w->v.dtype, e->d_xn, e->d_v_stage, c->n_kv_heads * HD, c->dim, e->stream);
         if (w->v_bias)
             k_add<<<(kvdim + 255) / 256, 256, 0, e->stream>>>(e->d_v_stage, w->v_bias, kvdim);
         if (tt_profiling()) tt_prof_end(TT_P_QKV, e->stream);
@@ -674,7 +701,7 @@ static int forward_layers(Qwen2Engine *e) {
 
         /* 5. Wo projection + residual: x += att @ Wo^T */
         if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
-        tt_gemv_q4_0(w->o, e->d_att, e->d_xn, c->dim, c->dim, e->stream);
+        tt_gemv_typed(w->o.ptr, w->o.dtype, e->d_att, e->d_xn, c->dim, c->dim, e->stream);
         k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
         if (tt_profiling()) tt_prof_end(TT_P_OMLP, e->stream);
 
@@ -684,10 +711,22 @@ static int forward_layers(Qwen2Engine *e) {
             e->d_x, w->ffn_norm, e->d_xn, c->dim, c->rms_eps);
         if (tt_profiling()) tt_prof_end(TT_P_RMSNORM, e->stream);
 
-        /* 7+8. fused SwiGLU MLP + down projection + residual */
+        /* 7+8. MLP: fused q4_0 SwiGLU when possible, else two typed GEMVs +
+         * elementwise apply. Then down projection + residual. */
         if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
-        tt_swiglu_q4_0(w->gate, w->up, e->d_xn, e->d_h, c->hidden_dim, c->dim, e->stream);
-        tt_gemv_q4_0(w->down, e->d_h, e->d_xn, c->dim, c->hidden_dim, e->stream);
+        if (w->gate.dtype == GGUF_TYPE_Q4_0 && w->up.dtype == GGUF_TYPE_Q4_0) {
+            tt_swiglu_q4_0(w->gate.ptr, w->up.ptr, e->d_xn, e->d_h,
+                           c->hidden_dim, c->dim, e->stream);
+        } else {
+            tt_gemv_typed(w->gate.ptr, w->gate.dtype, e->d_xn, e->d_g,
+                          c->hidden_dim, c->dim, e->stream);
+            tt_gemv_typed(w->up.ptr,   w->up.dtype,   e->d_xn, e->d_u,
+                          c->hidden_dim, c->dim, e->stream);
+            k_swiglu_apply<<<(c->hidden_dim + 255) / 256, 256, 0, e->stream>>>(
+                e->d_g, e->d_u, e->d_h, c->hidden_dim);
+        }
+        tt_gemv_typed(w->down.ptr, w->down.dtype, e->d_h, e->d_xn,
+                      c->dim, c->hidden_dim, e->stream);
         k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
         if (tt_profiling()) tt_prof_end(TT_P_OMLP, e->stream);
 
@@ -730,7 +769,9 @@ static int forward_layers(Qwen2Engine *e) {
 
 static int embed_token(Qwen2Engine *e, int tok) {
     if (tt_profiling()) tt_prof_begin(TT_P_EMBED, e->stream);
-    const int rc = tt_embed_q4_0(e->d_embd, tok, e->d_x, e->cfg.dim, e->stream);
+    /* M7: embedding may be any Tier-1 dtype now; dispatch by type */
+    const int rc = tt_embed_typed(e->d_embd.ptr, e->d_embd.dtype, tok,
+                                  e->d_x, e->cfg.dim, e->stream);
     if (tt_profiling()) tt_prof_end(TT_P_EMBED, e->stream);
     return rc;
 }
@@ -785,7 +826,7 @@ static int sample_eager(Qwen2Engine *e) {
     if (tt_profiling()) tt_prof_end(TT_P_RMSNORM, e->stream);
 
     if (tt_profiling()) tt_prof_begin(TT_P_LOGITS, e->stream);
-    int rc = tt_logits_dispatch(e->d_out_w, e->out_is_q8, e->d_xn,
+    int rc = tt_logits_dispatch(e->d_out_w.ptr, e->d_out_w.dtype, e->d_xn,
                                 e->d_logits, c->vocab, c->dim, e->stream);
     if (rc) return -1;
     if (tt_profiling()) tt_prof_end(TT_P_LOGITS, e->stream);
@@ -811,32 +852,41 @@ static int sample_eager(Qwen2Engine *e) {
 static int qwen2_engine_graph_capture(Qwen2Engine *e) {
     const TTConfig *c = &e->cfg;
 
+    /* M7: the dynamic-token embed kernel is q4_0-only; other embedding
+     * dtypes run eager (typed embed reads the host token id). */
+    if (e->d_embd.dtype != GGUF_TYPE_Q4_0) return -1;
+
     /* dummy valid token before capture begins (plain, uncaptured copy) */
     const int dummy = e->pending_tok >= 0 ? e->pending_tok : 0;
     cudaMemcpy(e->d_next_tok, &dummy, sizeof(int), cudaMemcpyHostToDevice);
     cudaStreamSynchronize(e->stream);
 
     /* warm up graph-only kernels eagerly (lazy module load must not happen
-     * implicitly during capture). Save/restore engine state they touch. */
+     * implicitly during capture). Save/restore engine state they touch.
+     * NOTE: d_logits must be RESTORED, not zeroed — callers (dump_logits,
+     * parity gate) read it right after this returns, while the sampled id
+     * from sample_eager is still the current answer. */
     {
         const int threads = c->dim / 32;
-        float *xsave = NULL;
+        float *xsave = NULL, *lsave = NULL;
         cudaMalloc(&xsave, c->dim * sizeof(float));
+        cudaMalloc(&lsave, c->vocab * sizeof(float));
         cudaMemcpy(xsave, e->d_x, c->dim * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(lsave, e->d_logits, c->vocab * sizeof(float), cudaMemcpyDeviceToDevice);
         const int pos_before = e->pos;
         k_embed_q4_0_dyn<<<(threads + 255) / 256, 256, 0, e->stream>>>(
-            e->d_embd, e->d_next_tok, e->d_x, c->dim);
+            (const BlockQ4_0 *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
         k_pos_inc<<<1, 1, 0, e->stream>>>(e->d_pos);
         k_repeat_penalty<<<1, 256, 0, e->stream>>>(e->d_logits, e->d_recent,
                                                    e->d_n_recent, c->vocab, 2.0f);
         k_gumbel_transform<<<1, 256, 0, e->stream>>>(e->d_logits, c->vocab,
                                                      0.8f, e->d_pos, e->d_sampling_on);
         cudaStreamSynchronize(e->stream);
-        cudaMemset(e->d_logits, 0, c->vocab * sizeof(float));  /* warmed kernels wrote garbage */
         /* restore state the warmup perturbed */
         cudaMemcpy(e->d_x, xsave, c->dim * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(e->d_logits, lsave, c->vocab * sizeof(float), cudaMemcpyDeviceToDevice);
         cudaMemcpy(e->d_pos, &pos_before, sizeof(int), cudaMemcpyHostToDevice);
-        cudaFree(xsave);
+        cudaFree(xsave); cudaFree(lsave);
     }
 
     g_capturing = 1;
@@ -848,12 +898,12 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
     {   /* dynamic-token embedding (device-side id) */
         const int threads = c->dim / 32;
         k_embed_q4_0_dyn<<<(threads + 255) / 256, 256, 0, e->stream>>>(
-            e->d_embd, e->d_next_tok, e->d_x, c->dim);
+            (const BlockQ4_0 *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
     }
     const int frc = forward_layers(e);          /* all layers at *d_pos */
     k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
         e->d_x, e->d_out_norm, e->d_xn, c->dim, c->rms_eps);
-    const int lrc = tt_logits_dispatch(e->d_out_w, e->out_is_q8, e->d_xn,
+    const int lrc = tt_logits_dispatch(e->d_out_w.ptr, e->d_out_w.dtype, e->d_xn,
                                        e->d_logits, c->vocab, c->dim, e->stream);
     /* sampling controls: both kernels no-op when disabled (greedy byte-identical) */
     k_repeat_penalty<<<(c->vocab + 255) / 256, 256, 0, e->stream>>>(
