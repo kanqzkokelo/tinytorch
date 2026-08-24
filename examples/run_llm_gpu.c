@@ -35,7 +35,7 @@ int main(int argc, char **argv) {
     Qwen2Engine *eng = qwen2_engine_create(&cfg, model);
     if (!eng) { fprintf(stderr, "engine init failed\n"); return 1; }
 
-    char formatted[1400];
+    char formatted[8192];
     if (!getenv("TT_RAW_PROMPT"))
         snprintf(formatted, sizeof(formatted),
                  "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", prompt);
