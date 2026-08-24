@@ -94,3 +94,16 @@ tie-break preserved -> parity gate unaffected.
 
 Result: argmax 0.568 -> 0.071 ms (-0.50 ms/step). Bench: 78 -> 80.0 tok/s median
 (--runs 3 --tokens 64). verify.sh m61 7/7. KEPT.
+
+## M6.3b TASK 1 — q4_0 GEMV variant ladder
+| Variant | Change | step ms | tok/s | Verdict |
+|---|---|---|---|---|
+| baseline | scalar byte loads, blockDim.y=16 | 12.81 | 78 | — |
+| (1.5) | argmax vectorized + parallel final | — | 80.0 | KEPT |
+| V1 | uint32 W words + __byte_perm odd/even merge + float4 x (k_gemv_q4_0 AND k_fused_swiglu_q4_0) | 5.42 | 213.4 | KEPT |
+
+V1 detail: port of lm-head winner pattern with q4_0 layout twist — row stride
+nb*18 B (nb=28 -> 504 B, nb=152 -> 2736 B, both 4B-aligned); block qs starts at
+18*b+2, aligned iff b ODD; nb even => last block odd-b => merges stay in-row.
+o+mlp-gemv 8.81 -> 1.86 ms (~21 -> ~100 GB/s). qkv-gemv 1.48 -> 0.61 ms
+(same kernel serves Q/K/V projs). Parity 7/7.
