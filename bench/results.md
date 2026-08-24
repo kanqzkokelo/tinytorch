@@ -100,7 +100,12 @@ Result: argmax 0.568 -> 0.071 ms (-0.50 ms/step). Bench: 78 -> 80.0 tok/s median
 |---|---|---|---|---|
 | baseline | scalar byte loads, blockDim.y=16 | 12.81 | 78 | — |
 | (1.5) | argmax vectorized + parallel final | — | 80.0 | KEPT |
-| V1 | uint32 W words + __byte_perm odd/even merge + float4 x (k_gemv_q4_0 AND k_fused_swiglu_q4_0) | 5.42 | 213.4 | KEPT |
+| V1 | uint32 W words + __byte_perm odd/even merge + float4 x (k_gemv_q4_0 AND k_fused_swiglu_q4_0) | 6.14 | 183.1 | KEPT |
+| V2 | two rows per warp, both kernels (halves x re-reads) | 5.42 | 213.4 | KEPT |
+| V3a | b-loop unroll x2 (batched block pairs) | — | 214.7 | REVERTED (+1.1%, under 2% bar) |
+| V3b | b-loop unroll x4 | — | 211.7 | REVERTED (-0.3% vs V2) |
+| V4a | blockDim.y 16 -> 8 | — | 214.3 | REVERTED (noise-level, min 187.8 unstable) |
+| V4b | blockDim.y 16 -> 32 | — | 195.9 | REVERTED (confirms lm-head finding: 32 hurts) |
 
 V1 detail: port of lm-head winner pattern with q4_0 layout twist — row stride
 nb*18 B (nb=28 -> 504 B, nb=152 -> 2736 B, both 4B-aligned); block qs starts at
