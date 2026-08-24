@@ -1,0 +1,109 @@
+{
+  "_comment": "M7 Task 0 test fleet. Models live in data/testmodels/ (gitignored); only this manifest is committed.",
+  "_substitutions": [
+    "smollm2-135m-f16: ggml-org/SmolLM2-135M-Instruct-GGUF returned 401 -> substituted unsloth/SmolLM2-135M-Instruct-GGUF (SmolLM2-135M-Instruct-F16.gguf)",
+    "tinyllama-f16: bartowski/TinyLlama-1.1B-Chat-v1.0-GGUF returned 401 (gated) -> substituted andrijdavid/TinyLlama-1.1B-Chat-v1.0-GGUF mirror (f16)",
+    "gemma2-2b-q6_k: bartowski repo has no ungated f16 and gemma2-2b f16 (~5.2GB) busts the 2.5GB/model envelope -> used Q6_K (closest-to-lossless that fits)",
+    "qwen3-0.6b: Qwen/Qwen3-0.6B-GGUF Q8_0 as planned"
+  ],
+  "models": [
+    {
+      "name": "gemma2-2b-q6_k",
+      "path": "data/testmodels/gemma2-2b-q6_k.gguf",
+      "arch": "gemma2",
+      "tokenizer_model": "llama",
+      "size_mb": 2051.7
+    },
+    {
+      "name": "qwen3-0.6b-q8_0",
+      "path": "data/testmodels/qwen3-0.6b-q8_0.gguf",
+      "arch": "qwen3",
+      "tokenizer_model": "gpt2",
+      "size_mb": 609.8
+    },
+    {
+      "name": "smollm2-135m-f16",
+      "path": "data/testmodels/smollm2-135m-f16.gguf",
+      "arch": "llama",
+      "tokenizer_model": "gpt2",
+      "size_mb": 258.3
+    },
+    {
+      "name": "smollm2-135m-instruct-Q4_0",
+      "path": "data/testmodels/smollm2-135m-instruct-Q4_0.gguf",
+      "arch": "llama",
+      "tokenizer_model": "gpt2",
+      "size_mb": 87.5
+    },
+    {
+      "name": "smollm2-135m-instruct-Q4_1",
+      "path": "data/testmodels/smollm2-135m-instruct-Q4_1.gguf",
+      "arch": "llama",
+      "tokenizer_model": "gpt2",
+      "size_mb": 93.8
+    },
+    {
+      "name": "smollm2-135m-instruct-Q4_K",
+      "path": "data/testmodels/smollm2-135m-instruct-Q4_K.gguf",
+      "arch": "llama",
+      "tokenizer_model": "gpt2",
+      "size_mb": 100.6
+    },
+    {
+      "name": "smollm2-135m-instruct-Q4_K_S",
+      "path": "data/testmodels/smollm2-135m-instruct-Q4_K_S.gguf",
+      "arch": "llama",
+      "tokenizer_model": "gpt2",
+      "size_mb": 97.3
+    },
+    {
+      "name": "smollm2-135m-instruct-Q5_0",
+      "path": "data/testmodels/smollm2-135m-instruct-Q5_0.gguf",
+      "arch": "llama",
+      "tokenizer_model": "gpt2",
+      "size_mb": 100.1
+    },
+    {
+      "name": "smollm2-135m-instruct-Q5_1",
+      "path": "data/testmodels/smollm2-135m-instruct-Q5_1.gguf",
+      "arch": "llama",
+      "tokenizer_model": "gpt2",
+      "size_mb": 106.5
+    },
+    {
+      "name": "smollm2-135m-instruct-Q5_K",
+      "path": "data/testmodels/smollm2-135m-instruct-Q5_K.gguf",
+      "arch": "llama",
+      "tokenizer_model": "gpt2",
+      "size_mb": 106.9
+    },
+    {
+      "name": "smollm2-135m-instruct-Q5_K_S",
+      "path": "data/testmodels/smollm2-135m-instruct-Q5_K_S.gguf",
+      "arch": "llama",
+      "tokenizer_model": "gpt2",
+      "size_mb": 104.9
+    },
+    {
+      "name": "smollm2-135m-instruct-Q6_K",
+      "path": "data/testmodels/smollm2-135m-instruct-Q6_K.gguf",
+      "arch": "llama",
+      "tokenizer_model": "gpt2",
+      "size_mb": 132.0
+    },
+    {
+      "name": "smollm2-135m-instruct-Q8_0",
+      "path": "data/testmodels/smollm2-135m-instruct-Q8_0.gguf",
+      "arch": "llama",
+      "tokenizer_model": "gpt2",
+      "size_mb": 138.1
+    },
+    {
+      "name": "tinyllama-f16",
+      "path": "data/testmodels/tinyllama-f16.gguf",
+      "arch": "llama",
+      "tokenizer_model": "llama",
+      "size_mb": 2099.1
+    }
+  ]
+}
