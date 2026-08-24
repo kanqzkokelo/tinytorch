@@ -39,6 +39,14 @@ int main(void) {
     Qwen2Engine *eng = qwen2_engine_create(&cfg, model);
     if (!eng) { fprintf(stderr, "[chat] engine init failed\n"); return 1; }
 
+    /* sampling defaults for chat (env-tunable); greedy via TT_GREEDY=1 */
+    if (!getenv("TT_GREEDY")) {
+        const float temp = getenv("TT_TEMP") ? atof(getenv("TT_TEMP")) : 0.8f;
+        const float pen  = getenv("TT_REPEAT_PENALTY")
+                           ? atof(getenv("TT_REPEAT_PENALTY")) : 1.15f;
+        qwen2_engine_set_sampling(eng, temp, 40, pen);
+    }
+
     char user_input[1024];
     while (1) {
         printf("\nUser > ");

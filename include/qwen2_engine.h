@@ -57,6 +57,9 @@ void *qwen2_debug_stream(Qwen2Engine *e);
 void qwen2_debug_profile_reset(void);
 void qwen2_debug_profile_report(int nsteps);
 
+/* sampling: temp>0 enables Gumbel-max sampling + repeat penalty; default greedy */
+void qwen2_engine_set_sampling(Qwen2Engine *e, float temp, int topk, float penalty);
+
 /* debug/parity helpers */
 int qwen2_debug_copy_x(Qwen2Engine *e, float *host, int n);
 int qwen2_debug_copy_kv(Qwen2Engine*, int layer, float*, long);

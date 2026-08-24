@@ -251,6 +251,57 @@ __global__ void k_embed_q4_0_dyn(const BlockQ4_0 *__restrict__ W, const int *__r
  * device position scalar exactly once (host mirror does e->pos++ in lockstep). */
 __global__ void k_pos_inc(int *d_pos) { (*d_pos)++; }
 
+/* llama.cpp-style repetition penalty over a device ring of recent tokens.
+   No-ops when penalty <= 1.0f. Capture-safe: reads/writes device state only. */
+__global__ void k_repeat_penalty(float *__restrict__ logits,
+                                 const int *__restrict__ recent,
+                                 const int *__restrict__ n_recent,
+                                 int vocab, float penalty) {
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= vocab) return;
+    if (penalty <= 1.0f) return;
+    const int nr = *n_recent < 64 ? *n_recent : 64;
+    float v = logits[i];
+    for (int j = 0; j < nr; j++) {
+        if (recent[j] == i) {
+            v = v > 0.0f ? v / penalty : v * penalty;
+            break;
+        }
+    }
+    logits[i] = v;
+}
+
+/* Gumbel-max transform: logits' = logits/temp + gumbel_noise.
+   argmax(logits') samples softmax(logits/temp). No-op when temp <= 0 (greedy:
+   downstream argmax sees unmodified logits => byte-identical to before).
+   Nonce = *d_pos keeps it deterministic and capture-safe. */
+__device__ __forceinline__ unsigned int phil32(unsigned int seed, unsigned int idx) {
+    unsigned int h = seed ^ (idx * 0x9E3779B9u);
+    h ^= h >> 16; h *= 0x85EBCA6Bu; h ^= h >> 13; h *= 0xC2B2AE35u; h ^= h >> 16;
+    return h;
+}
+__global__ void k_gumbel_transform(float *__restrict__ logits, int vocab,
+                                   float temp, const int *__restrict__ d_pos,
+                                   const int *__restrict__ d_sampling_on) {
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= vocab) return;
+    if (temp <= 0.0f || !*d_sampling_on) return;
+    const unsigned int r = phil32((unsigned int)(*d_pos) * 2654435761u + 12345u,
+                                  (unsigned int)i);
+    /* u in (0,1]; gumbel = -log(-log(u)) */
+    const float u = ((float)r + 1.0f) / 4294967296.0f;
+    const float g = -logf(-logf(u));
+    logits[i] = logits[i] / temp + g;
+}
+
+/* called at end of captured step: bump pos AND record fed token in recent ring */
+__global__ void k_pos_inc_recent(int *d_pos, const int *d_next_tok,
+                                 int *recent, int *n_recent) {
+    recent[(*d_pos) % 64] = *d_next_tok;
+    if (*n_recent < 64) (*n_recent)++;
+    (*d_pos)++;
+}
+
 /* ---------------- host-side engine ---------------- */
 
 #define MAX_LAYERS 128
@@ -285,6 +336,12 @@ struct Qwen2Engine {
     int no_graph;                 /* TT_NO_GRAPH=1: eager path forever */
     int *d_next_tok;              /* device token fed by the next replay */
     int *h_sampled;               /* pinned staging for async D2H argmax result */
+    /* sampling controls (all device-resident => capture-safe; default greedy) */
+    float sampling_temp;          /* 0 = pure greedy (kernels no-op) */
+    float repeat_penalty;
+    int   *d_recent;              /* ring of recently fed tokens, 64 entries */
+    int   *d_n_recent;            /* valid count in ring */
+    int   *d_sampling_on;         /* 0/1 flag read by kernels inside graph */
     int pending_tok;              /* sampled token not yet fed through layers */
     int pos;
     cudaStream_t stream;
@@ -411,6 +468,18 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     const int nb = 256;
     cudaMalloc(&e->d_bvals, nb * sizeof(float));
     cudaMalloc(&e->d_bidxs, nb * sizeof(int));
+    /* sampling state: greedy until qwen2_engine_set_sampling() is called */
+    e->sampling_temp = 0.0f;
+    e->repeat_penalty = 1.0f;
+    cudaMalloc(&e->d_recent, 64 * sizeof(int));
+    cudaMalloc(&e->d_n_recent, sizeof(int));
+    cudaMemset(e->d_recent, 0, 64 * sizeof(int));
+    cudaMemsetAsync(e->d_n_recent, 0, sizeof(int), e->stream);
+    {
+        int zero = 0;
+        cudaMalloc(&e->d_sampling_on, sizeof(int));
+        cudaMemcpy(e->d_sampling_on, &zero, sizeof(int), cudaMemcpyHostToDevice);
+    }
     cudaMalloc(&e->d_out, sizeof(int));
     /* graph replay state */
     e->graph_exec = NULL;
@@ -433,8 +502,10 @@ void qwen2_engine_free(Qwen2Engine *e) {
     cudaFree(e->d_logits); cudaFree(e->d_kc); cudaFree(e->d_vc);
     cudaFree(e->d_k_stage); cudaFree(e->d_v_stage); cudaFree(e->d_pos);
     cudaFree(e->d_bvals); cudaFree(e->d_bidxs); cudaFree(e->d_out);
-    cudaFree(e->d_next_tok);
+    if (e->d_recent) cudaFree(e->d_recent);
+    if (e->d_n_recent) cudaFree(e->d_n_recent);
     if (e->h_sampled) cudaFreeHost(e->h_sampled);
+    cudaFree(e->d_next_tok);
     if (e->graph_exec) cudaGraphExecDestroy(e->graph_exec);
     /* NOTE: per-weight cudaFree calls are intentionally not tracked here; they are
      * leaked until process exit by design (engine lifetime == process lifetime).
@@ -697,6 +768,15 @@ int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
 /* Eager sampling tail shared by all paths: final rmsnorm -> logits ->
  * greedy argmax -> D2H sync. Returns token id, or negative on error.
  * d_logits stays valid afterwards (dump_logits relies on this). */
+/* sampling controls applied to d_logits before argmax (eager path mirror) */
+static void apply_sampling_eager(Qwen2Engine *e) {
+    if (e->repeat_penalty > 1.0f)
+        k_repeat_penalty<<<(e->cfg.vocab + 255) / 256, 256, 0, e->stream>>>(
+            e->d_logits, e->d_recent, e->d_n_recent, e->cfg.vocab, e->repeat_penalty);
+    k_gumbel_transform<<<(e->cfg.vocab + 255) / 256, 256, 0, e->stream>>>(
+        e->d_logits, e->cfg.vocab, e->sampling_temp, e->d_pos, e->d_sampling_on);
+}
+
 static int sample_eager(Qwen2Engine *e) {
     const TTConfig *c = &e->cfg;
     if (tt_profiling()) tt_prof_begin(TT_P_RMSNORM, e->stream);
@@ -709,6 +789,7 @@ static int sample_eager(Qwen2Engine *e) {
                                 e->d_logits, c->vocab, c->dim, e->stream);
     if (rc) return -1;
     if (tt_profiling()) tt_prof_end(TT_P_LOGITS, e->stream);
+    apply_sampling_eager(e);
 
     if (tt_profiling()) tt_prof_begin(TT_P_ARGMAX, e->stream);
     const int nb = 64;
@@ -746,7 +827,12 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
         k_embed_q4_0_dyn<<<(threads + 255) / 256, 256, 0, e->stream>>>(
             e->d_embd, e->d_next_tok, e->d_x, c->dim);
         k_pos_inc<<<1, 1, 0, e->stream>>>(e->d_pos);
+        k_repeat_penalty<<<1, 256, 0, e->stream>>>(e->d_logits, e->d_recent,
+                                                   e->d_n_recent, c->vocab, 2.0f);
+        k_gumbel_transform<<<1, 256, 0, e->stream>>>(e->d_logits, c->vocab,
+                                                     0.8f, e->d_pos, e->d_sampling_on);
         cudaStreamSynchronize(e->stream);
+        cudaMemset(e->d_logits, 0, c->vocab * sizeof(float));  /* warmed kernels wrote garbage */
         /* restore state the warmup perturbed */
         cudaMemcpy(e->d_x, xsave, c->dim * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(e->d_pos, &pos_before, sizeof(int), cudaMemcpyHostToDevice);
@@ -769,10 +855,16 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
         e->d_x, e->d_out_norm, e->d_xn, c->dim, c->rms_eps);
     const int lrc = tt_logits_dispatch(e->d_out_w, e->out_is_q8, e->d_xn,
                                        e->d_logits, c->vocab, c->dim, e->stream);
+    /* sampling controls: both kernels no-op when disabled (greedy byte-identical) */
+    k_repeat_penalty<<<(c->vocab + 255) / 256, 256, 0, e->stream>>>(
+        e->d_logits, e->d_recent, e->d_n_recent, c->vocab, e->repeat_penalty);
+    k_gumbel_transform<<<(c->vocab + 255) / 256, 256, 0, e->stream>>>(
+        e->d_logits, c->vocab, e->sampling_temp, e->d_pos, e->d_sampling_on);
     const int nb = 64;
     k_argmax_partial<<<nb, 256, 0, e->stream>>>(e->d_logits, c->vocab, e->d_bvals, e->d_bidxs);
     k_argmax_final<<<1, nb, 0, e->stream>>>(e->d_bvals, e->d_bidxs, nb, e->d_out);
-    k_pos_inc<<<1, 1, 0, e->stream>>>(e->d_pos);
+    k_pos_inc_recent<<<1, 1, 0, e->stream>>>(e->d_pos, e->d_next_tok,
+                                             e->d_recent, e->d_n_recent);
 
     cudaGraph_t graph = NULL;
     const cudaError_t enderr = cudaStreamEndCapture(e->stream, &graph);
@@ -866,6 +958,20 @@ int qwen2_debug_replay_step(Qwen2Engine *e, int next_tok) {
 void *qwen2_debug_stream(Qwen2Engine *e) { return e ? (void *)e->stream : NULL; }
 
 int qwen2_engine_pos(const Qwen2Engine *e) { return e ? e->pos : -1; }
+
+void qwen2_engine_set_sampling(Qwen2Engine *e, float temp, int topk,
+                               float penalty) {
+    if (!e) return;
+    (void)topk; /* Gumbel-max samples full softmax; topk reserved */
+    e->sampling_temp = temp;
+    e->repeat_penalty = penalty;
+    const int on = (temp > 0.0f) ? 1 : 0;
+    cudaMemcpyAsync(e->d_sampling_on, &on, sizeof(int),
+                    cudaMemcpyHostToDevice, e->stream);
+    if (on)
+        fprintf(stderr, "[qwen2-engine] sampling ON: temp=%.2f penalty=%.2f\n",
+                temp, penalty);
+}
 
 /* debug accessors (used by parity harness; not part of the public API contract) */
 int qwen2_debug_copy_x(Qwen2Engine *e, float *host, int n) {

@@ -57,6 +57,7 @@ def degenerate_fraction(text):
 
 
 def check_path(name, env_extra):
+    env_extra = dict(env_extra or {}, TT_GREEDY="1")  # determinism: gate tests greedy; sampling is a chat-level feature
     turns = run_session(env_extra)
     if turns is None:
         return False
