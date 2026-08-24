@@ -43,6 +43,7 @@
 - [ ] 3.5 (opt) fp16 activations / fp32 accum — re-run Q2 after
 - [x] 3.6 `bench/bench_llm.py`: timed run + in-process validity assertion (≥95% token-exact) + oracle comparison
 - [x] P1-analog: graph-mode 75.6 tok/s valid (eager 58.0 — original P1 wording predates graphs)
+- [x] M6.3b road-to-270: 286.7 tok/s short-ctx decode (argmax V2 + layer GEMV uint32/float4/two-rows + head y=1); decay curve documented; see bench/results.md
 - [x] P2-analog: 1.30x llama.cpp short-ctx reference (~58 tok/s same box); formal tg-128 head-to-head still open
 - [ ] Gate P3: Llama-3.2-1B spot-check (model not yet downloaded)
 
