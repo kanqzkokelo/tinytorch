@@ -586,10 +586,26 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     const long cache_per = (long)cfg->n_kv_heads * cfg->max_ctx * cfg->head_dim;
     cudaMalloc(&e->d_kc, cache_per * cfg->n_layers * sizeof(float));
     cudaMalloc(&e->d_vc, cache_per * cfg->n_layers * sizeof(float));
+    /* Zero every scratch/cache buffer: parity gates compare raw floats, so any
+     * read of never-written device memory (garbage varies with physical page
+     * assignment per process) shows up as cross-process nondeterminism.
+     * All buffers are logically fully overwritten before use; this is a
+     * deterministic-behavior belt-and-suspenders measure. */
+    cudaMemset(e->d_kc, 0, cache_per * cfg->n_layers * sizeof(float));
+    cudaMemset(e->d_vc, 0, cache_per * cfg->n_layers * sizeof(float));
+    cudaMemset(e->d_xn, 0, D * sizeof(float));
+    cudaMemset(e->d_q, 0, (long)cfg->n_heads * cfg->head_dim * sizeof(float));
+    cudaMemset(e->d_att, 0, (long)cfg->n_heads * cfg->head_dim * sizeof(float));
+    cudaMemset(e->d_h, 0, F * sizeof(float));
+    cudaMemset(e->d_g, 0, F * sizeof(float));
+    cudaMemset(e->d_u, 0, F * sizeof(float));
+    cudaMemset(e->d_logits, 0, (long)e->cfg.vocab * sizeof(float));
     cudaMemset(e->d_x, 0, D * sizeof(float));
     const long kvdim_alloc = (long)cfg->n_kv_heads * cfg->head_dim;
     cudaMalloc(&e->d_k_stage, kvdim_alloc * sizeof(float));
     cudaMalloc(&e->d_v_stage, kvdim_alloc * sizeof(float));
+    cudaMemset(e->d_k_stage, 0, kvdim_alloc * sizeof(float));
+    cudaMemset(e->d_v_stage, 0, kvdim_alloc * sizeof(float));
     cudaMalloc(&e->d_pos, sizeof(int));
     cudaMemsetAsync(e->d_pos, 0, sizeof(int), e->stream);   /* pos starts at 0 on device */
     const int nb = 256;
@@ -902,7 +918,12 @@ static int advance(Qwen2Engine *e, int tok) {
     rc = forward_layers(e);      /* runs while *d_pos == current slot */
     if (rc) return rc;
     e->pos++;
-    cudaMemcpyAsync(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice, e->stream);
+    /* SYNC copy: source is mutable host memory the next advance() increments
+     * immediately after enqueue. A small pageable async H2D copy can be
+     * executed later on the device timeline and would then read the
+     * already-incremented pos -> wrong RoPE/scatter/attention positions
+     * (observed as cross-process nondeterministic logits). */
+    cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
     return 0;
 }
 
@@ -916,8 +937,8 @@ int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
         if (advance(e, e->pending_tok)) return -3;
         e->pending_tok = -1;
     }
-    /* resync device position scalar before any forward work */
-    cudaMemcpyAsync(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice, e->stream);
+    /* resync device position scalar before any forward work (sync: see advance()) */
+    cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
     for (int i = 0; i < n; i++) {
         int rc = advance(e, toks[i]);
         if (rc) return rc;
@@ -1121,8 +1142,9 @@ int qwen2_debug_replay_step(Qwen2Engine *e, int next_tok) {
     if (!e || !e->graph_ready || next_tok < 0) return -1;
     const int vocab = e->cfg.vocab;
 
-    cudaMemcpyAsync(e->d_next_tok, &next_tok, sizeof(int),
-                    cudaMemcpyHostToDevice, e->stream);   /* same stream, before launch */
+    /* SYNC copy: source is a stack parameter; an async copy could execute
+     * after this function returns, reading reused stack memory. */
+    cudaMemcpy(e->d_next_tok, &next_tok, sizeof(int), cudaMemcpyHostToDevice);
     cudaGraphLaunch(e->graph_exec, e->stream);
     cudaMemcpyAsync(e->h_sampled, e->d_out, sizeof(int),
                     cudaMemcpyDeviceToHost, e->stream);
@@ -1146,8 +1168,7 @@ void qwen2_engine_set_sampling(Qwen2Engine *e, float temp, int topk,
     e->sampling_temp = temp;
     e->repeat_penalty = penalty;
     const int on = (temp > 0.0f) ? 1 : 0;
-    cudaMemcpyAsync(e->d_sampling_on, &on, sizeof(int),
-                    cudaMemcpyHostToDevice, e->stream);
+    cudaMemcpy(e->d_sampling_on, &on, sizeof(int), cudaMemcpyHostToDevice);
     if (on)
         fprintf(stderr, "[qwen2-engine] sampling ON: temp=%.2f penalty=%.2f\n",
                 temp, penalty);

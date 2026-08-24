@@ -1,5 +1,6 @@
 // Dump final-position logits from the tinytorch engine for teacher-forced tokens.
-// Usage: dump_logits <id,id,...> [out.bin]
+// Usage: dump_logits [--model PATH] <id,id,...> [out.bin]
+//   --model PATH   explicit model; falls back to $TT_MODEL, then the M6 default
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,8 +14,19 @@ int qwen2_debug_copy_logits(Qwen2Engine*, float*, int);
 int qwen2_debug_copy_xn(Qwen2Engine*, float*, int);
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s id,id,.. [out.bin]\n", argv[0]); return 1; }
     const char *model_path = "data/models/qwen2.5-0.5b-instruct-q4_0.gguf";
+    int argi = 1;
+    if (argi < argc && strcmp(argv[argi], "--model") == 0) {
+        if (argi + 1 >= argc) { fprintf(stderr, "--model requires a path\n"); return 1; }
+        model_path = argv[argi + 1];
+        argi += 2;
+    } else if (getenv("TT_MODEL") && getenv("TT_MODEL")[0]) {
+        model_path = getenv("TT_MODEL");
+    }
+    if (argc - argi < 1) {
+        fprintf(stderr, "usage: %s [--model PATH] id,id,... [out.bin]\n", argv[0]);
+        return 1;
+    }
     GGUFModel *m = gguf_load(model_path);
     if (!m) { fprintf(stderr, "gguf load failed: %s\n", model_path); return 1; }
     printf("model: %s\n", model_path);
@@ -23,8 +35,10 @@ int main(int argc, char **argv) {
     Qwen2Engine *e = qwen2_engine_create(&cfg, m);
     if (!e) return 1;
 
+    const char *ids_arg = argv[argi];
+    const char *dump_path = (argc - argi > 1) ? argv[argi + 1] : NULL;
     int toks[512], n = 0;
-    char *save = NULL, *p = strtok_r(argv[1], ",", &save);
+    char *save = NULL, *p = strtok_r((char *)ids_arg, ",", &save);
     while (p && n < 512) {
         char *end = NULL;
         long v = strtol(p, &end, 10);
@@ -54,8 +68,8 @@ int main(int argc, char **argv) {
     int best = 0; float mv = -1e30f;
     for (int i = 0; i < nvocab; i++) if (lg[i] > mv) { mv = lg[i]; best = i; }
     printf("ARGMAX %d %.4f VOCAB %d\n", best, mv, nvocab);
-    if (argc > 2) {
-        FILE *f = fopen(argv[2], "wb");
+    if (dump_path) {
+        FILE *f = fopen(dump_path, "wb");
         fwrite(lg, 4, nvocab, f);
         fclose(f);
     }
