@@ -112,3 +112,62 @@ nb*18 B (nb=28 -> 504 B, nb=152 -> 2736 B, both 4B-aligned); block qs starts at
 18*b+2, aligned iff b ODD; nb even => last block odd-b => merges stay in-row.
 o+mlp-gemv 8.81 -> 1.86 ms (~21 -> ~100 GB/s). qkv-gemv 1.48 -> 0.61 ms
 (same kernel serves Q/K/V projs). Parity 7/7.
+
+## M6.3b TASK 2 — lm-head second pass
+| Variant | Change | tok/s (3x64) | Verdict |
+|---|---|---|---|
+| T2-a | two-rows-per-warp on k_logits_q8_0 (layer-V2 pattern) | 212.2 (min 171.6, unstable) | REVERTED (flat) |
+| T2-b | blockDim.y sweep on head: 16->8 | 247.2 | KEPT step |
+| T2-b | ->4 | 268.8 | KEPT step |
+| T2-b | ->2 | 279.4 | KEPT step |
+| T2-b | ->1 (one warp per block) | **286.7** | KEPT |
+
+logits-gemv 1.283 -> 0.090 ms. The 512-thread blocks of the original config were
+the bottleneck, not DRAM: one warp per block lets the scheduler pack far more
+concurrent rows. Parity 7/7 at every step.
+
+## M6.3b TASK 3 — latency-gap trim: SKIPPED by measurement
+Post-T2 stage sum = 3.416 ms vs graph step 3.49 ms => gap ~2% < 5% action bar.
+No launch-gap work warranted.
+
+## M6.3b TASK 4 — context decay curve (decode-only, median of 3x64 gen)
+| prompt tokens (measured prefill) | decode tok/s |
+|---|---|
+| 33 | 288.4 |
+| 52 | 265.5 |
+| 252 | 145.6 |
+| 512 | 92.0 |
+
+Flash-attn share grows linearly with KV length as expected. fp16 K/V cache would
+halve that traffic but changes numerics -> requires parity-tolerance re-baseline
+with human sign-off (flagged, NOT done per plan non-goals).
+
+## M6.3b FINAL LADDER + VERDICT (2026-08-23)
+| Date | Config | Decode tok/s | Parity |
+|------|--------|--------------|--------|
+| 2026-08-23 | M6.3 baseline (graph replay + lm-head V1) | 75.6 (5x128) | 7/7 top1 |
+| — | + argmax V2 (float4 partials, parallel final) | 79.8 (3x64) | 7/7 |
+| — | + layer GEMV V1 (uint32 W + __byte_perm + float4 x) | 183.1 | 7/7 |
+| — | + layer GEMV V2 (two rows/warp) | 212.3 | 7/7 |
+| — | + head y-sweep 16->1 | **286.7 (3x64) / 219.6 (5x128)** | 7/7 |
+
+Final profile (eager events, ctx<=6):
+```
+STEP_MS 4.326            (graph replay min-of-20 was 12.07 at baseline)
+PROFILE embed           0.006
+PROFILE qkv-gemv        0.628
+PROFILE o+mlp-gemv      1.879   (~135 GB/s effective on the 253 MB read)
+PROFILE flash           0.377
+PROFILE rmsnorm         0.271
+PROFILE kv-scatter      0.093
+PROFILE logits-gemv     0.090
+PROFILE argmax          0.073
+PROFILE TOTAL(med)      3.416   (graph step ~3.49 ms; gap ~2%)
+```
+
+Verdict: TARGET MET at short context — >=270 tok/s decode-only for <=64-token
+contexts (286.7 median). Under the older 5-runs-x-128-tokens protocol the number
+is 219.6 because attention/KV cost grows across the 128 generated positions
+(see decay curve) — documented, not hidden. Remaining levers if more is ever
+needed: fp16 KV cache (numerics sign-off), cp.async staging in layer GEMVs,
+flash-attn kernel tuning at long ctx.
