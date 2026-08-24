@@ -83,3 +83,14 @@ PROFILE TOTAL(med)     12.809   (vs 13.62 eager STEP_MS; remainder = launch gaps
 ```
 
 Reading: o+mlp GEMVs = 68% of the step (the 253 MB q4_0 layer-weight read — Task 1 target). logits-GEMV 1.29 ms confirms Task 2 relevance (< 1.4 ms bar, marginal). flash 0.38 ms at pos<=6 = 2.9% — healthy. rmsnorm+scatter+embed ≈ 3% — confirmed skip. ncu: NOT available in $HOME/mmcuda/bin (`ls | grep -i ncu` empty, `which ncu` empty) — event timings carry the plan.
+
+## M6.3b TASK 1.5 — argmax fix (kept)
+Date: 2026-08-23. Baseline argmax 0.568 ms for a 600 KB logits read = launch-bound
+(256 partial blocks x 128 threads + single-thread final over 256 partials).
+
+Change: float4 vectorized partial kernel (64 blocks x 256 threads), final reduce now
+parallel (1 block x 64 threads, tree, same value-then-index tie-break). Deterministic
+tie-break preserved -> parity gate unaffected.
+
+Result: argmax 0.568 -> 0.071 ms (-0.50 ms/step). Bench: 78 -> 80.0 tok/s median
+(--runs 3 --tokens 64). verify.sh m61 7/7. KEPT.
