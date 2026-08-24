@@ -326,6 +326,7 @@ int tt_embed_q4_0(const void *dW, int tok, float *dx, int dim, cudaStream_t stre
 int tt_logits_dispatch(const void *dW, int is_q8, const float *dx,
                        float *dlogits, int vocab, int K, cudaStream_t stream) {
     dim3 g, b; gemv_dims(vocab, &g, &b);
+    if (is_q8) b.y = 1;   /* M6.3b: one warp per block for the head (y sweep 16->8->4->2->1 monotone win) */
     if (is_q8)
         k_logits_q8_0<<<g, b, 0, stream>>>((const BlockQ8_0 *)dW, dx, dlogits, vocab, K);
     else
