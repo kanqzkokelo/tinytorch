@@ -23,7 +23,17 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 }
 
 // One warp computes one output row: y[m] = W[m,:] @ x[:].
-// blockDim=(32, warps_per_block); gridDim.x = ceil(M / warps_per_block).
+// V2: vectorized weight streaming, port of the k_logits_q8_0 winner.
+// Alignment reasoning (same approach as k_logits_q8_0): row stride is
+// nb*18 bytes, which is 4-byte aligned iff nb is even (18*nb = 4*9*nb/2).
+// Both layer shapes satisfy that: K=896 -> nb=28, K=4864 -> nb=152.
+// Block scale d lives at byte 18*b (high half of word 18b>>2 iff b odd);
+// the 16-byte qs payload starts at byte 18b+2, which is 4-byte aligned
+// only for odd b, so even-b blocks merge two adjacent aligned words with
+// __byte_perm. When merging, one extra trailing word is touched (next
+// block's scale) - in-row for every block except possibly the last;
+// nb even guarantees the last block is odd-b (aligned path), so no
+// out-of-row access. Requires nb even.
 __global__ void k_gemv_q4_0(const BlockQ4_0 *__restrict__ W,
                             const float *__restrict__ x,
                             float *__restrict__ y,
@@ -33,18 +43,31 @@ __global__ void k_gemv_q4_0(const BlockQ4_0 *__restrict__ W,
 
     const int lane = threadIdx.x;
     const int nb = K / 32;                    // q4_0 blocks per row
-    const BlockQ4_0 *rowW = W + (long)row * nb;
+    const uint32_t *roww = (const uint32_t *)((const char *)W + (long)row * nb * 18);
     float sum = 0.0f;
 
     for (int b = lane; b < nb; b += 32) {
-        BlockQ4_0 blk = rowW[b];
-        const float d = __half2float(blk.d);
-        const float *xb = x + b * 32;
+        const int wsc = (18 * b) >> 2;                 // word holding blk.d
+        const unsigned short d16 = (unsigned short)
+            (((18 * b) & 2) ? (roww[wsc] >> 16) : (roww[wsc] & 0xFFFFu));
+        const float d = __half2float(__ushort_as_half(d16));
+        const int a0 = (18 * b + 2) >> 2;              // first qs word
+        const int sh  = (18 * b + 2) & 2;              // 2 => misaligned merge
+        const float4 *x4 = (const float4 *)(x + b * 32);
 #pragma unroll
-        for (int i = 0; i < 16; i++) {
-            const int q0 = (blk.qs[i] & 0x0F) - 8;
-            const int q1 = (blk.qs[i] >> 4) - 8;
-            sum += ((float)q0 * d) * xb[i] + ((float)q1 * d) * xb[i + 16];
+        for (int k = 0; k < 4; k++) {
+            const uint32_t lo = roww[a0 + k];
+            const uint32_t vv = sh ? __byte_perm(lo, roww[a0 + k + 1], 0x5432) : lo;
+            const float4 xa = x4[k];       // x[4k .. 4k+3]   <- low nibbles
+            const float4 xb = x4[k + 4];   // x[16+4k .. +3]  <- high nibbles
+            sum += (float)((vv         & 0xFu) - 8u) * d * xa.x;
+            sum += (float)(((vv >>  4) & 0xFu) - 8u) * d * xa.y;
+            sum += (float)(((vv >>  8) & 0xFu) - 8u) * d * xa.z;
+            sum += (float)(((vv >> 12) & 0xFu) - 8u) * d * xa.w;
+            sum += (float)(((vv >> 16) & 0xFu) - 8u) * d * xb.x;
+            sum += (float)(((vv >> 20) & 0xFu) - 8u) * d * xb.y;
+            sum += (float)(((vv >> 24) & 0xFu) - 8u) * d * xb.z;
+            sum += (float)( (vv >> 28)         - 8u) * d * xb.w;
         }
     }
     sum = warp_reduce_sum(sum);
@@ -52,6 +75,7 @@ __global__ void k_gemv_q4_0(const BlockQ4_0 *__restrict__ W,
 }
 
 // Fused MLP up-projection: h[m] = silu(W_gate[m,:] @ x) * (W_up[m,:] @ x).
+// V2: same vectorized streaming as k_gemv_q4_0 above (same nb-even contract).
 __global__ void k_fused_swiglu_q4_0(const BlockQ4_0 *__restrict__ W_gate,
                                     const BlockQ4_0 *__restrict__ W_up,
                                     const float *__restrict__ x,
@@ -62,21 +86,46 @@ __global__ void k_fused_swiglu_q4_0(const BlockQ4_0 *__restrict__ W_gate,
 
     const int lane = threadIdx.x;
     const int nb = K / 32;
-    const BlockQ4_0 *gRow = W_gate + (long)row * nb;
-    const BlockQ4_0 *uRow = W_up + (long)row * nb;
+    const uint32_t *gw = (const uint32_t *)((const char *)W_gate + (long)row * nb * 18);
+    const uint32_t *uw = (const uint32_t *)((const char *)W_up   + (long)row * nb * 18);
     float sg = 0.0f, su = 0.0f;
 
     for (int b = lane; b < nb; b += 32) {
-        BlockQ4_0 bg = gRow[b];
-        BlockQ4_0 bu = uRow[b];
-        const float dg = __half2float(bg.d);
-        const float du = __half2float(bu.d);
-        const float *xb = x + b * 32;
+        const int wsc = (18 * b) >> 2;
+        const int sh  = (18 * b + 2) & 2;
+        const unsigned short dg16 = (unsigned short)
+            (((18 * b) & 2) ? (gw[wsc] >> 16) : (gw[wsc] & 0xFFFFu));
+        const unsigned short du16 = (unsigned short)
+            (((18 * b) & 2) ? (uw[wsc] >> 16) : (uw[wsc] & 0xFFFFu));
+        const float dg = __half2float(__ushort_as_half(dg16));
+        const float du = __half2float(__ushort_as_half(du16));
+        const int g0 = (18 * b + 2) >> 2;
+        const int u0 = g0;                           // same layout both rows
+        const float4 *x4 = (const float4 *)(x + b * 32);
 #pragma unroll
-        for (int i = 0; i < 16; i++) {
-            const float x0 = xb[i], x1 = xb[i + 16];
-            sg += (((bg.qs[i] & 0x0F) - 8) * dg) * x0 + (((bg.qs[i] >> 4) - 8) * dg) * x1;
-            su += (((bu.qs[i] & 0x0F) - 8) * du) * x0 + (((bu.qs[i] >> 4) - 8) * du) * x1;
+        for (int k = 0; k < 4; k++) {
+            const uint32_t glo = gw[g0 + k];
+            const uint32_t ulo = uw[u0 + k];
+            const uint32_t gvv = sh ? __byte_perm(glo, gw[g0 + k + 1], 0x5432) : glo;
+            const uint32_t uvv = sh ? __byte_perm(ulo, uw[u0 + k + 1], 0x5432) : ulo;
+            const float4 xa = x4[k];
+            const float4 xb = x4[k + 4];
+            sg += (float)((gvv         & 0xFu) - 8u) * dg * xa.x;
+            sg += (float)(((gvv >>  4) & 0xFu) - 8u) * dg * xa.y;
+            sg += (float)(((gvv >>  8) & 0xFu) - 8u) * dg * xa.z;
+            sg += (float)(((gvv >> 12) & 0xFu) - 8u) * dg * xa.w;
+            sg += (float)(((gvv >> 16) & 0xFu) - 8u) * dg * xb.x;
+            sg += (float)(((gvv >> 20) & 0xFu) - 8u) * dg * xb.y;
+            sg += (float)(((gvv >> 24) & 0xFu) - 8u) * dg * xb.z;
+            sg += (float)( (gvv >> 28)         - 8u) * dg * xb.w;
+            su += (float)((uvv         & 0xFu) - 8u) * du * xa.x;
+            su += (float)(((uvv >>  4) & 0xFu) - 8u) * du * xa.y;
+            su += (float)(((uvv >>  8) & 0xFu) - 8u) * du * xa.z;
+            su += (float)(((uvv >> 12) & 0xFu) - 8u) * du * xa.w;
+            su += (float)(((uvv >> 16) & 0xFu) - 8u) * du * xb.x;
+            su += (float)(((uvv >> 20) & 0xFu) - 8u) * du * xb.y;
+            su += (float)(((uvv >> 24) & 0xFu) - 8u) * du * xb.z;
+            su += (float)( (uvv >> 28)         - 8u) * du * xb.w;
         }
     }
     sg = warp_reduce_sum(sg);
