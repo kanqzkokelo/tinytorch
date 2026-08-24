@@ -56,22 +56,22 @@ cublas: $(BUILD)/libtt_cublas.so
 
 .PHONY: cublas
 
-$(BUILD)/run_llm_gpu: examples/run_llm_gpu.c src/loader_gguf.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
+$(BUILD)/run_llm_gpu: examples/run_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
 	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
-	  examples/run_llm_gpu.c src/loader_gguf.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
+	  examples/run_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
 	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
 
 run_llm_gpu: $(BUILD)/run_llm_gpu
 
-$(BUILD)/chat_llm_gpu: examples/chat_llm_gpu.c src/loader_gguf.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
+$(BUILD)/chat_llm_gpu: examples/chat_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
 	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
-	  examples/chat_llm_gpu.c src/loader_gguf.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
+	  examples/chat_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
 	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
 
 chat_llm_gpu: $(BUILD)/chat_llm_gpu
@@ -88,24 +88,24 @@ oracle_logits: $(BUILD)/oracle_logits
 
 .PHONY: run_llm_gpu chat_llm_gpu
 
-$(BUILD)/dump_logits: tools/dump_logits.c src/loader_gguf.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
+$(BUILD)/dump_logits: tools/dump_logits.c src/loader_gguf.c src/arch_registry.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
 	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
-	  tools/dump_logits.c src/loader_gguf.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
+	  tools/dump_logits.c src/loader_gguf.c src/arch_registry.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
 	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
 
 dump_logits: $(BUILD)/dump_logits
 
 .PHONY: dump_logits
 
-$(BUILD)/profile_step: tools/profile_step.cu src/loader_gguf.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
+$(BUILD)/profile_step: tools/profile_step.cu src/loader_gguf.c src/arch_registry.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
 	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
-	  tools/profile_step.cu src/loader_gguf.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
+	  tools/profile_step.cu src/loader_gguf.c src/arch_registry.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
 	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
 
 profile_step: $(BUILD)/profile_step

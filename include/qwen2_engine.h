@@ -2,12 +2,16 @@
 #define QWEN2_ENGINE_H
 
 #include "loader_gguf.h"
+#include "arch_registry.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Model geometry — every field derived from GGUF metadata, never hardcoded. */
+/* Model geometry + M7 architecture traits — every field derived from
+ * GGUF metadata, never hardcoded. The trait block selects kernel variants
+ * at fixed variation points inside the forward pass (rope style, activation,
+ * q/k norm, logit softcap, SWA window, tied embeddings). */
 typedef struct {
     int dim;          /* embedding / residual stream width            */
     int hidden_dim;   /* FFN intermediate width                       */
@@ -19,6 +23,7 @@ typedef struct {
     int max_ctx;      /* KV cache capacity (caller-chosen)            */
     float rms_eps;
     float rope_base;
+    TTraits tr;       /* per-family behavior (arch_registry defaults) */
 } TTConfig;
 
 /* Returns cfg with dim==0 if required metadata keys are missing. */

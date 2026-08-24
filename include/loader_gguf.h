@@ -50,6 +50,9 @@ typedef struct {
     int max_seq_len;
     float rms_norm_eps;
     float rope_freq_base;
+    char architecture[64];        /* general.architecture (M7 task 3)   */
+    int sliding_window;           /* <arch>.attention.sliding_window     */
+    float final_logit_softcapping;/* <arch>.final_logit_softcapping      */
     int tensor_count;
     GGUFTensor *tensors;
     void *mmap_addr;

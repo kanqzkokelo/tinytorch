@@ -108,29 +108,41 @@ GGUFModel *gguf_load(const char *filepath) {
     model->mmap_size = file_size;
     model->tensor_count = (int)header.tensor_count;
 
-    // Parse KV metadata
+    // Parse KV metadata. M7 task 3: keys are matched by SUFFIX after the
+    // first dot, so <arch>.embedding_length works for every family
+    // (llama./qwen2./qwen3./gemma2. ...) instead of a hardcoded pair.
+    // Suffixes are unique enough across namespaces (tokenizer.* never uses
+    // them). general.architecture is stored verbatim for the trait registry.
     char key[128];
     for (uint64_t i = 0; i < header.metadata_kv_count; i++) {
         read_string(&p, key, sizeof(key));
         uint32_t value_type = read_u32(&p);
+        const char *dot = strchr(key, '.');
+        const char *sfx = dot ? dot + 1 : key;
 
-        if (strcmp(key, "llama.embedding_length") == 0 || strcmp(key, "qwen2.embedding_length") == 0) {
+        if (value_type == 8 && strcmp(key, "general.architecture") == 0) {
+            read_string(&p, model->architecture, sizeof(model->architecture));
+            continue;
+        } else if (strcmp(sfx, "embedding_length") == 0) {
             model->dim = *(const int32_t *)p;
-        } else if (strcmp(key, "llama.feed_forward_length") == 0 || strcmp(key, "qwen2.feed_forward_length") == 0) {
+        } else if (strcmp(sfx, "feed_forward_length") == 0) {
             model->hidden_dim = *(const int32_t *)p;
-        } else if (strcmp(key, "llama.block_count") == 0 || strcmp(key, "qwen2.block_count") == 0) {
+        } else if (strcmp(sfx, "block_count") == 0) {
             model->n_layers = *(const int32_t *)p;
-        } else if (strcmp(key, "llama.attention.head_count") == 0 || strcmp(key, "qwen2.attention.head_count") == 0) {
+        } else if (strcmp(sfx, "attention.head_count") == 0) {
             model->n_heads = *(const int32_t *)p;
-        } else if (strcmp(key, "llama.attention.head_count_kv") == 0 || strcmp(key, "qwen2.attention.head_count_kv") == 0) {
+        } else if (strcmp(sfx, "attention.head_count_kv") == 0) {
             model->n_kv_heads = *(const int32_t *)p;
-        } else if (strcmp(key, "llama.context_length") == 0 || strcmp(key, "qwen2.context_length") == 0) {
+        } else if (strcmp(sfx, "context_length") == 0) {
             model->max_seq_len = *(const int32_t *)p;
-        } else if (strcmp(key, "llama.attention.layer_norm_rms_epsilon") == 0 || strcmp(key, "qwen2.attention.layer_norm_rms_epsilon") == 0) {
+        } else if (strcmp(sfx, "attention.layer_norm_rms_epsilon") == 0) {
             model->rms_norm_eps = *(const float *)p;
-        } else if (strcmp(key, "llama.rope.freq_base") == 0 || strcmp(key, "qwen2.rope.freq_base") == 0 ||
-                   strcmp(key, "llama.rope_freq_base") == 0) {
+        } else if (strcmp(sfx, "rope.freq_base") == 0 || strcmp(key, "llama.rope_freq_base") == 0) {
             model->rope_freq_base = *(const float *)p;
+        } else if (strcmp(sfx, "attention.sliding_window") == 0) {
+            model->sliding_window = *(const int32_t *)p;
+        } else if (strcmp(sfx, "final_logit_softcapping") == 0) {
+            model->final_logit_softcapping = *(const float *)p;
         }
 
         skip_kv_value(&p, value_type);
@@ -202,7 +214,8 @@ GGUFModel *gguf_load(const char *filepath) {
         t->data = (void *)(binary_base + t->offset);
     }
 
-    printf("[GGUF] Loaded model: dim=%d, hidden=%d, layers=%d, heads=%d, kv_heads=%d, tensors=%d\n",
+    printf("[GGUF] Loaded model: arch=%s dim=%d, hidden=%d, layers=%d, heads=%d, kv_heads=%d, tensors=%d\n",
+           model->architecture[0] ? model->architecture : "?",
            model->dim, model->hidden_dim, model->n_layers, model->n_heads, model->n_kv_heads, model->tensor_count);
 
     return model;

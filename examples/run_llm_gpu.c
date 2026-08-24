@@ -17,14 +17,20 @@ int main(int argc, char **argv) {
     int target_tokens = argc > 2 ? atoi(argv[2]) : 64;
     if (target_tokens < 1) target_tokens = 1;
 
-    const char *model_path =
-        "data/models/qwen2.5-0.5b-instruct-q4_0.gguf";
+    const char *model_path = getenv("TT_MODEL") ? getenv("TT_MODEL")
+        : "data/models/qwen2.5-0.5b-instruct-q4_0.gguf";
     const int MAX_CTX = 1024;
 
     GGUFModel *model = gguf_load(model_path);
     if (!model) return 1;
     BPETokenizer *tok = bpe_tokenizer_init(model);
-    if (!tok) return 1;
+    if (!tok)
+        /* M7 task 3 smoke path: SentencePiece models (gemma/llama-vocab)
+         * decode in Task 4. Engine plumbing still gets exercised with
+         * placeholder ids. */
+        fprintf(stderr, "[run] WARN: BPE tokenizer unavailable for %s "
+                "(arch=%s); feeding placeholder ids, text output invalid\n",
+                model_path, model->architecture[0] ? model->architecture : "?");
 
     TTConfig cfg = tt_config_from_gguf(model, MAX_CTX);
     if (cfg.dim == 0) { fprintf(stderr, "config failed\n"); return 1; }
@@ -43,7 +49,15 @@ int main(int argc, char **argv) {
         snprintf(formatted, sizeof(formatted), "%s", prompt);
 
     int prompt_tokens[512];
-    int n_prompt = bpe_encode(tok, formatted, prompt_tokens, 512);
+    int n_prompt;
+    if (tok) {
+        n_prompt = bpe_encode(tok, formatted, prompt_tokens, 512);
+    } else {
+        /* placeholder prefill: valid ids within any vocab */
+        const int smoke_ids[5] = {1, 2, 3, 4, 5};
+        memcpy(prompt_tokens, smoke_ids, sizeof(smoke_ids));
+        n_prompt = 5;
+    }
     printf("[run] prompt: %d tokens\n", n_prompt);
     if (n_prompt <= 0) return 1;
 
@@ -61,7 +75,8 @@ int main(int argc, char **argv) {
     size_t tl = 0;
     for (int s = 0; s < target_tokens && qwen2_engine_pos(eng) < MAX_CTX - 1; s++) {
         const int id = qwen2_engine_next(eng);
-        if (id < 0 || id == tok->eos_id || id == 151643 || id == 151645) break;
+        if (id < 0 || (tok && (id == tok->eos_id || id == 151643 || id == 151645))) break;
+        if (!tok) { gen_count++; continue; }   /* no decoder yet: count only */
         int out_len = 0;
         const char *txt = bpe_decode_token(tok, id, &out_len);
         if (tl + (size_t)out_len < sizeof(turn_text)) {
@@ -94,7 +109,7 @@ int main(int argc, char **argv) {
     printf("STATS tokens=%d prefill=%d decode_us=%.0f\n", gen_count, n_prompt, dec * 1e6);
 
     qwen2_engine_free(eng);
-    bpe_tokenizer_free(tok);
+    if (tok) bpe_tokenizer_free(tok);
     gguf_free(model);
     return 0;
 }

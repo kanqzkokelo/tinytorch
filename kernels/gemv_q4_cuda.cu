@@ -101,13 +101,20 @@ __global__ void k_gemv_q4_0(const BlockQ4_0 *__restrict__ W,
     }
 }
 
-// Fused MLP up-projection: h[m] = silu(W_gate[m,:] @ x) * (W_up[m,:] @ x).
+// GELU tanh approximation (Hendrycks), used by gemma/gemma2 FFN epilogue.
+__device__ __forceinline__ float gelu_tanh(float x) {
+    return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+}
+
+// Fused MLP up-projection: h[m] = act(W_gate[m,:] @ x) * (W_up[m,:] @ x).
+// act = 0: silu (qwen2/llama/qwen3 SwiGLU); act = 1: gelu-tanh (gemma GeGLU):
+//   gelu(x) = 0.5x(1+tanh(sqrt(2/pi)(x+0.044715x^3)))
 // V2: two rows per warp (same sharing scheme as k_gemv_q4_0; nb-even contract).
 __global__ void k_fused_swiglu_q4_0(const BlockQ4_0 *__restrict__ W_gate,
                                     const BlockQ4_0 *__restrict__ W_up,
                                     const float *__restrict__ x,
                                     float *__restrict__ out,
-                                    int M, int K) {
+                                    int M, int K, int act) {
     const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 2;
     if (row0 >= M) return;
     const int row1 = row0 + 1;
@@ -187,12 +194,9 @@ __global__ void k_fused_swiglu_q4_0(const BlockQ4_0 *__restrict__ W_gate,
     sg1 = warp_reduce_sum(sg1);
     su1 = warp_reduce_sum(su1);
     if (lane == 0) {
-        const float ga = sg0;
-        out[row0] = (ga / (1.0f + expf(-ga))) * su0;
-        if (row1 < M) {
-            const float gb = sg1;
-            out[row1] = (gb / (1.0f + expf(-gb))) * su1;
-        }
+        out[row0] = (act ? gelu_tanh(sg0) : sg0 / (1.0f + expf(-sg0))) * su0;
+        if (row1 < M)
+            out[row1] = (act ? gelu_tanh(sg1) : sg1 / (1.0f + expf(-sg1))) * su1;
     }
 }
 
@@ -311,7 +315,17 @@ int tt_swiglu_q4_0(const void *dGate, const void *dUp, const float *dx,
                    float *dh, int M, int K, cudaStream_t stream) {
     dim3 g, b; gemv_dims2(M, &g, &b);
     k_fused_swiglu_q4_0<<<g, b, 0, stream>>>((const BlockQ4_0 *)dGate, (const BlockQ4_0 *)dUp,
-                                             dx, dh, M, K);
+                                             dx, dh, M, K, 0);
+    return (int)cudaGetLastError();
+}
+
+/* M7 task 3: activation-selecting fused q4_0 FFN kernel.
+ * act: 0 = SiLU (SwiGLU), 1 = GELU-tanh (GeGLU, gemma families). */
+int tt_ffn_q4_0(const void *dGate, const void *dUp, const float *dx,
+                float *dh, int M, int K, int act, cudaStream_t stream) {
+    dim3 g, b; gemv_dims2(M, &g, &b);
+    k_fused_swiglu_q4_0<<<g, b, 0, stream>>>((const BlockQ4_0 *)dGate, (const BlockQ4_0 *)dUp,
+                                             dx, dh, M, K, act);
     return (int)cudaGetLastError();
 }
 

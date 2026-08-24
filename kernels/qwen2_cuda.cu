@@ -44,6 +44,9 @@ int tt_logits_q4_0(const void *dW, const float *dx, float *dlogits,
 /* M7 task 2: typed dispatch (kernels/gemv_typed.cu) */
 int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
                   int M, int K, cudaStream_t stream);
+/* M7 task 3: fused q4_0 FFN with activation-selectable epilogue */
+int tt_ffn_q4_0(const void *dGate, const void *dUp, const float *dx,
+                float *dh, int M, int K, int act, cudaStream_t stream);
 int tt_embed_typed(const void *dW, int dtype, int tok, float *dx, int dim,
                    cudaStream_t stream);
 int tt_logits_dispatch(const void *dW, int dtype, const float *dx,
@@ -77,9 +80,12 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
-/* y = x / sqrt(mean(x^2) + eps) * gamma ; one block per row. */
+/* y = x / sqrt(mean(x^2) + eps) * (woff + gamma) ; one block per row.
+ * woff is the gemma-style norm offset; converted gemma GGUFs bake the
+ * (1+w) into the stored weights (oracle convert_hf_to_gguf.py:4730), so it
+ * stays 0 there. woff=0 => y[i] = x[i]*inv*g[i] exactly as before. */
 __global__ void k_rmsnorm(const float *__restrict__ x, const float *__restrict__ g,
-                          float *__restrict__ y, int dim, float eps) {
+                          float *__restrict__ y, int dim, float eps, float woff) {
     extern __shared__ float s[];
     const int tid = threadIdx.x;
     float ss = 0.0f;
@@ -94,7 +100,11 @@ __global__ void k_rmsnorm(const float *__restrict__ x, const float *__restrict__
     }
     __syncthreads();
     const float inv = s[0];
-    for (int i = tid; i < dim; i += blockDim.x) y[i] = x[i] * inv * g[i];
+    if (woff == 0.0f) {
+        for (int i = tid; i < dim; i += blockDim.x) y[i] = x[i] * inv * g[i];
+    } else {
+        for (int i = tid; i < dim; i += blockDim.x) y[i] = x[i] * inv * (woff + g[i]);
+    }
 }
 
 /* RoPE in-place on rows [n_heads, head_dim]; one thread per half-dim pair. */
@@ -114,6 +124,61 @@ __global__ void k_rope(float *__restrict__ q, int n_heads, int head_dim,
     row[i + head_dim / 2] = v0 * s + v1 * c;
 }
 
+/* GPT-J style RoPE: interleaved consecutive pairs (2i, 2i+1).
+ * This is llama.cpp's LLAMA_ROPE_TYPE_NORM convention used by the llama
+ * family (mistral/tinyllama/smollm) — oracle llama-model.cpp:3854-3875.
+ * Selected by the ROPE_GPTJ trait; identical signature to k_rope. */
+__global__ void k_rope_gptj(float *__restrict__ q, int n_heads, int head_dim,
+                            const int *__restrict__ d_pos, float base) {
+    const int pos = *d_pos;
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;   /* 0..head_dim/2 */
+    const int h = blockIdx.y;
+    if (h >= n_heads || i >= head_dim / 2) return;
+
+    float *row = q + (long)h * head_dim;
+    const float freq = powf(base, -2.0f * (float)i / (float)head_dim);
+    const float ang = (float)pos * freq;
+    const float c = cosf(ang), s = sinf(ang);
+    const int i0 = 2 * i, i1 = 2 * i + 1;
+    const float v0 = row[i0], v1 = row[i1];
+    row[i0] = v0 * c - v1 * s;
+    row[i1] = v0 * s + v1 * c;
+}
+
+/* M7 task 3: per-head RMSNorm over q/k rows pre-rope (qwen3 trait).
+ * One block per head; mean-of-squares over head_dim only.
+ * y[h*hd+i] = x[h*hd+i] * rsqrt(mean(x^2)+eps) * gamma[i]. */
+__global__ void k_qk_norm_rms(float *__restrict__ x, const float *__restrict__ g,
+                              int n_heads, int head_dim, float eps) {
+    extern __shared__ float s[];
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+    const int tid = threadIdx.x;
+    const float *row = x + (long)h * head_dim;
+    float ss = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) ss += row[i] * row[i];
+    ss = warp_sum(ss);
+    if ((tid & 31) == 0) s[tid >> 5] = ss;
+    __syncthreads();
+    if (tid == 0) {
+        float t = 0.0f;
+        for (int w = 0; w < (blockDim.x + 31) / 32; w++) t += s[w];
+        s[0] = rsqrtf(t / (float)head_dim + eps);
+    }
+    __syncthreads();
+    const float inv = s[0];
+    for (int i = tid; i < head_dim; i += blockDim.x)
+        x[(long)h * head_dim + i] = row[i] * inv * g[i];
+}
+
+/* Final-logit tanh softcap (gemma2): l = tanh(l/c)*c.
+ * Mirrors oracle build_gemma2 tail (llama.cpp:5000-5003:
+ * scale(1/c) -> tanh -> scale(c)). No-op launch skipped when cap<=0. */
+__global__ void k_softcap(float *__restrict__ logits, int n, float cap) {
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) logits[i] = tanhf(logits[i] / cap) * cap;
+}
+
 __global__ void k_add(float *__restrict__ dst, const float *__restrict__ src, int n) {
     const int i = threadIdx.x + blockIdx.x * blockDim.x;
     if (i < n) dst[i] += src[i];
@@ -127,7 +192,7 @@ __global__ void k_flash_gqa(const float *__restrict__ q,
                             float *__restrict__ out,
                             const int *__restrict__ d_pos, /* inclusive: attend to 0..*d_pos */
                             int n_heads, int n_kv_heads, int head_dim,
-                            int max_ctx, float scale) {
+                            int max_ctx, float scale, int window) {
     const int pos = *d_pos;
     const int h = blockIdx.x;
     if (h >= n_heads) return;
@@ -135,6 +200,12 @@ __global__ void k_flash_gqa(const float *__restrict__ q,
     const int kvh = h / (n_heads / n_kv_heads);          /* GQA group map */
     const int elems = head_dim / 32;                     /* per-lane elements */
     const float *qh = q + (long)h * head_dim + lane * elems;
+
+    /* SWA (gemma2): skip slots older than the window. Slot t attends iff
+     * pos - t < window (HF gemma2 masking: scores masked when i-j >= swa).
+     * window <= 0 => full attention, t0=0, loop unchanged. */
+    int t0 = 0;
+    if (window > 0 && pos >= window) t0 = pos - window + 1;
 
     float qreg[8];
 #pragma unroll
@@ -144,7 +215,7 @@ __global__ void k_flash_gqa(const float *__restrict__ q,
     float oreg[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
     /* INVARIANT: callers enforce pos < max_ctx (no ring wraparound in this loop) */
-    for (int t = 0; t <= pos; t++) {
+    for (int t = t0; t <= pos; t++) {
         /* slot-major layout: [slot][kv_head*head_dim], matches GEMV writes */
         const long off = ((long)t * n_kv_heads + kvh) * head_dim + lane * elems;
         const float *kp = Kc + off;
@@ -323,13 +394,18 @@ __global__ void k_pos_inc_recent(int *d_pos, const int *d_next_tok,
     (*d_pos)++;
 }
 
-/* silu(g) * u elementwise: the non-q4_0 MLP path (two plain GEMVs + this)
- * replaces the fused q4_0 kernel when gate/up are any other dtype. */
+/* act(g) * u elementwise: the non-q4_0 MLP path (two plain GEMVs + this)
+ * replaces the fused q4_0 kernel when gate/up are any other dtype.
+ * act = 0: silu; act = 1: gelu tanh-approx (gemma GeGLU families). */
 __global__ void k_swiglu_apply(const float *__restrict__ g,
                                const float *__restrict__ u,
-                               float *__restrict__ h, int n) {
+                               float *__restrict__ h, int n, int act) {
     const int i = threadIdx.x + blockIdx.x * blockDim.x;
-    if (i < n) { const float gi = g[i]; h[i] = (gi / (1.0f + expf(-gi))) * u[i]; }
+    if (i >= n) return;
+    const float gi = g[i];
+    const float a = act ? 0.5f * gi * (1.0f + tanhf(0.7978845608028654f * (gi + 0.044715f * gi * gi * gi)))
+                        : gi / (1.0f + expf(-gi));
+    h[i] = a * u[i];
 }
 
 /* ---------------- host-side engine ---------------- */
@@ -343,6 +419,7 @@ struct LayerW {
     TTensor q, k, v, o, gate, up, down;
     float *attn_norm, *ffn_norm;      /* device f32 gammas */
     float *q_bias, *k_bias, *v_bias;  /* this GGUF variant carries QKV biases */
+    float *q_norm, *k_norm;           /* per-head q/k rmsnorm gammas (qwen3 trait) */
 };
 
 struct Qwen2Engine {
@@ -422,6 +499,23 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     e->pos = 0;
     cudaStreamCreate(&e->stream);
 
+    /* M7 task 3: resolve architecture traits from general.architecture.
+     * Unknown arch => clear error listing what we support. */
+    if (tt_traits_resolve(m, &e->cfg.tr) != 0) {
+        fprintf(stderr,
+                "[qwen2-engine] ERROR: unsupported general.architecture '%s'.\n"
+                "  supported: %s\n",
+                m->architecture[0] ? m->architecture : "(missing)",
+                tt_traits_supported());
+        qwen2_engine_free(e);
+        return NULL;
+    }
+    fprintf(stderr, "[qwen2-engine] traits: rope=%s act=%s softcap=%.1f swa=%d tied=%d qk_norm=%d norm_off=%.1f\n",
+            e->cfg.tr.rope == ROPE_GPTJ ? "gptj" : "neox",
+            e->cfg.tr.act == ACT_GELU ? "gelu" : "silu",
+            e->cfg.tr.softcap_value, e->cfg.tr.swa_size, e->cfg.tr.tied_embeddings,
+            e->cfg.tr.qk_norm_rms, e->cfg.tr.norm_offset);
+
     const long D = cfg->dim, F = cfg->hidden_dim;
     char name[160];
 
@@ -464,6 +558,14 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         snprintf(name, sizeof(name), "blk.%d.attn_q.bias", l);         w->q_bias    = upload_f32(m, name); /* optional */
         snprintf(name, sizeof(name), "blk.%d.attn_k.bias", l);         w->k_bias    = upload_f32(m, name); /* optional */
         snprintf(name, sizeof(name), "blk.%d.attn_v.bias", l);         w->v_bias    = upload_f32(m, name); /* optional */
+        if (e->cfg.tr.qk_norm_rms) {   /* qwen3 trait: gammas required */
+            snprintf(name, sizeof(name), "blk.%d.attn_q_norm.weight", l); w->q_norm = upload_f32(m, name);
+            snprintf(name, sizeof(name), "blk.%d.attn_k_norm.weight", l); w->k_norm = upload_f32(m, name);
+            if (!w->q_norm || !w->k_norm) {
+                fprintf(stderr, "[qwen2-engine] qk_norm_rms trait set but attn_q/k_norm missing for layer %d\n", l);
+                qwen2_engine_free(e); return NULL;
+            }
+        }
         if (!w->q.ptr || !w->k.ptr || !w->v.ptr || !w->o.ptr || !w->gate.ptr || !w->up.ptr || !w->down.ptr ||
             !w->attn_norm || !w->ffn_norm) {  /* v_bias optional: absent in stock Qwen2 */
             fprintf(stderr, "[qwen2-engine] missing weights for layer %d\n", l);
@@ -650,7 +752,7 @@ static int forward_layers(Qwen2Engine *e) {
         /* 1. xn = rmsnorm(x) * attn_norm */
         if (tt_profiling()) tt_prof_begin(TT_P_RMSNORM, e->stream);
         k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
-            e->d_x, w->attn_norm, e->d_xn, c->dim, c->rms_eps);
+            e->d_x, w->attn_norm, e->d_xn, c->dim, c->rms_eps, c->tr.norm_offset);
         if (tt_profiling()) tt_prof_end(TT_P_RMSNORM, e->stream);
 
         /* 2. projections: q -> d_q ; k,v -> KV cache slot pos */
@@ -665,15 +767,30 @@ static int forward_layers(Qwen2Engine *e) {
         if (w->k_bias)
             k_add<<<(kvdim + 255) / 256, 256, 0, e->stream>>>(e->d_k_stage, w->k_bias, kvdim);
 
-        /* 3. RoPE on q (all heads) and on the staged k row (in-place, pre-scatter) */
+        /* M7 trait: qwen3 per-head q/k RMSNorm pre-rope. Sits between the
+         * q/k projections (+biases) and RoPE; branch is dead for every
+         * family without the trait. */
+        if (c->tr.qk_norm_rms) {
+            const int qkthreads = HD < 256 ? HD : 256;
+            k_qk_norm_rms<<<c->n_heads, qkthreads, qkthreads * sizeof(float), e->stream>>>
+                (e->d_q, w->q_norm, c->n_heads, HD, c->tr.qk_norm_eps);
+            k_qk_norm_rms<<<c->n_kv_heads, qkthreads, qkthreads * sizeof(float), e->stream>>>
+                (e->d_k_stage, w->k_norm, c->n_kv_heads, HD, c->tr.qk_norm_eps);
+        }
+
+        /* 3. RoPE on q (all heads) and on the staged k row (in-place, pre-scatter).
+         * Kernel picked by the rope-style trait: NEOX half-split vs GPT-J
+         * interleaved pairs (llama family). */
         static int no_rope = -1;
         if (no_rope < 0) no_rope = getenv("TT_NO_ROPE") ? 1 : 0;
         if (!no_rope) {
+            void (*rope_fn)(float *, int, int, const int *, float) =
+                (c->tr.rope == ROPE_GPTJ) ? k_rope_gptj : k_rope;
             g.x = (HD / 2 + 63) / 64; g.y = c->n_heads; g.z = 1;
             b.x = 64; b.y = 1; b.z = 1;
-            k_rope<<<g, b, 0, e->stream>>>(e->d_q, c->n_heads, HD, e->d_pos, c->rope_base);
+            rope_fn<<<g, b, 0, e->stream>>>(e->d_q, c->n_heads, HD, e->d_pos, c->rope_base);
             g.x = (HD / 2 + 63) / 64; g.y = c->n_kv_heads; g.z = 1;
-            k_rope<<<g, b, 0, e->stream>>>(e->d_k_stage, c->n_kv_heads, HD, e->d_pos, c->rope_base);
+            rope_fn<<<g, b, 0, e->stream>>>(e->d_k_stage, c->n_kv_heads, HD, e->d_pos, c->rope_base);
         }
 
         /* v projection + bias (QKV group) */
@@ -690,13 +807,14 @@ static int forward_layers(Qwen2Engine *e) {
             c->n_kv_heads, HD, c->max_ctx);
         if (tt_profiling()) tt_prof_end(TT_P_SCATTER, e->stream);
 
-        /* 4. GQA flash attention over slots [0..pos] */
+        /* 4. GQA flash attention over slots [t0..pos]; t0 raised by the SWA
+         * trait (gemma2), full [0..pos] when swa_size == 0 (qwen2 unchanged). */
         if (tt_profiling()) tt_prof_begin(TT_P_FLASH, e->stream);
         k_flash_gqa<<<c->n_heads, 32, 0, e->stream>>>(
             e->d_q, Kl_f, Vl_f, e->d_att,
             e->d_pos,
             c->n_heads, c->n_kv_heads, HD, c->max_ctx,
-            1.0f / sqrtf((float)HD));
+            1.0f / sqrtf((float)HD), c->tr.swa_size);
         if (tt_profiling()) tt_prof_end(TT_P_FLASH, e->stream);
 
         /* 5. Wo projection + residual: x += att @ Wo^T */
@@ -708,22 +826,24 @@ static int forward_layers(Qwen2Engine *e) {
         /* 6. ffn norm */
         if (tt_profiling()) tt_prof_begin(TT_P_RMSNORM, e->stream);
         k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
-            e->d_x, w->ffn_norm, e->d_xn, c->dim, c->rms_eps);
+            e->d_x, w->ffn_norm, e->d_xn, c->dim, c->rms_eps, c->tr.norm_offset);
         if (tt_profiling()) tt_prof_end(TT_P_RMSNORM, e->stream);
 
-        /* 7+8. MLP: fused q4_0 SwiGLU when possible, else two typed GEMVs +
-         * elementwise apply. Then down projection + residual. */
+        /* 7+8. MLP: fused q4_0 SwiGLU/GeGLU when possible (epilogue from the
+         * activation trait), else two typed GEMVs + elementwise apply.
+         * Then down projection + residual. */
         if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
+        const int act_gelu = (c->tr.act == ACT_GELU) ? 1 : 0;
         if (w->gate.dtype == GGUF_TYPE_Q4_0 && w->up.dtype == GGUF_TYPE_Q4_0) {
-            tt_swiglu_q4_0(w->gate.ptr, w->up.ptr, e->d_xn, e->d_h,
-                           c->hidden_dim, c->dim, e->stream);
+            tt_ffn_q4_0(w->gate.ptr, w->up.ptr, e->d_xn, e->d_h,
+                        c->hidden_dim, c->dim, act_gelu, e->stream);
         } else {
             tt_gemv_typed(w->gate.ptr, w->gate.dtype, e->d_xn, e->d_g,
                           c->hidden_dim, c->dim, e->stream);
             tt_gemv_typed(w->up.ptr,   w->up.dtype,   e->d_xn, e->d_u,
                           c->hidden_dim, c->dim, e->stream);
             k_swiglu_apply<<<(c->hidden_dim + 255) / 256, 256, 0, e->stream>>>(
-                e->d_g, e->d_u, e->d_h, c->hidden_dim);
+                e->d_g, e->d_u, e->d_h, c->hidden_dim, act_gelu);
         }
         tt_gemv_typed(w->down.ptr, w->down.dtype, e->d_h, e->d_xn,
                       c->dim, c->hidden_dim, e->stream);
@@ -822,7 +942,7 @@ static int sample_eager(Qwen2Engine *e) {
     const TTConfig *c = &e->cfg;
     if (tt_profiling()) tt_prof_begin(TT_P_RMSNORM, e->stream);
     k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
-        e->d_x, e->d_out_norm, e->d_xn, c->dim, c->rms_eps);
+        e->d_x, e->d_out_norm, e->d_xn, c->dim, c->rms_eps, c->tr.norm_offset);
     if (tt_profiling()) tt_prof_end(TT_P_RMSNORM, e->stream);
 
     if (tt_profiling()) tt_prof_begin(TT_P_LOGITS, e->stream);
@@ -830,6 +950,11 @@ static int sample_eager(Qwen2Engine *e) {
                                 e->d_logits, c->vocab, c->dim, e->stream);
     if (rc) return -1;
     if (tt_profiling()) tt_prof_end(TT_P_LOGITS, e->stream);
+
+    /* M7 trait: final-logit tanh softcap (gemma2), post-GEMV pre-sampling. */
+    if (c->tr.softcap_value > 0.0f)
+        k_softcap<<<(c->vocab + 255) / 256, 256, 0, e->stream>>>(
+            e->d_logits, c->vocab, c->tr.softcap_value);
     apply_sampling_eager(e);
 
     if (tt_profiling()) tt_prof_begin(TT_P_ARGMAX, e->stream);
@@ -902,9 +1027,14 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
     }
     const int frc = forward_layers(e);          /* all layers at *d_pos */
     k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
-        e->d_x, e->d_out_norm, e->d_xn, c->dim, c->rms_eps);
+        e->d_x, e->d_out_norm, e->d_xn, c->dim, c->rms_eps, c->tr.norm_offset);
     const int lrc = tt_logits_dispatch(e->d_out_w.ptr, e->d_out_w.dtype, e->d_xn,
                                        e->d_logits, c->vocab, c->dim, e->stream);
+    /* M7 trait: final-logit softcap (gemma2). Host-side branch is constant
+     * per capture; kernel reads no host state => capture-safe. */
+    if (c->tr.softcap_value > 0.0f)
+        k_softcap<<<(c->vocab + 255) / 256, 256, 0, e->stream>>>(
+            e->d_logits, c->vocab, c->tr.softcap_value);
     /* sampling controls: both kernels no-op when disabled (greedy byte-identical) */
     k_repeat_penalty<<<(c->vocab + 255) / 256, 256, 0, e->stream>>>(
         e->d_logits, e->d_recent, e->d_n_recent, c->vocab, e->repeat_penalty);
