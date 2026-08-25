@@ -484,6 +484,8 @@ struct Qwen2Engine {
     float *d_pl_tmp;              /* [n_layers*256] staging */
     float *d_ple_row;             /* [n_layers*256] active position's block */
     float *d_ones;                /* ones vector for plain V rmsnorm */
+    int pl_heads[MAX_LAYERS], pl_kv[MAX_LAYERS], pl_ffn[MAX_LAYERS];
+    int pl_swa[MAX_LAYERS], pl_src[MAX_LAYERS];
     int has_pl_embd;
     int pl_dim;                   /* 256 */
     int ple_cache_tok;            /* last token id dequantized into ple_pe */
@@ -716,6 +718,26 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
             e->ple_pe = (float *)malloc(row * sizeof(float));
             fprintf(stderr, "[qwen2-engine] MatFormer per-layer embeddings ON "
                             "(pl_dim=%d)\n", e->pl_dim);
+
+            /* derive heterogeneous per-layer geometry from tensor shapes:
+             * heads = attn_q_out / head_dim; kv = attn_k_out / head_dim;
+             * ffn = ffn_down ne[0]. Global layers (every 5th on E-series)
+             * carry 16 heads vs 8, and kv 2 vs 1. */
+            const int hd_meta = m->head_dim > 0 ? m->head_dim : 256;
+            for (int l = 0; l < cfg->n_layers; l++) {
+                char qn[128], kn[128], dn[128];
+                snprintf(qn, sizeof(qn), "blk.%d.attn_q.weight", l);
+                snprintf(kn, sizeof(kn), "blk.%d.attn_k.weight", l);
+                snprintf(dn, sizeof(dn), "blk.%d.ffn_down.weight", l);
+                GGUFTensor *tq = gguf_get_tensor(m, qn);
+                GGUFTensor *tk = gguf_get_tensor(m, kn);
+                GGUFTensor *td = gguf_get_tensor(m, dn);
+                e->pl_heads[l] = tq ? (int)(tq->shape[1] / hd_meta) : cfg->dim / cfg->head_dim;
+                e->pl_kv[l]    = tk ? (int)(tk->shape[1] / hd_meta) : 0;
+                e->pl_ffn[l]   = td ? (int)(td->shape[0]) : 0;
+                e->pl_swa[l]   = m->sliding_window > 0 ? m->sliding_window : 512;
+                e->pl_src[l]   = -1;
+            }
         }
     }
     cudaMalloc(&e->d_logits, (long)e->cfg.vocab * sizeof(float));
@@ -919,8 +941,10 @@ static int forward_layers(Qwen2Engine *e) {
         CHK_STAGE("1 rmsnorm");
         /* 2. projections: q -> d_q ; k,v -> KV cache slot pos */
         if (tt_profiling()) tt_prof_begin(TT_P_QKV, e->stream);
-        /* gemma families: n_heads*HD != dim (explicit head_dim in meta) */
-        const int attn_qout = c->n_heads * HD;
+        const int H_l = e->pl_heads[l] > 0 ? e->pl_heads[l] : c->n_heads;
+        const int KV_l = e->pl_kv[l] > 0 ? e->pl_kv[l] : c->n_kv_heads;
+        const int FF_l = e->pl_ffn[l] > 0 ? e->pl_ffn[l] : c->hidden_dim;
+        const int attn_qout = H_l * HD;
         int qrc = tt_gemv_typed(w->q.ptr, w->q.dtype, e->d_xn, e->d_q,
                       attn_qout, c->dim, e->stream);
         if (qrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] q gemv rc=%d\n", qrc);
@@ -929,7 +953,7 @@ static int forward_layers(Qwen2Engine *e) {
         /* QKV biases present in some GGUF conversions of Qwen2 (applied by
          * llama.cpp whenever the tensors exist). Optional by design. */
         CHK_STAGE("2 qkv-gemv");
-        const int kvdim = c->n_kv_heads * HD;
+        const int kvdim = KV_l * HD;
         if (w->q_bias)
             k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_q, w->q_bias, c->dim);
         if (w->k_bias)
@@ -942,7 +966,7 @@ static int forward_layers(Qwen2Engine *e) {
             const int qkthreads = HD < 256 ? HD : 256;
             k_qk_norm_rms<<<c->n_heads, qkthreads, qkthreads * sizeof(float), e->stream>>>
                 (e->d_q, w->q_norm, c->n_heads, HD, c->tr.qk_norm_eps);
-            k_qk_norm_rms<<<c->n_kv_heads, qkthreads, qkthreads * sizeof(float), e->stream>>>
+            k_qk_norm_rms<<<KV_l, qkthreads, qkthreads * sizeof(float), e->stream>>>
                 (e->d_k_stage, w->k_norm, c->n_kv_heads, HD, c->tr.qk_norm_eps);
         }
 
