@@ -1,0 +1,17 @@
+{
+ "qwen2.5-0.5b-q4_0 (reference)": "PASS (7/7 (need >= 0.85))",
+ "gemma2-2b-q6_k": "PASS (7/7 (need >= 0.85))",
+ "qwen3-0.6b-q8_0": "PASS (7/7 (need >= 0.85))",
+ "smollm2-135m-f16": "PASS (6/7 (need >= 0.85))",
+ "smollm2-135m-instruct-Q4_0": "PASS (6/7 (need >= 0.85))",
+ "smollm2-135m-instruct-Q4_1": "FAIL (4/7 (need >= 0.85))",
+ "smollm2-135m-instruct-Q4_K": "PASS (6/7 (need >= 0.85))",
+ "smollm2-135m-instruct-Q4_K_S": "PASS (6/7 (need >= 0.85))",
+ "smollm2-135m-instruct-Q5_0": "PASS (6/7 (need >= 0.85))",
+ "smollm2-135m-instruct-Q5_1": "PASS (7/7 (need >= 0.85))",
+ "smollm2-135m-instruct-Q5_K": "PASS (7/7 (need >= 0.85))",
+ "smollm2-135m-instruct-Q5_K_S": "FAIL (5/7 (need >= 0.85))",
+ "smollm2-135m-instruct-Q6_K": "FAIL (5/7 (need >= 0.85))",
+ "smollm2-135m-instruct-Q8_0": "PASS (6/7 (need >= 0.85))",
+ "tinyllama-f16": "PASS (7/7 (need >= 0.85))"
+}
