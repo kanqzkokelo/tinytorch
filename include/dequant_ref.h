@@ -29,6 +29,7 @@ enum {
     TTQ_Q4_K = 12,  /* 144 B per 256 values (Q4_K_S files share this layout) */
     TTQ_Q5_K = 13,  /* 176 B per 256 values (Q5_K_S likewise) */
     TTQ_Q6_K = 14,  /* 210 B per 256 values */
+    TTQ_BF16 = 30,  /* 2 B per value: fp32 with truncated mantissa */
 };
 
 /*

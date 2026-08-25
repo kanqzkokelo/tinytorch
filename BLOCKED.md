@@ -1,64 +1,42 @@
-# BLOCKED: M2 & M3 Gates
+# BLOCKED: M8 Gemma-4 (E2B/E4B) — requires per-layer heterogeneous architecture
 
 ## Status
-- `./scripts/verify.sh m2` → **EXIT=1** (red). CPU AVX2 matmul vs OpenBLAS-1T.
-- `./scripts/verify.sh m3` → **EXIT=1** (red). GPU parity PASS, CUDA bench RED (4.8x < 10x target).
+Engine loads and runs gemma-4-E2B but produces wrong output. Root cause
+discovered via full tensor inventory (TT_DEBUG upload log):
 
----
+## The blocker: gemma4-E2B is a HETEROGENEOUS mixture model
+- Layers 0-3, 5-8, ... : q_out=2048 (8 heads x 256), k/v_out=256 (1 kv head),
+  ffn=6144
+- Layers 4, 9, 14, 19, 24, 29 (every 5th): q_out=4096 (16 heads x 256),
+  k/v_out=512 (2 kv heads), ffn=6144
+- Layer 15+: ffn=12288 (double-wide MLP), others 6144
+- All layers also carry inp_gate [256,1536], proj [1536,256],
+  layer_output_scale [1], plus top-level per_layer_token_embd [262144, 8960]
+  (MatFormer per-layer inputs, scaled by sqrt(256), projected per layer)
 
-## M2 — CPU Performance
+The engine assumes ONE uniform layer geometry (single TTConfig). Supporting
+gemma4 requires per-layer dims: separate head counts, kv counts, head dims,
+and ffn widths per layer group — an engine capability addition comparable in
+size to the entire M6 rewrite.
 
-### The wall
-Gate requires: single-threaded matmul ≥ NumPy float32 @ 1024³.
-On this machine NumPy = OpenBLAS 0.3.34 (DYNAMIC_ARCH, Haswell kernels,
-pinned to 1 thread for fairness). Measured OpenBLAS-1T: **85–102 GFLOPS**
-(~26–37 flop/cycle depending on thermal window; ~90% of AVX2 fp32 peak).
+Additionally needed once unblocked:
+- rope_freqs.weight learned frequency factors (global attention layers)
+- dual rope bases (1e6 global / 1e4 swa)
+- sliding_window_pattern handling
+- v plain-rmsnorm, attention scale 1.0 (both already implemented)
 
-Our best hand-scheduled kernel (6x16 asm tile, k-unroll x4, packed A/B
-panels, aligned hot loop): **58–75 GFLOPS** → ratio locked at
-**0.70–0.76** across every configuration tried.
-
-### Configurations exhausted (all median-of-20, same-window vs OpenBLAS)
-| variant                                   | best result          |
-|-------------------------------------------|----------------------|
-| naive C ikj                                | 6–8 GFLOPS           |
-| C blocked 4x16 register tile               | 42–49 GFLOPS         |
-| asm 6x16, k-unroll x2                      | 59–67 GFLOPS         |
-| asm 6x16, k-unroll x4 + .p2align 5         | 62–75 GFLOPS (best)  |
-| asm 6x16 + software prefetch                | ≤ un-prefetched      |
-| asm 4x16 / 4x24 / 8x8 tiles                | worse (fewer chains/spill) |
-| transposed-A packing ([k][r] tiles)         | worse (13–20 f/c)    |
-| APAD ∈ {0,4,8,12,16,20}, KC ∈ {128..768}, NC ∈ {64..512} | ratio invariant |
-| taskset core isolation                     | no change            |
-| MR=6 spills (C version), MR=4 broadcast-bound (asm) | confirmed via disasm |
-
----
-
-## M3 — CUDA Backend
-
-### Status
-- **Gate A (gpu-parity): PASS** — all kernels (naive, tiled, fp16 WMMA) match CPU reference (`allclose(1e-3)` for fp32, `2e-2` for fp16 WMMA due to half input quantization).
-- **Gate B (cuda-bench): RED** — tiled reaches ~2100 GFLOPS (50.7% of cuBLAS), but ratio vs naive is **4.8x** (target ≥ 10x).
-
-### Why Gate B is RED
-On Ampere (RTX 3050 laptop, 2MB L2 cache), the canonical naive kernel achieves **~385 GFLOPS** (~4.3% of 9.1TF peak) because L2 caches B column-panels across thread blocks automatically. To hit 10x naive (3850 GFLOPS), tiled would need >84% of cuBLAS.
-- Naive: 386 GFLOPS
-- Tiled (64x64 SMEM tile, 4x4 subtile): 2112 GFLOPS (4.7x naive, 50.7% cuBLAS)
-- WMMA fp16 (Tensor Cores): 2873 GFLOPS (68.9% cuBLAS)
-- cuBLAS (reference): 4169 GFLOPS
-
----
+## What IS complete (committed)
+- Full forward math extraction (docs/plans/2026-08-24-m8-gemma4-port.md)
+- Metadata array parser, trait entry, typed uploads incl. bf16 GEMV,
+  PLE pipeline scaffold, sandwich norms, embed sqrt scaling
+- Oracle upgraded to latest llama.cpp which SUPPORTS gemma4 natively
+  (reference logits available for parity iteration when unblocked)
 
 ## Options for the human
-1. **Recalibrate M2 gate**: `AVX2-1T ≥ 0.75 × NumPy-1T @1024³ AND ≥ 8× naive` (passes today: OMP hits 183 GFLOPS = 26x naive).
-2. **Recalibrate M3 gate**: `tiled ≥ 4.5× naive AND ≥ 45% cuBLAS @1024³` (passes today: 4.8x naive, 50.7% cuBLAS).
-3. Keep gates as-is; ship the full ladder tables in `bench/results.md` (valuable paper data showing realistic performance curves against industrial baselines).
+1. Fund the per-layer-geometry refactor (est. 1-2 sessions) then gemma4 works.
+2. Target a uniform-layer gemma-family model instead (e.g. gemma2-2b — DONE).
+3. Accept partial support: run E2B's uniform layers only (not a real model).
 
-## Reproduce
-```
-make -s -B lib cuda cublas
-./scripts/verify.sh m0   # PASS (EXIT=0)
-./scripts/verify.sh m1   # PASS (EXIT=0)
-./scripts/verify.sh m2   # RED  (EXIT=1, 0.73x OpenBLAS-1T)
-./scripts/verify.sh m3   # RED  (Gate A PASS, Gate B 4.8x < 10x naive)
-```
+## Evidence
+Full tensor inventory captured in-session (TT_DEBUG upload log): layers 0-34
+inventoried; heterogeneity confirmed by shape diffs across layer groups.

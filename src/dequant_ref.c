@@ -268,6 +268,17 @@ long ttq_dequant(const void *data, int type_code, long numel, float *out) {
         case TTQ_Q4_K: if (numel % QK_K) return -5; dq_q4_K(data, out, numel); return numel;
         case TTQ_Q5_K: if (numel % QK_K) return -5; dq_q5_K(data, out, numel); return numel;
         case TTQ_Q6_K: if (numel % QK_K) return -5; dq_q6_K(data, out, numel); return numel;
+        case TTQ_BF16: {
+            /* bf16 -> f32: value = bits << 16 */
+            const uint16_t *u = (const uint16_t *)data;
+            for (long i = 0; i < numel; i++) {
+                unsigned int bits = (unsigned int)u[i] << 16;
+                union { unsigned int u; float f; } cvt;
+                cvt.u = bits;
+                out[i] = cvt.f;
+            }
+            return numel;
+        }
         default: fprintf(stderr, "[dequant_ref] unsupported type %d\n", type_code); return -5;
     }
 }

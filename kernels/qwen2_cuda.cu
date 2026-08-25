@@ -355,6 +355,11 @@ __global__ void k_embed_q4_0_dyn(const BlockQ4_0 *__restrict__ W, const int *__r
  * device position scalar exactly once (host mirror does e->pos++ in lockstep). */
 __global__ void k_pos_inc(int *d_pos) { (*d_pos)++; }
 
+__global__ void k_scale(float *__restrict__ buf, float s, int n) {
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) buf[i] *= s;
+}
+
 /* llama.cpp-style repetition penalty over a device ring of recent tokens.
    No-ops when penalty <= 1.0f. Capture-safe: reads/writes device state only. */
 __global__ void k_repeat_penalty(float *__restrict__ logits,
@@ -432,6 +437,7 @@ struct LayerW {
     float *attn_norm, *ffn_norm;      /* device f32 gammas */
     float *post_attn_norm, *post_ffn_norm; /* gemma2 sandwich norms (optional) */
     TTensor inp_gate, pl_proj;        /* gemma4 MatFormer per-layer block */
+    float *pl_post_norm;              /* [dim] gamma, normalizes pl_proj output */
     float out_scale_val;              /* gemma4 per-layer scalar (0 = absent) */
     float *q_bias, *k_bias, *v_bias;  /* this GGUF variant carries QKV biases */
     float *q_norm, *k_norm;           /* per-head q/k rmsnorm gammas (qwen3 trait) */
@@ -635,6 +641,8 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         if (gguf_get_tensor(m, name)) upload_w(m, name, &w->inp_gate);
         snprintf(name, sizeof(name), "blk.%d.proj.weight", l);
         if (gguf_get_tensor(m, name)) upload_w(m, name, &w->pl_proj);
+        snprintf(name, sizeof(name), "blk.%d.post_norm.weight", l);
+        w->pl_post_norm = upload_f32(m, name);   /* gemma4: normalizes pl_proj out */
         snprintf(name, sizeof(name), "blk.%d.layer_output_scale.weight", l);
         {
             GGUFTensor *tsc = gguf_get_tensor(m, name);
@@ -675,7 +683,7 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     {
         GGUFTensor *tp = gguf_get_tensor(m, "per_layer_token_embd.weight");
         GGUFTensor *tm = gguf_get_tensor(m, "per_layer_model_proj.weight");
-        if (tp && tp->data && tm && tm->data && cfg->tr.per_layer_embd &&
+        if (tp && tp->data && tm && tm->data && e->cfg.tr.per_layer_embd &&
             m->per_layer_embd_dim > 0) {
             e->has_pl_embd = 1;
             e->pl_dim = m->per_layer_embd_dim;
@@ -1035,6 +1043,57 @@ static int forward_layers(Qwen2Engine *e) {
         if (tt_profiling()) tt_prof_end(TT_P_OMLP, e->stream);
         CHK_STAGE("7 mlp");
 
+        /* gemma4 MatFormer per-layer embedding block (all host round-trips;
+         * pl_dim=256 so data movement is trivial). Order per build_gemma4:
+         *   g = gelu(inp_gate @ x) * PLE[l] ; p = rmsnorm(pl_proj @ g) ;
+         *   x += p ; x *= layer_output_scale                        */
+        if (e->has_pl_embd) {
+            const int slot = e->pos % c->max_ctx;
+            static float gbuf[1024];
+            static float ple_slice[1024];
+            static float pe_slice[1024];
+
+            /* g = inp_gate @ x (device) */
+            int ig = tt_gemv_typed(w->inp_gate.ptr, w->inp_gate.dtype,
+                                   e->d_x, e->d_pl_tmp, e->pl_dim, c->dim,
+                                   e->stream);
+            cudaStreamSynchronize(e->stream);
+            cudaMemcpy(gbuf, e->d_pl_tmp, e->pl_dim * 4, cudaMemcpyDeviceToHost);
+
+            /* fetch this position's PLE row + pe slice for layer l */
+            cudaMemcpy(ple_slice, e->d_ple_row + (long)l * 256,
+                       256 * sizeof(float), cudaMemcpyDeviceToHost);
+            memcpy(pe_slice, e->ple_pe + (long)l * 256, 256 * sizeof(float));
+
+            /* gelu then elementwise multiply by PLE slice — NOTE: per
+             * build_gemma4 the multiply happens AFTER gelu but the residual
+             * uses pre-gate cur; also pe is added post-projection in
+             * project_per_layer_inputs, already folded into ple_finish_host. */
+            for (int i = 0; i < e->pl_dim; i++) {
+                const float gv = gbuf[i];
+                gbuf[i] = 0.5f * gv * (1.0f + tanhf(0.7978845608028654f *
+                                                    (gv + 0.044715f * gv * gv * gv)));
+                gbuf[i] *= ple_slice[i];
+            }
+
+            /* p = rmsnorm(pl_proj @ g) ; x += p ; x *= out_scale */
+            memcpy(e->d_pl_tmp, gbuf, e->pl_dim * 4);
+            int pg = tt_gemv_typed(w->pl_proj.ptr, w->pl_proj.dtype,
+                                   e->d_pl_tmp, e->d_xn, c->dim, e->pl_dim,
+                                   e->stream);
+            cudaStreamSynchronize(e->stream);
+            if (ig || pg) fprintf(stderr, "[qwen2-engine] pl block rc ig=%d pg=%d\n", ig, pg);
+            if (w->pl_post_norm)
+                k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
+                    e->d_xn, w->pl_post_norm, e->d_xn, c->dim, c->rms_eps,
+                    c->tr.norm_offset);
+            k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
+            /* per-layer output scale (scalar by value) */
+            if (w->out_scale_val != 0.0f && w->out_scale_val != 1.0f)
+                k_scale<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(
+                    e->d_x, w->out_scale_val, c->dim);
+        }
+
         {
             static const char *dump_env = NULL;
             /* never dump while a stream capture is in progress: the blocking
@@ -1089,11 +1148,6 @@ static void ple_finish_host(float *v, const float *gamma256,
         v[i] = (v[i] + pe_row[i]) * s2;
 }
 
-__global__ void k_scale(float *__restrict__ buf, float s, int n) {
-    const int i = threadIdx.x + blockIdx.x * blockDim.x;
-    if (i < n) buf[i] *= s;
-}
-
 static int embed_token(Qwen2Engine *e, int tok) {
     if (tt_profiling()) tt_prof_begin(TT_P_EMBED, e->stream);
     /* M7: embedding may be any Tier-1 dtype now; dispatch by type */
@@ -1120,10 +1174,18 @@ static int embed_token(Qwen2Engine *e, int tok) {
 
         /* dequant per_layer_token_embd row 'tok' (q4_0), scale by sqrt(pl_dim) */
         GGUFTensor *tp = gguf_get_tensor(e->gguf, "per_layer_token_embd.weight");
-        if (!tp || !tp->data || tp->type != TTQ_Q4_0) return -10;
+        if (!tp || !tp->data) return -10;
         static float pe_full[64 * 1024];
-        ttq_dequant((const char *)tp->data + (long)tok * (row / 32 * 18),
-                    TTQ_Q4_0, row, pe_full);
+        long rb;
+        switch (tp->type) {
+            case TTQ_Q4_0: rb = row / 32 * 18; break;
+            case TTQ_Q5_K: rb = row / 256 * 176; break;
+            case TTQ_Q6_K: rb = row / 256 * 210; break;
+            case TTQ_Q8_0: rb = row / 32 * 34; break;
+            case TTQ_F16:  rb = row * 2; break;
+            default: fprintf(stderr, "[qwen2-engine] ple: unsupported pe dtype %d (TTQ_Q5_K=%d)\n", tp->type, TTQ_Q5_K); return -11;
+        }
+        ttq_dequant((const char *)tp->data + (long)tok * rb, tp->type, row, pe_full);
         for (long i = 0; i < row; i++)
             pe_full[i] *= sqrtf((float)e->pl_dim);
 

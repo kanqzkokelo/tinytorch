@@ -457,6 +457,24 @@ static int kquant_aligned(int dtype, long K) { return K % 256 == 0; }
  * Returns 0 or a cuda error code; -100 on unsupported dtype;
  * -101 on K-quant alignment violation (K % 256 != 0, message on stderr).
  */
+__global__ void k_gemv_bf16(const uint16_t *__restrict__ W,
+                            const float *__restrict__ x, float *__restrict__ y,
+                            int M, int K) {
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= M) return;
+    const int lane = threadIdx.x;
+    const uint16_t *rw = W + (long)row * K;
+    float sum = 0.0f;
+    for (int k = lane; k < K; k += 32) {
+        union { unsigned int u; float f; } cvt;
+        cvt.u = ((unsigned int)rw[k]) << 16;
+        sum += cvt.f * x[k];
+    }
+    for (int off = 16; off > 0; off /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, off);
+    if (lane == 0) y[row] = sum;
+}
+
 int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
                   int M, int K, cudaStream_t stream) {
     dim3 g, b;
@@ -507,6 +525,9 @@ int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
         case TTQ_F32:
             k_gemv_f32<<<g, b, 0, stream>>>((const float *)W, x, y, M, K);
             break;
+        case 30: /* TTQ_BF16 */
+            k_gemv_bf16<<<g, b, 0, stream>>>((const uint16_t *)W, x, y, M, K);
+            break;
         default:
             fprintf(stderr, "[gemv-typed] unsupported dtype %d\n", dtype);
             return -100;
@@ -523,8 +544,20 @@ int tt_logits_typed(const void *dW, int dtype, const float *dx,
 }
 
 /* Typed embedding row lookup. Returns 0 or cuda err; -100 unsupported. */
+__global__ void k_embed_bf16(const uint16_t *__restrict__ W, int tok,
+                             float *__restrict__ dx, int dim) {
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= dim) return;
+    unsigned int bits = (unsigned int)W[(long)tok * dim + i] << 16;
+    union { unsigned int u; float f; } cvt; cvt.u = bits;
+    dx[i] = cvt.f;
+}
+
 int tt_embed_typed(const void *dW, int dtype, int tok, float *dx, int dim,
                    cudaStream_t stream) {
+    if (getenv("TT_DEBUG2"))
+        fprintf(stderr, "[embed-typed] enter dtype=%d tok=%d dim=%d W=%p\n",
+                dtype, tok, dim, (const void *)dW);
     switch (dtype) {
         case TTQ_Q4_0: {
             extern int tt_embed_q4_0(const void *, int, float *, int, cudaStream_t);
@@ -573,6 +606,11 @@ int tt_embed_typed(const void *dW, int dtype, int tok, float *dx, int dim,
         case TTQ_F32:
             k_embed_f32<<<(dim + 255) / 256, 256, 0, stream>>>(
                 (const float *)dW, tok, dx, dim);
+            break;
+        
+        case 30: /* TTQ_BF16 */
+            k_embed_bf16<<<(dim + 255) / 256, 256, 0, stream>>>(
+                (const uint16_t *)dW, tok, dx, dim);
             break;
         default:
             fprintf(stderr, "[gemv-typed] embed: unsupported dtype %d\n", dtype);
