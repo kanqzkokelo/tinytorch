@@ -119,6 +119,8 @@ typedef struct {
     BPETokenizer base;
     HashMap tok2id;      /* token bytes -> id */
     HashMap pair_rank;   /* merged-bytes -> merge rank */
+    int sp_mode;         /* SentencePiece vocab ('llama'/'gemma4' ggml models) */
+    int max_piece;       /* longest vocab piece in bytes */
     unsigned short byte2cp[256];
     signed int cp2byte[32768];       /* -1 if unused */
     char *dec_buf; size_t dec_cap;   /* decode scratch */
@@ -208,6 +210,7 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
                 p += slen;
                 t->base.tokens[id] = s;
                 t->base.token_lens[id] = (int)slen;
+                if ((int)slen > t->max_piece) t->max_piece = (int)slen;
                 hm_put(&t->tok2id, s, (int)slen, (int)id);
             }
         } else if (strcmp(key, "tokenizer.ggml.merges") == 0 && vtype == 9) {
@@ -229,6 +232,12 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
                 }
                 p += slen;
             }
+        } else if (strcmp(key, "tokenizer.ggml.model") == 0 && vtype == 8) {
+            const uint64_t slen = read_u64(&p);
+            char tm[32];
+            const size_t cp = slen < sizeof(tm)-1 ? slen : sizeof(tm)-1;
+            memcpy(tm, p, cp); tm[cp] = '\0'; p += slen;
+            t->sp_mode = (strcmp(tm, "gpt2") != 0);   /* llama/gemma4/gemma => SP */
         } else if (strcmp(key, "tokenizer.ggml.scores") == 0 && vtype == 9) {
             (void)read_u32(&p);
             const uint64_t n = read_u64(&p);
@@ -245,7 +254,7 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
         }
     }
 
-    if (!t->base.tokens || !t->pair_rank.ents) {
+    if (!t->base.tokens || (!t->sp_mode && !t->pair_rank.ents)) {
         fprintf(stderr, "[BPE] missing tokens or merges in GGUF\n");
         bpe_tokenizer_free(&t->base);
         return NULL;
@@ -271,12 +280,41 @@ const char *bpe_decode_token(const BPETokenizer *tok_, int token_id, int *out_le
         t->dec_buf = (char *)realloc(t->dec_buf, t->dec_cap);
     }
 
-    /* walk codepoints; map BPE-domain chars back to real bytes, pass others through */
     int o = 0, i = 0;
+    if (t->sp_mode) {
+        /* SentencePiece pieces are raw text: '▁'(U+2581) => space,
+         * '<0xNN>' byte-fallback pieces => the single byte, everything
+         * else passes through verbatim. */
+        while (i < raw_len) {
+            if (raw[i] == '<' && i + 5 < raw_len && raw[i+1] == '0' && raw[i+2] == 'x'
+                && raw[i+5] == '>') {
+                unsigned int bval;
+                if (sscanf(raw + i + 3, "%2x", &bval) == 1) {
+                    t->dec_buf[o++] = (char)bval;
+                    i += 6;
+                    continue;
+                }
+            }
+            /* '▁' = U+2581 = 0xE2 0x96 0x81 */
+            if ((unsigned char)raw[i] == 0xE2 && i + 2 < raw_len
+                && (unsigned char)raw[i+1] == 0x96
+                && (unsigned char)raw[i+2] == 0x81) {
+                t->dec_buf[o++] = ' ';
+                i += 3;
+                continue;
+            }
+            t->dec_buf[o++] = raw[i++];
+        }
+        t->dec_buf[o] = '\0';
+        if (out_len) *out_len = o;
+        return t->dec_buf;
+    }
+
+    /* BPE (gpt2) domain: map chars back to real bytes */
     while (i < raw_len) {
         unsigned int cp;
         const int n = utf8_dec(raw + i, raw_len - i, &cp);
-        if (n < 0) { t->dec_buf[o++] = raw[i++]; continue; }   /* invalid: passthrough */
+        if (n < 0) { t->dec_buf[o++] = raw[i++]; continue; }
         i += n;
         const signed int b = (cp < 32768) ? t->cp2byte[cp] : -1;
         if (b >= 0) t->dec_buf[o++] = (char)b;
@@ -343,6 +381,55 @@ int bpe_encode(const BPETokenizer *tok_, const char *text, int *out_tokens, int 
     const int len = (int)strlen(text);
     int n_out = 0;
     int pos = 0;
+
+    if (t->sp_mode) {
+        /* SentencePiece (llama/gemma families): greedy longest-piece match.
+         * APPROXIMATION of true unigram Viterbi — fine for interactive chat,
+         * may split words differently than llama-tokenize on rare inputs.
+         * Spaces become '▁'(U+2581) first, matching how pieces are stored. */
+        if (t->max_piece <= 0) return 0;
+        char *mapped = (char *)malloc((size_t)len * 3 + 4);
+        if (!mapped) return 0;
+        int mlen = 0;
+        /* add_dummy_prefix convention: virtual '▁' at text start */
+        mapped[mlen++] = (char)0xE2;
+        mapped[mlen++] = (char)0x96;
+        mapped[mlen++] = (char)0x81;
+        for (int i = 0; i < len; i++) {
+            if (text[i] == ' ') {
+                mapped[mlen++] = (char)0xE2;
+                mapped[mlen++] = (char)0x96;
+                mapped[mlen++] = (char)0x81;
+            } else {
+                mapped[mlen++] = text[i];
+            }
+        }
+        while (pos < mlen && n_out < max_tokens) {
+            int rem = mlen - pos;
+            int L = rem < t->max_piece ? rem : t->max_piece;
+            int best = -1;
+            for (; L >= 1; L--) {
+                best = hm_get(&t->tok2id, mapped + pos, L);
+                if (best >= 0) break;
+            }
+            if (best < 0) {
+                /* unknown byte -> <0xNN> fallback */
+                char fb[8];
+                const int fl = snprintf(fb, sizeof(fb), "<0x%02X>",
+                                        (unsigned char)mapped[pos]);
+                best = hm_get(&t->tok2id, fb, fl);
+                L = 1;
+            }
+            if (best < 0) { pos++; continue; }   /* no fallback token: skip byte */
+            /* SP convention: BOS (<s>) leads every sequence when defined */
+            if (n_out == 0 && t->base.bos_id >= 0)
+                out_tokens[n_out++] = t->base.bos_id;
+            out_tokens[n_out++] = best;
+            pos += L;
+        }
+        free(mapped);
+        return n_out;
+    }
 
     while (pos < len && n_out < max_tokens) {
         /* Special/control tokens have the literal form "<|name|>" and live in

@@ -67,9 +67,10 @@ def engine_logits(model, ids, tag):
     return np.fromfile(out, dtype="<f4"), int(parts[1]), float(parts[2])
 
 
-def oracle_ref(model, prompt, tag):
+def oracle_ref(model, ids, tag):
     out = f"/tmp/m7_oracle_{tag}.bin"
-    r = subprocess.run([ORACLE_LOGITS, model, prompt, "--dump", out],
+    id_csv = ",".join(map(str, ids))
+    r = subprocess.run([ORACLE_LOGITS, model, "--ids", id_csv, "--dump", out],
                        capture_output=True, text=True, timeout=300, env=env)
     if r.returncode != 0:
         raise RuntimeError("oracle_logits exit=%d\n%s" %
@@ -93,7 +94,7 @@ def main():
         try:
             ids = oracle_tokenize(args.model, prompt)
             ours, ours_am, ours_v = engine_logits(args.model, ids, str(i))
-            ref = oracle_ref(args.model, prompt, str(i))
+            ref = oracle_ref(args.model, ids, str(i))
         except (RuntimeError, OSError) as exc:
             print(f"[FAIL] {prompt[:40]!r:44s} {exc}")
             continue

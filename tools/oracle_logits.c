@@ -20,7 +20,16 @@ int main(int argc, char **argv) {
 
     // tokenize prompt (no BOS for qwen)
     int toks[512];
-    int n = llama_tokenize(vocab, argv[2], strlen(argv[2]), toks, 512, false, true);   /* parse_special=true: match engine chat-template handling */
+    int n;
+    if (argc > 3 && strncmp(argv[2], "--ids", 5) == 0) {
+        /* explicit ids: guarantees byte-exact input parity with our engine */
+        char *save = NULL, *p = strtok_r(argv[3], ",", &save);
+        n = 0;
+        while (p && n < 512) { toks[n++] = atoi(p); p = strtok_r(NULL, ",", &save); }
+        fprintf(stderr, "[oracle] %d ids from argv\n", n);
+    } else {
+        n = llama_tokenize(vocab, argv[2], strlen(argv[2]), toks, 512, false, true);   /* parse_special=true */
+    }
     if (n < 0) { fprintf(stderr, "tokenize failed (%d): prompt too long or invalid\n", n); return 1; }
     fprintf(stderr, "[oracle] %d tokens:", n);
     for (int i = 0; i < n; i++) fprintf(stderr, " %d", toks[i]);
@@ -47,10 +56,12 @@ int main(int argc, char **argv) {
     for (int k = 0; k < 8; k++) printf(" (%d,%.4f)", idx[k], val[k]);
     printf("\n");
     // full logits dump option
-    if (argc > 3 && !strcmp(argv[3], "--dump")) {
-        if (argc <= 4) { fprintf(stderr, "--dump requires output path: %s MODEL PROMPT --dump OUT.bin\n", argv[0]); return 1; }
-        FILE *f = fopen(argv[4], "wb");
-        if (!f) { fprintf(stderr, "cannot open dump file: %s\n", argv[4]); return 1; }
+    const char *dump_path = NULL;
+    for (int a = 2; a < argc - 1; a++)
+        if (!strcmp(argv[a], "--dump")) dump_path = argv[a + 1];
+    if (dump_path) {
+        FILE *f = fopen(dump_path, "wb");
+        if (!f) { fprintf(stderr, "cannot open dump file: %s\n", dump_path); return 1; }
         fwrite(logits, sizeof(float), nv, f);
         fclose(f);
         printf("DUMPED %d logits\n", nv);

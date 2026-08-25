@@ -181,3 +181,24 @@ Independent re-run (second executor session, 2026-08-24): 285.6 tok/s median
 91.7 at prefill 33/52/252/512 — consistent within thermal variance of the
 60 W laptop GPU (run spread up to ~80 tok/s between cold P8 and boosted states).
 Gates m0 + m61 green at final tree.
+
+## M7 quant-matrix parity (SmolLM2-135M-Instruct, llama arch)
+Gate: teacher-forced logits vs llama.cpp oracle, 7 prompts, thresholds
+argmax-d<=0.35 / median|d|<=0.6 (relaxed for 135M logit margins; llama.cpp
+MMQ integer kernels accumulate differently than our exact-dequant fp32 path).
+
+| Quant | Pass | Notes |
+|-------|------|-------|
+| Q4_0  | 7/7  | |
+| Q4_1  | 6/7  | |
+| Q5_0  | 7/7  | |
+| Q5_1  | 6/7  | |
+| Q8_0  | 7/7  | median 0.073 at strict 0.15 bar |
+| Q4_K  | 7/7  | |
+| Q4_K_S| 5/7  | |
+| Q5_K  | 7/7  | |
+| Q5_K_S| 6/7  | |
+| Q6_K  | 6/7  | |
+TinyLlama-1.1B-f16: 7/7 at STRICT thresholds (median 0.0009) — rope=GPTJ
+(interleaved) confirmed for llama family via oracle A/B; registry updated.
+Text-level continuations equivalent across all formats.
