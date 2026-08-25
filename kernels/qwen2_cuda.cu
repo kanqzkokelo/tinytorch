@@ -460,7 +460,13 @@ struct Qwen2Engine {
 
 static float *upload_f32(GGUFModel *m, const char *name) {
     GGUFTensor *t = gguf_get_tensor(m, name);
-    if (!t || !t->data) { fprintf(stderr, "[qwen2-engine] f32 upload missing: %s\n", name); return NULL; }
+    if (!t || !t->data) {
+        /* optional-tensor silence: callers treat NULL as "feature absent"
+         * (e.g. QKV biases on bias-free families). Only real failures print. */
+        if (strstr(name, ".bias") == NULL)
+            fprintf(stderr, "[qwen2-engine] f32 upload missing: %s\n", name);
+        return NULL;
+    }
     float *d = NULL;
     if (cudaMalloc(&d, t->size_bytes) != cudaSuccess) { fprintf(stderr, "[qwen2-engine] cudaMalloc fail %s\n", name); return NULL; }
     cudaMemcpy(d, t->data, t->size_bytes, cudaMemcpyHostToDevice);

@@ -11,7 +11,10 @@
 #include "async_printer.h"
 
 int main(void) {
-    const char *model_path = "data/models/qwen2.5-0.5b-instruct-q4_0.gguf";
+    const char *model_path =
+        (getenv("TT_MODEL") && getenv("TT_MODEL")[0])
+            ? getenv("TT_MODEL")
+            : "data/models/qwen2.5-0.5b-instruct-q4_0.gguf";
     const int MAX_CTX = 1024;
 
     printf("\n=======================================================\n");
