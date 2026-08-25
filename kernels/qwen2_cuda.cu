@@ -25,12 +25,16 @@
 
 #include "loader_gguf.h"
 #include "qwen2_engine.h"
+#include "dequant_ref.h"
 
 /* BlockQ4_0 comes from loader_gguf.h (d stored as raw fp16 bits). */
 #define Q4_D(blk) __half2float(*(const __half *)&(blk).d)
 
 #define Q4_BYTES_PER_BLOCK 18
 #define Q4_VALS_PER_BLOCK 32
+
+extern "C" long ttq_dequant(const void *data, int type_code, long numel,
+                            float *out);   /* src/dequant_ref.c */
 
 /* launchers implemented in kernels/gemv_q4_cuda.cu */
 extern "C" {
@@ -427,12 +431,17 @@ struct LayerW {
     TTensor q, k, v, o, gate, up, down;
     float *attn_norm, *ffn_norm;      /* device f32 gammas */
     float *post_attn_norm, *post_ffn_norm; /* gemma2 sandwich norms (optional) */
+    TTensor inp_gate, pl_proj;        /* gemma4 MatFormer per-layer block */
+    float out_scale_val;              /* gemma4 per-layer scalar (0 = absent) */
     float *q_bias, *k_bias, *v_bias;  /* this GGUF variant carries QKV biases */
     float *q_norm, *k_norm;           /* per-head q/k rmsnorm gammas (qwen3 trait) */
 };
 
+static int c_kvdim_for(const TTConfig *c) { return c->n_kv_heads * c->head_dim; }
+
 struct Qwen2Engine {
     TTConfig cfg;
+    GGUFModel *gguf;
     LayerW L[MAX_LAYERS];
     TTensor d_embd;          /* tied or untied lm head below */
     TTensor d_out_w;
@@ -463,6 +472,16 @@ struct Qwen2Engine {
     int   *d_n_recent;            /* valid count in ring */
     int   *d_sampling_on;         /* 0/1 flag read by kernels inside graph */
     int pending_tok;              /* sampled token not yet fed through layers */
+    /* gemma4 MatFormer per-layer embeddings */
+    TTensor pl_model_proj;        /* [n_layers*256, dim] typed */
+    float *pl_proj_norm_host;     /* [256] host gamma */
+    float *d_pl_tmp;              /* [n_layers*256] staging */
+    float *d_ple_row;             /* [n_layers*256] active position's block */
+    float *d_ones;                /* ones vector for plain V rmsnorm */
+    int has_pl_embd;
+    int pl_dim;                   /* 256 */
+    int ple_cache_tok;            /* last token id dequantized into ple_pe */
+    float *ple_pe;                /* cached scaled per-layer token embed row */
     int pos;
     cudaStream_t stream;
 };
@@ -491,8 +510,41 @@ TTConfig tt_config_from_gguf(const GGUFModel *m, int max_ctx) {
     c.n_layers = m->n_layers;
     c.n_heads = m->n_heads;
     c.n_kv_heads = m->n_kv_heads > 0 ? m->n_kv_heads : m->n_heads;
-    /* gemma families carry explicit key_length != dim/n_heads */
-    c.head_dim = m->head_dim > 0 ? m->head_dim : c.dim / c.n_heads;
+    /* Derive geometry from blk.0 TENSORS when metadata is absent or ambiguous
+     * (gemma4: head counts are per-layer arrays; its feed_forward_length meta
+     * disagrees with actual tensor shapes). Tensor shapes are ground truth.
+     * GGUF ne[] order: ne0 = fastest axis = input width; ne1 = output count. */
+    {
+        GGUFTensor *tq = gguf_get_tensor((GGUFModel *)m, "blk.0.attn_q.weight");
+        GGUFTensor *tk = gguf_get_tensor((GGUFModel *)m, "blk.0.attn_k.weight");
+        GGUFTensor *td = gguf_get_tensor((GGUFModel *)m, "blk.0.ffn_down.weight");
+        if (tq && tk && tq->ndim == 2 && tk->ndim == 2) {
+            const long qr = tq->shape[1];      /* outputs = n_heads * hd */
+            const long kr = tk->shape[1];      /* outputs = n_kv_heads * hd */
+            long a = qr, b = kr;
+            while (b) { long t2 = a % b; a = b; b = t2; }
+            const int hd_gcd = (int)a;
+            if (c.n_heads <= 0) {
+                /* meta missing: pick hd = gcd, heads follow */
+                if (m->head_dim > 0 && qr % m->head_dim == 0 && kr % m->head_dim == 0)
+                    c.head_dim = m->head_dim;
+                else c.head_dim = hd_gcd;
+                c.n_heads = (int)(qr / c.head_dim);
+                c.n_kv_heads = (int)(kr / c.head_dim);
+            } else {
+                /* meta present: verify against tensors, fall back to gcd */
+                int hd = c.dim / c.n_heads;
+                if (qr % hd != 0 || kr % hd != 0 || c.n_heads * hd != qr)
+                    hd = (m->head_dim > 0 && qr % m->head_dim == 0 && kr % m->head_dim == 0)
+                         ? m->head_dim : hd_gcd;
+                c.head_dim = hd;
+            }
+            c.n_kv_heads = c.n_kv_heads > 0 ? c.n_kv_heads : c.n_heads;
+        }
+        if (td && td->ndim == 2 && td->shape[0] > 0) {
+            c.hidden_dim = (int)td->shape[0];   /* tensor truth beats meta */
+        }
+    }
     c.vocab = 0;                    /* resolved from tokenizer/embedding at create */
     c.max_ctx = max_ctx;
     c.rms_eps = m->rms_norm_eps > 0 ? m->rms_norm_eps : 1e-6f;
@@ -511,6 +563,7 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     if (cfg->n_layers > MAX_LAYERS || cfg->dim > MAX_DIM) { fail("dims exceed engine limits"); return NULL; }
 
     Qwen2Engine *e = (Qwen2Engine *)calloc(1, sizeof(Qwen2Engine));
+    e->gguf = m;
     e->cfg = *cfg;
     e->pos = 0;
     cudaStreamCreate(&e->stream);
@@ -574,6 +627,21 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         snprintf(name, sizeof(name), "blk.%d.attn_q.bias", l);         w->q_bias    = upload_f32(m, name); /* optional */
         snprintf(name, sizeof(name), "blk.%d.attn_k.bias", l);         w->k_bias    = upload_f32(m, name); /* optional */
         snprintf(name, sizeof(name), "blk.%d.post_attention_norm.weight", l); w->post_attn_norm = upload_f32(m, name); /* gemma2 sandwich */
+        {   /* gemma4 MatFormer block tensors (optional) */
+            GGUFTensor *tg = gguf_get_tensor(m, name);
+            (void)tg;
+        }
+        snprintf(name, sizeof(name), "blk.%d.inp_gate.weight", l);
+        if (gguf_get_tensor(m, name)) upload_w(m, name, &w->inp_gate);
+        snprintf(name, sizeof(name), "blk.%d.proj.weight", l);
+        if (gguf_get_tensor(m, name)) upload_w(m, name, &w->pl_proj);
+        snprintf(name, sizeof(name), "blk.%d.layer_output_scale.weight", l);
+        {
+            GGUFTensor *tsc = gguf_get_tensor(m, name);
+            w->out_scale_val = 0.0f;
+            if (tsc && tsc->data && tsc->size_bytes >= 4)
+                memcpy(&w->out_scale_val, tsc->data, 4);
+        }
         snprintf(name, sizeof(name), "blk.%d.post_ffw_norm.weight", l);       w->post_ffn_norm  = upload_f32(m, name); /* gemma2 sandwich */
         snprintf(name, sizeof(name), "blk.%d.attn_v.bias", l);         w->v_bias    = upload_f32(m, name); /* optional */
         if (e->cfg.tr.qk_norm_rms) {   /* qwen3 trait: gammas required */
@@ -600,6 +668,48 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     cudaMalloc(&e->d_h,  F * sizeof(float));
     cudaMalloc(&e->d_g,  F * sizeof(float));   /* split-SwiGLU staging */
     cudaMalloc(&e->d_u,  F * sizeof(float));
+    /* gemma4 MatFormer per-layer embeddings */
+    e->has_pl_embd = 0;
+    e->pl_dim = 0;
+    e->ple_cache_tok = -1;
+    {
+        GGUFTensor *tp = gguf_get_tensor(m, "per_layer_token_embd.weight");
+        GGUFTensor *tm = gguf_get_tensor(m, "per_layer_model_proj.weight");
+        if (tp && tp->data && tm && tm->data && cfg->tr.per_layer_embd &&
+            m->per_layer_embd_dim > 0) {
+            e->has_pl_embd = 1;
+            e->pl_dim = m->per_layer_embd_dim;
+            memset(&e->pl_model_proj, 0, sizeof(TTensor));
+            void *dpj = NULL;
+            if (cudaMalloc(&dpj, tm->size_bytes) == cudaSuccess) {
+                cudaMemcpy(dpj, tm->data, tm->size_bytes, cudaMemcpyHostToDevice);
+                e->pl_model_proj.ptr = dpj;
+                e->pl_model_proj.dtype = (int)tm->type;
+            } else { e->has_pl_embd = 0; }
+        }
+        if (e->has_pl_embd) {
+            const long row = (long)e->cfg.n_layers * e->pl_dim;   /* 8960 */
+            cudaMalloc(&e->d_pl_tmp, row * sizeof(float));
+            cudaMalloc(&e->d_ple_row, row * sizeof(float));
+            e->pl_proj_norm_host = (float *)malloc(256 * sizeof(float));
+            {
+                GGUFTensor *tn2 = gguf_get_tensor(m, "per_layer_proj_norm.weight");
+                if (tn2 && tn2->data && tn2->size_bytes >= 256*4)
+                    memcpy(e->pl_proj_norm_host, tn2->data, 256 * sizeof(float));
+            }
+            cudaMalloc(&e->d_ones, c_kvdim_for(cfg) * sizeof(float));
+            {
+                float *ones = (float *)malloc(c_kvdim_for(cfg) * sizeof(float));
+                for (int i = 0; i < c_kvdim_for(cfg); i++) ones[i] = 1.0f;
+                cudaMemcpy(e->d_ones, ones, c_kvdim_for(cfg) * sizeof(float),
+                           cudaMemcpyHostToDevice);
+                free(ones);
+            }
+            e->ple_pe = (float *)malloc(row * sizeof(float));
+            fprintf(stderr, "[qwen2-engine] MatFormer per-layer embeddings ON "
+                            "(pl_dim=%d)\n", e->pl_dim);
+        }
+    }
     cudaMalloc(&e->d_logits, (long)e->cfg.vocab * sizeof(float));
     const long cache_per = (long)cfg->n_kv_heads * cfg->max_ctx * cfg->head_dim;
     cudaMalloc(&e->d_kc, cache_per * cfg->n_layers * sizeof(float));
@@ -668,6 +778,11 @@ void qwen2_engine_free(Qwen2Engine *e) {
     if (e->d_recent) cudaFree(e->d_recent);
     if (e->d_n_recent) cudaFree(e->d_n_recent);
     if (e->h_sampled) cudaFreeHost(e->h_sampled);
+    if (e->d_pl_tmp) cudaFree(e->d_pl_tmp);
+    if (e->d_ple_row) cudaFree(e->d_ple_row);
+    if (e->d_ones) cudaFree(e->d_ones);
+    if (e->ple_pe) free(e->ple_pe);
+    if (e->pl_proj_norm_host) free(e->pl_proj_norm_host);
     cudaFree(e->d_next_tok);
     if (e->graph_exec) cudaGraphExecDestroy(e->graph_exec);
     /* NOTE: per-weight cudaFree calls are intentionally not tracked here; they are
@@ -862,7 +977,8 @@ static int forward_layers(Qwen2Engine *e) {
             e->d_q, Kl_f, Vl_f, e->d_att,
             e->d_pos,
             c->n_heads, c->n_kv_heads, HD, c->max_ctx,
-            1.0f / sqrtf((float)HD), c->tr.swa_size);
+            (c->tr.attn_scale_one ? 1.0f : 1.0f / sqrtf((float)HD)),
+            c->tr.swa_size);
         if (tt_profiling()) tt_prof_end(TT_P_FLASH, e->stream);
 
         CHK_STAGE("4 flash");
@@ -956,6 +1072,23 @@ static int forward_layers(Qwen2Engine *e) {
     return (int)cudaGetLastError();
 }
 
+/* per-layer embedding finisher (host, small data): rmsnorm each 256-slice
+ * with pl_proj_norm, add scaled pe row, scale by 1/sqrt(2) */
+static void ple_finish_host(float *v, const float *gamma256,
+                            const float *pe_row, int n_slices) {
+    for (int s = 0; s < n_slices; s++) {
+        float *sl = v + (long)s * 256;
+        double ss = 0.0;
+        for (int i = 0; i < 256; i++) ss += (double)sl[i] * sl[i];
+        const float inv = 1.0f / sqrtf((float)(ss / 256.0) + 1e-6f);
+        for (int i = 0; i < 256; i++)
+            sl[i] = sl[i] * inv * gamma256[i];
+    }
+    const float s2 = 1.0f / sqrtf(2.0f);
+    for (long i = 0; i < (long)n_slices * 256; i++)
+        v[i] = (v[i] + pe_row[i]) * s2;
+}
+
 __global__ void k_scale(float *__restrict__ buf, float s, int n) {
     const int i = threadIdx.x + blockIdx.x * blockDim.x;
     if (i < n) buf[i] *= s;
@@ -971,6 +1104,36 @@ static int embed_token(Qwen2Engine *e, int tok) {
     if (e->cfg.tr.embed_sqrt)
         k_scale<<<(e->cfg.dim + 255) / 256, 256, 0, e->stream>>>(
             e->d_x, sqrtf((float)e->cfg.dim), e->cfg.dim);
+
+    /* gemma4: build this position's MatFormer per-layer input row.
+     * Host-assisted (small data): gemv on GPU -> D2H -> CPU finish -> H2D. */
+    if (e->has_pl_embd) {
+        const long row = (long)e->cfg.n_layers * e->pl_dim;
+        cudaStreamSynchronize(e->stream);
+        int prc = tt_gemv_typed(e->pl_model_proj.ptr, e->pl_model_proj.dtype,
+                                e->d_x, e->d_ple_row, (int)row, e->cfg.dim,
+                                e->stream);
+        cudaStreamSynchronize(e->stream);
+        if (prc) return prc;
+        cudaMemcpy(e->ple_pe, e->d_ple_row, row * sizeof(float),
+                   cudaMemcpyDeviceToHost);   /* reuse as staging */
+
+        /* dequant per_layer_token_embd row 'tok' (q4_0), scale by sqrt(pl_dim) */
+        GGUFTensor *tp = gguf_get_tensor(e->gguf, "per_layer_token_embd.weight");
+        if (!tp || !tp->data || tp->type != TTQ_Q4_0) return -10;
+        static float pe_full[64 * 1024];
+        ttq_dequant((const char *)tp->data + (long)tok * (row / 32 * 18),
+                    TTQ_Q4_0, row, pe_full);
+        for (long i = 0; i < row; i++)
+            pe_full[i] *= sqrtf((float)e->pl_dim);
+
+        /* CPU: per-slice rmsnorm w/ pl_proj_norm, then add pe, then *1/sqrt2 */
+        ple_finish_host(e->ple_pe, e->pl_proj_norm_host, pe_full,
+                        e->cfg.n_layers);
+
+        cudaMemcpyAsync(e->d_ple_row, e->ple_pe, row * sizeof(float),
+                        cudaMemcpyHostToDevice, e->stream);
+    }
     return rc;
 }
 
