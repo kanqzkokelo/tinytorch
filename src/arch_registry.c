@@ -48,16 +48,20 @@ typedef struct {
 
 static const ArchEntry kArchTable[] = {
     /* qwen2: NEOX rope + SiLU + optional qkv biases (per-tensor detection). */
-    { "qwen2", { ROPE_NEOX, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f } },
+    { "qwen2", { ROPE_NEOX, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
     /* "llama" covers mistral / tinyllama / smollm conversions. Interleaved
      * rope (LLAMA_ROPE_TYPE_NORM), no biases, untied head. */
-    { "llama", { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f } },
+    { "llama", { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
     /* qwen3: qwen2-style rope + per-head q/k rmsnorm pre-rope. */
-    { "qwen3", { ROPE_NEOX, ACT_SILU, 0.0f, 0, 0, 1, 1e-6f, 0.0f } },
+    { "qwen3", { ROPE_NEOX, ACT_SILU, 0.0f, 0, 0, 1, 1e-6f, 0.0f, 0, 0, 0 } },
     /* gemma: NEOX rope, GeGLU(gelu), tied embeddings, no softcap/swa. */
-    { "gemma", { ROPE_NEOX, ACT_GELU, 0.0f, 0, 1, 0, 0.0f, 0.0f, 1 } },
+    { "gemma", { ROPE_NEOX, ACT_GELU, 0.0f, 0, 1, 0, 0.0f, 0.0f, 1, 0, 0 } },
     /* gemma2: + SWA 4096 default + final-logits softcap 30.0 fallback. */
-    { "gemma2", { ROPE_NEOX, ACT_GELU, 30.0f, 4096, 1, 0, 0.0f, 0.0f, 1 } },
+    { "gemma2", { ROPE_NEOX, ACT_GELU, 30.0f, 4096, 1, 0, 0.0f, 0.0f, 1, 0, 0 } },
+    /* gemma4 (E2B/E4B): QK-norms on every layer, attention scale 1.0 (no
+     * 1/sqrt hd), plain RMSNorm on V, per-layer token embeddings (MatFormer),
+     * per-layer output scales, learned rope_freqs on global layers. */
+    { "gemma4", { ROPE_NEOX, ACT_GELU, 30.0f, 0, 1, 1, 1e-6f, 0.0f, 1, 1, 1, 1 } },
 };
 
 const TTraits *tt_traits_lookup(const char *arch) {

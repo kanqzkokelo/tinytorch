@@ -119,32 +119,79 @@ GGUFModel *gguf_load(const char *filepath) {
         uint32_t value_type = read_u32(&p);
         const char *dot = strchr(key, '.');
         const char *sfx = dot ? dot + 1 : key;
+        if (getenv("TT_KV_DEBUG")) fprintf(stderr, "[kv] %s vt=%u\n", key, value_type);
 
+        /* general.architecture */
         if (value_type == 8 && strcmp(key, "general.architecture") == 0) {
             read_string(&p, model->architecture, sizeof(model->architecture));
             continue;
-        } else if (strcmp(sfx, "embedding_length") == 0) {
-            model->dim = *(const int32_t *)p;
-        } else if (strcmp(sfx, "feed_forward_length") == 0) {
-            model->hidden_dim = *(const int32_t *)p;
-        } else if (strcmp(sfx, "block_count") == 0) {
-            model->n_layers = *(const int32_t *)p;
-        } else if (strcmp(sfx, "attention.key_length") == 0) {
-            model->head_dim = *(const int32_t *)p;   /* gemma families: hd != dim/heads */
-        } else if (strcmp(sfx, "attention.head_count") == 0) {
-            model->n_heads = *(const int32_t *)p;
-        } else if (strcmp(sfx, "attention.head_count_kv") == 0) {
-            model->n_kv_heads = *(const int32_t *)p;
-        } else if (strcmp(sfx, "context_length") == 0) {
-            model->max_seq_len = *(const int32_t *)p;
-        } else if (strcmp(sfx, "attention.layer_norm_rms_epsilon") == 0) {
+        }
+
+        /* Numeric model-dimension keys. Some families (gemma4) store these as
+         * u32 ARRAYS with header item_type(u32)+count(u64); element[0] is the
+         * value (uniform across layers for E-series models). Scalars read i32. */
+        static const char *dim_keys[] = {"embedding_length", "feed_forward_length",
+            "block_count", "attention.head_count", "attention.head_count_kv",
+            "attention.key_length", "attention.value_length",
+            "rope.dimension_count", "rope.dimension_count_swa"};
+        int dk = -1;
+        for (int ki = 0; ki < 9; ki++)
+            if (strcmp(sfx, dim_keys[ki]) == 0) { dk = ki; break; }
+        if (dk >= 0 && (value_type == 9 || value_type == 4)) {
+            int32_t v = 0;
+            if (value_type == 9) {
+                const uint32_t itype = read_u32(&p);
+                const uint64_t alen = read_u64(&p);
+                const uint64_t esz = (itype <= 6 || itype == 7) ? (itype <= 1 ? 1 : itype <= 6 ? 4 : 1) : 8;
+                if (alen > 0 && esz >= 4) memcpy(&v, p, 4);
+                else if (alen > 0 && esz == 1) v = p[0];
+                p += alen * esz;
+            } else {
+                memcpy(&v, p, 4);
+                p += 4;
+            }
+            switch (dk) {
+                case 0: model->dim = v; break;
+                case 1: model->hidden_dim = v; break;
+                case 2: model->n_layers = v; break;
+                case 3: model->n_heads = v; break;
+                case 4: model->n_kv_heads = v; break;
+                case 5: model->head_dim = v; break;
+                default: break;   /* value_length / rope dims unused yet */
+            }
+            continue;
+        }
+
+        if (strcmp(sfx, "attention.layer_norm_rms_epsilon") == 0 && value_type == 6) {
             model->rms_norm_eps = *(const float *)p;
-        } else if (strcmp(sfx, "rope.freq_base") == 0 || strcmp(key, "llama.rope_freq_base") == 0) {
+            skip_kv_value(&p, value_type);
+            continue;
+        }
+        if ((strcmp(sfx, "rope.freq_base") == 0 || strcmp(key, "llama.rope_freq_base") == 0)
+            && value_type == 6) {
             model->rope_freq_base = *(const float *)p;
-        } else if (strcmp(sfx, "attention.sliding_window") == 0) {
+            skip_kv_value(&p, value_type);
+            continue;
+        }
+        if (strcmp(sfx, "attention.sliding_window") == 0 && value_type == 4) {
             model->sliding_window = *(const int32_t *)p;
-        } else if (strcmp(sfx, "final_logit_softcapping") == 0) {
+            skip_kv_value(&p, value_type);
+            continue;
+        }
+        if (strcmp(sfx, "final_logit_softcapping") == 0 && value_type == 6) {
             model->final_logit_softcapping = *(const float *)p;
+            skip_kv_value(&p, value_type);
+            continue;
+        }
+        if (strcmp(sfx, "embedding_length_per_layer_input") == 0 && value_type == 4) {
+            model->per_layer_embd_dim = *(const int32_t *)p;
+            skip_kv_value(&p, value_type);
+            continue;
+        }
+        if (strcmp(sfx, "context_length") == 0 && value_type == 4) {
+            model->max_seq_len = *(const int32_t *)p;
+            skip_kv_value(&p, value_type);
+            continue;
         }
 
         skip_kv_value(&p, value_type);

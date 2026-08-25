@@ -26,6 +26,9 @@ typedef struct {
     float qk_norm_eps;
     float norm_offset;       /* extra added to every rmsnorm gamma         */
     int   embed_sqrt;        /* gemma: scale embeddings by sqrt(dim)       */
+    int   attn_scale_one;    /* gemma4: attention scale = 1.0              */
+    int   v_plain_norm;      /* gemma4: plain RMSNorm on V (no gamma)      */
+    int   per_layer_embd;    /* gemma4: MatFormer per-layer token embeds   */
                              /* NOTE gemma's (1+w) is baked into GGUF weights
                               * at conversion (oracle convert_hf_to_gguf.py:4730),
                               * so this stays 0 for converted models.        */

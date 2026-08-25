@@ -1,5 +1,16 @@
 # SESSION STATE — resume here
 
+# RESUME (latest — supersedes below)
+## Oracle UPGRADED to latest llama.cpp 0a5ac49b (qwen3+gemma4 aware). m61 still green.
+## qwen3-0.6b gate: 7/7 PASS. Grid runner: tests/gate_m7_grid.py (11/14 green).
+## README truth table written.
+## NEXT: M8 gemma4 port — FULL SPEC at docs/plans/2026-08-24-m8-gemma4-port.md
+## (all math extracted from llama.cpp build_gemma4; E2B downloaded complete 3.04GB;
+##  old gemma-4 files in data/models/*.incomplete were truncated downloads - delete)
+## Registry/loader already carry gemma4 entry + array-metadata parsing (committed).
+
+---
+
 ## Branch m6-correctness. M7 Task 4 COMPLETE for llama/gemma2 families.
 
 ## Verified grid (gate_m7_arch.py, teacher-forced logits vs llama.cpp oracle)
