@@ -69,6 +69,14 @@ static int upload_w(GGUFModel *m, const char *name, TTensor *out) {
     cudaMemcpy(d, t->data, t->size_bytes, cudaMemcpyHostToDevice);
     out->ptr = d;
     out->dtype = (int)t->type;
+    if (getenv("TT_DEBUG")) {
+        long shape0 = 0, shape1 = 0;
+        /* shapes live in the loader; re-fetch for debug print */
+        GGUFTensor *tt = gguf_get_tensor(m, name);
+        if (tt) { shape0 = tt->shape[0]; shape1 = tt->ndim > 1 ? tt->shape[1] : 0; }
+        fprintf(stderr, "[qwen2-engine] up %s type=%d size=%zu ne=[%ld,%ld]\n",
+                name, t->type, t->size_bytes, shape0, shape1);
+    }
     return 0;
 }
 
@@ -418,6 +426,7 @@ struct LayerW {
      * dispatcher picks the kernel from `dtype`. */
     TTensor q, k, v, o, gate, up, down;
     float *attn_norm, *ffn_norm;      /* device f32 gammas */
+    float *post_attn_norm, *post_ffn_norm; /* gemma2 sandwich norms (optional) */
     float *q_bias, *k_bias, *v_bias;  /* this GGUF variant carries QKV biases */
     float *q_norm, *k_norm;           /* per-head q/k rmsnorm gammas (qwen3 trait) */
 };
@@ -482,7 +491,8 @@ TTConfig tt_config_from_gguf(const GGUFModel *m, int max_ctx) {
     c.n_layers = m->n_layers;
     c.n_heads = m->n_heads;
     c.n_kv_heads = m->n_kv_heads > 0 ? m->n_kv_heads : m->n_heads;
-    c.head_dim = c.dim / c.n_heads;
+    /* gemma families carry explicit key_length != dim/n_heads */
+    c.head_dim = m->head_dim > 0 ? m->head_dim : c.dim / c.n_heads;
     c.vocab = 0;                    /* resolved from tokenizer/embedding at create */
     c.max_ctx = max_ctx;
     c.rms_eps = m->rms_norm_eps > 0 ? m->rms_norm_eps : 1e-6f;
@@ -563,6 +573,8 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", l);     w->ffn_norm  = upload_f32(m, name);
         snprintf(name, sizeof(name), "blk.%d.attn_q.bias", l);         w->q_bias    = upload_f32(m, name); /* optional */
         snprintf(name, sizeof(name), "blk.%d.attn_k.bias", l);         w->k_bias    = upload_f32(m, name); /* optional */
+        snprintf(name, sizeof(name), "blk.%d.post_attention_norm.weight", l); w->post_attn_norm = upload_f32(m, name); /* gemma2 sandwich */
+        snprintf(name, sizeof(name), "blk.%d.post_ffw_norm.weight", l);       w->post_ffn_norm  = upload_f32(m, name); /* gemma2 sandwich */
         snprintf(name, sizeof(name), "blk.%d.attn_v.bias", l);         w->v_bias    = upload_f32(m, name); /* optional */
         if (e->cfg.tr.qk_norm_rms) {   /* qwen3 trait: gammas required */
             snprintf(name, sizeof(name), "blk.%d.attn_q_norm.weight", l); w->q_norm = upload_f32(m, name);
@@ -771,18 +783,29 @@ static int forward_layers(Qwen2Engine *e) {
          * K/V are computed into staging buffers, then scattered to the slot
          * selected by the DEVICE position scalar (*e->d_pos). */
 
+        #define CHK_STAGE(tag) do { cudaError_t ce_ = cudaGetLastError(); \
+            if (ce_ != cudaSuccess && getenv("TT_DEBUG")) \
+                fprintf(stderr, "[qwen2-engine] L%d %s: %s\n", l, tag, cudaGetErrorString(ce_)); } while(0)
+
         /* 1. xn = rmsnorm(x) * attn_norm */
         if (tt_profiling()) tt_prof_begin(TT_P_RMSNORM, e->stream);
         k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
             e->d_x, w->attn_norm, e->d_xn, c->dim, c->rms_eps, c->tr.norm_offset);
         if (tt_profiling()) tt_prof_end(TT_P_RMSNORM, e->stream);
 
+        CHK_STAGE("1 rmsnorm");
         /* 2. projections: q -> d_q ; k,v -> KV cache slot pos */
         if (tt_profiling()) tt_prof_begin(TT_P_QKV, e->stream);
-        tt_gemv_typed(w->q.ptr, w->q.dtype, e->d_xn, e->d_q, c->dim, c->dim, e->stream);
-        tt_gemv_typed(w->k.ptr, w->k.dtype, e->d_xn, e->d_k_stage, c->n_kv_heads * HD, c->dim, e->stream);
+        /* gemma families: n_heads*HD != dim (explicit head_dim in meta) */
+        const int attn_qout = c->n_heads * HD;
+        int qrc = tt_gemv_typed(w->q.ptr, w->q.dtype, e->d_xn, e->d_q,
+                      attn_qout, c->dim, e->stream);
+        if (qrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] q gemv rc=%d\n", qrc);
+        int krc = tt_gemv_typed(w->k.ptr, w->k.dtype, e->d_xn, e->d_k_stage, c->n_kv_heads * HD, c->dim, e->stream);
+        if (krc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] k gemv rc=%d\n", krc);
         /* QKV biases present in some GGUF conversions of Qwen2 (applied by
          * llama.cpp whenever the tensors exist). Optional by design. */
+        CHK_STAGE("2 qkv-gemv");
         const int kvdim = c->n_kv_heads * HD;
         if (w->q_bias)
             k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_q, w->q_bias, c->dim);
@@ -800,6 +823,7 @@ static int forward_layers(Qwen2Engine *e) {
                 (e->d_k_stage, w->k_norm, c->n_kv_heads, HD, c->tr.qk_norm_eps);
         }
 
+        CHK_STAGE("2b biases+qknorm");
         /* 3. RoPE on q (all heads) and on the staged k row (in-place, pre-scatter).
          * Kernel picked by the rope-style trait: NEOX half-split vs GPT-J
          * interleaved pairs (llama family). */
@@ -816,7 +840,8 @@ static int forward_layers(Qwen2Engine *e) {
         }
 
         /* v projection + bias (QKV group) */
-        tt_gemv_typed(w->v.ptr, w->v.dtype, e->d_xn, e->d_v_stage, c->n_kv_heads * HD, c->dim, e->stream);
+        int vrc = tt_gemv_typed(w->v.ptr, w->v.dtype, e->d_xn, e->d_v_stage, c->n_kv_heads * HD, c->dim, e->stream);
+        if (vrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] v gemv rc=%d\n", vrc);
         if (w->v_bias)
             k_add<<<(kvdim + 255) / 256, 256, 0, e->stream>>>(e->d_v_stage, w->v_bias, kvdim);
         if (tt_profiling()) tt_prof_end(TT_P_QKV, e->stream);
@@ -829,6 +854,7 @@ static int forward_layers(Qwen2Engine *e) {
             c->n_kv_heads, HD, c->max_ctx);
         if (tt_profiling()) tt_prof_end(TT_P_SCATTER, e->stream);
 
+        CHK_STAGE("3 rope");
         /* 4. GQA flash attention over slots [t0..pos]; t0 raised by the SWA
          * trait (gemma2), full [0..pos] when swa_size == 0 (qwen2 unchanged). */
         if (tt_profiling()) tt_prof_begin(TT_P_FLASH, e->stream);
@@ -839,9 +865,16 @@ static int forward_layers(Qwen2Engine *e) {
             1.0f / sqrtf((float)HD), c->tr.swa_size);
         if (tt_profiling()) tt_prof_end(TT_P_FLASH, e->stream);
 
+        CHK_STAGE("4 flash");
         /* 5. Wo projection + residual: x += att @ Wo^T */
         if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
-        tt_gemv_typed(w->o.ptr, w->o.dtype, e->d_att, e->d_xn, c->dim, c->dim, e->stream);
+        int orc_ = tt_gemv_typed(w->o.ptr, w->o.dtype, e->d_att, e->d_xn, c->dim, attn_qout, e->stream);
+        if (orc_ && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] o gemv rc=%d\n", orc_);
+        /* gemma2 sandwich: normalize the attention output before residual */
+        if (w->post_attn_norm)
+            k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
+                e->d_xn, w->post_attn_norm, e->d_xn, c->dim, c->rms_eps,
+                c->tr.norm_offset);
         k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
         if (tt_profiling()) tt_prof_end(TT_P_OMLP, e->stream);
 
@@ -860,17 +893,31 @@ static int forward_layers(Qwen2Engine *e) {
             tt_ffn_q4_0(w->gate.ptr, w->up.ptr, e->d_xn, e->d_h,
                         c->hidden_dim, c->dim, act_gelu, e->stream);
         } else {
-            tt_gemv_typed(w->gate.ptr, w->gate.dtype, e->d_xn, e->d_g,
+            int grc = tt_gemv_typed(w->gate.ptr, w->gate.dtype, e->d_xn, e->d_g,
                           c->hidden_dim, c->dim, e->stream);
-            tt_gemv_typed(w->up.ptr,   w->up.dtype,   e->d_xn, e->d_u,
+            if (grc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] gate gemv rc=%d\n", grc);
+            CHK_STAGE("7a gate-gemv");
+            int urc = tt_gemv_typed(w->up.ptr, w->up.dtype, e->d_xn, e->d_u,
                           c->hidden_dim, c->dim, e->stream);
+            if (urc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] up gemv rc=%d\n", urc);
+            CHK_STAGE("7b up-gemv");
             k_swiglu_apply<<<(c->hidden_dim + 255) / 256, 256, 0, e->stream>>>(
                 e->d_g, e->d_u, e->d_h, c->hidden_dim, act_gelu);
+            CHK_STAGE("6b swiglu-apply");
         }
-        tt_gemv_typed(w->down.ptr, w->down.dtype, e->d_h, e->d_xn,
+        int drc = tt_gemv_typed(w->down.ptr, w->down.dtype, e->d_h, e->d_xn,
                       c->dim, c->hidden_dim, e->stream);
+        if (drc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] down gemv rc=%d\n", drc);
+        CHK_STAGE("7c down-gemv");
+        /* gemma2 sandwich: normalize the MLP output before residual */
+        if (w->post_ffn_norm)
+            k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
+                e->d_xn, w->post_ffn_norm, e->d_xn, c->dim, c->rms_eps,
+                c->tr.norm_offset);
         k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
+        CHK_STAGE("7d add");
         if (tt_profiling()) tt_prof_end(TT_P_OMLP, e->stream);
+        CHK_STAGE("7 mlp");
 
         {
             static const char *dump_env = NULL;
@@ -909,20 +956,29 @@ static int forward_layers(Qwen2Engine *e) {
     return (int)cudaGetLastError();
 }
 
+__global__ void k_scale(float *__restrict__ buf, float s, int n) {
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) buf[i] *= s;
+}
+
 static int embed_token(Qwen2Engine *e, int tok) {
     if (tt_profiling()) tt_prof_begin(TT_P_EMBED, e->stream);
     /* M7: embedding may be any Tier-1 dtype now; dispatch by type */
     const int rc = tt_embed_typed(e->d_embd.ptr, e->d_embd.dtype, tok,
                                   e->d_x, e->cfg.dim, e->stream);
     if (tt_profiling()) tt_prof_end(TT_P_EMBED, e->stream);
+    /* gemma families scale embeddings by sqrt(hidden_size) */
+    if (e->cfg.tr.embed_sqrt)
+        k_scale<<<(e->cfg.dim + 255) / 256, 256, 0, e->stream>>>(
+            e->d_x, sqrtf((float)e->cfg.dim), e->cfg.dim);
     return rc;
 }
 
 static int advance(Qwen2Engine *e, int tok) {
     int rc = embed_token(e, tok);
-    if (rc) return rc;
+    if (rc) { fprintf(stderr, "[qwen2-engine] embed rc=%d tok=%d\n", rc, tok); return rc; }
     rc = forward_layers(e);      /* runs while *d_pos == current slot */
-    if (rc) return rc;
+    if (rc) { fprintf(stderr, "[qwen2-engine] forward rc=%d\n", rc); return rc; }
     e->pos++;
     /* SYNC copy: source is mutable host memory the next advance() increments
      * immediately after enqueue. A small pageable async H2D copy can be

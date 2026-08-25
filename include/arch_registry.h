@@ -25,6 +25,7 @@ typedef struct {
     int   qk_norm_rms;       /* rmsnorm on q/k heads pre-rope (qwen3)      */
     float qk_norm_eps;
     float norm_offset;       /* extra added to every rmsnorm gamma         */
+    int   embed_sqrt;        /* gemma: scale embeddings by sqrt(dim)       */
                              /* NOTE gemma's (1+w) is baked into GGUF weights
                               * at conversion (oracle convert_hf_to_gguf.py:4730),
                               * so this stays 0 for converted models.        */

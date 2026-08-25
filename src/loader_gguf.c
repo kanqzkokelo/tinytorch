@@ -129,6 +129,8 @@ GGUFModel *gguf_load(const char *filepath) {
             model->hidden_dim = *(const int32_t *)p;
         } else if (strcmp(sfx, "block_count") == 0) {
             model->n_layers = *(const int32_t *)p;
+        } else if (strcmp(sfx, "attention.key_length") == 0) {
+            model->head_dim = *(const int32_t *)p;   /* gemma families: hd != dim/heads */
         } else if (strcmp(sfx, "attention.head_count") == 0) {
             model->n_heads = *(const int32_t *)p;
         } else if (strcmp(sfx, "attention.head_count_kv") == 0) {

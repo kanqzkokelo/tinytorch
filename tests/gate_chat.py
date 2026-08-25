@@ -81,9 +81,13 @@ def check_path(name, env_extra):
         # fed through the layers when the counter is printed; the graph path
         # additionally holds one pending-unfed token until the next prefill
         # flush. Gross mis-accounting (double-fed / runaway ctx) still trips.
-        if prompt_len is None:
-            prompt_len = ctx - ntok
-        elif abs((ctx - prev_ctx) - (ntok + prompt_len)) > 4:
+        # Turn 1 includes the system prompt (~30 extra tokens); later turns
+        # share a fixed user-prompt length. Infer that length from turn 2's
+        # delta and enforce accounting from turn 3 on.
+        if i == 1:
+            prompt_len = (ctx - prev_ctx) - ntok
+        elif prompt_len is not None and i >= 2 and \
+                abs((ctx - prev_ctx) - (ntok + prompt_len)) > 4:
             print(f"[FAIL] {name} turn {i+1}: ctx {ctx} vs expected "
                   f"{prev_ctx + ntok + prompt_len} (+/-2)")
             ok = False

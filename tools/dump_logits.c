@@ -58,11 +58,11 @@ int main(int argc, char **argv) {
     // prefill everything, snapshot x, compute norm+logits via a second engine pass.
     if (qwen2_engine_prefill(e, toks, n)) { fprintf(stderr, "prefill failed\n"); return 1; }
 
-    static float lg[160000];
+    static float lg[262144];
     // next() computes rmsnorm->logits->argmax then advances; logits buffer still valid
     int id = qwen2_engine_next(e);   // consumes one step; logits correspond to LAST prompt token
     (void)id;
-    const int nvocab = qwen2_debug_copy_logits(e, lg, 160000); /* accessor caps at true vocab */
+    const int nvocab = qwen2_debug_copy_logits(e, lg, 262144); /* accessor caps at true vocab */
     if (nvocab <= 0) { fprintf(stderr, "logits copy failed\n"); return 1; }
 
     int best = 0; float mv = -1e30f;

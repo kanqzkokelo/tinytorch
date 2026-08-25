@@ -46,6 +46,7 @@ typedef struct {
     int n_layers;
     int n_heads;
     int n_kv_heads;
+    int head_dim;   /* 0 = derive dim/n_heads */
     int vocab_size;
     int max_seq_len;
     float rms_norm_eps;

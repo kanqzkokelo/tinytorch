@@ -55,9 +55,9 @@ static const ArchEntry kArchTable[] = {
     /* qwen3: qwen2-style rope + per-head q/k rmsnorm pre-rope. */
     { "qwen3", { ROPE_NEOX, ACT_SILU, 0.0f, 0, 0, 1, 1e-6f, 0.0f } },
     /* gemma: NEOX rope, GeGLU(gelu), tied embeddings, no softcap/swa. */
-    { "gemma", { ROPE_NEOX, ACT_GELU, 0.0f, 0, 1, 0, 0.0f, 0.0f } },
+    { "gemma", { ROPE_NEOX, ACT_GELU, 0.0f, 0, 1, 0, 0.0f, 0.0f, 1 } },
     /* gemma2: + SWA 4096 default + final-logits softcap 30.0 fallback. */
-    { "gemma2", { ROPE_NEOX, ACT_GELU, 30.0f, 4096, 1, 0, 0.0f, 0.0f } },
+    { "gemma2", { ROPE_NEOX, ACT_GELU, 30.0f, 4096, 1, 0, 0.0f, 0.0f, 1 } },
 };
 
 const TTraits *tt_traits_lookup(const char *arch) {

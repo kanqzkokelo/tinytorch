@@ -51,8 +51,8 @@ int main(void) {
     }
 
     static const char *SYSTEM_PROMPT =
-        "You are a helpful assistant. Respond in English by default unless the "
-        "user writes in another language. Keep answers concise.";
+        "You are a helpful assistant. Respond in English by default unless "
+        "the user writes in another language. Give complete, detailed answers.";
     int session_started = 0;
     char user_input[1024];
     while (1) {

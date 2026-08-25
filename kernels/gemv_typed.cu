@@ -462,6 +462,9 @@ int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
     dim3 g, b;
     int rc = gemv_dims(M, &g, &b);
     if (rc) return rc;
+    if (getenv("TT_DEBUG2"))
+        fprintf(stderr, "[gemv] W=%p dt=%d x=%p y=%p M=%d K=%d\n",
+                W, dtype, (const void *)x, (void *)y, M, K);
 
     switch (dtype) {
         case TTQ_Q4_0: {
