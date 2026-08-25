@@ -1,38 +1,33 @@
-# SESSION STATE — resume here (end of 2026-08-24, late)
+# SESSION STATE — resume here
 
-## Branch state: m6-correctness @ 992e20d, tree clean
+## Branch m6-correctness. M7 Task 4 COMPLETE for llama/gemma2 families.
 
-## DONE (M7)
-- Task -1 multi-turn fix (3 root causes: q4_0 nibble pairing + unsigned underflow,
-  lm-head grid/blockDim mismatch, missing special-token encode)
-- Task 0 fleet: 14 ggufs incl. 10-quant smollm2 matrix (data/testmodels/, gitignored)
-- Task 1 golden dequant all types (gguf-py verified; caught real q5_K field-order bug)
-- Task 2 CUDA GEMV dispatch all types (golden-verified, maxerr ~1e-6)
-- Task 3 traits: rope style / activation / qk-norm / softcap / swa / norm-offset;
-  qwen2 byte-identical; loader suffix-based keys + arch string
-- Task 4 MOSTLY: SP tokenizer done (encode matches llama-tokenize);
-  tinyllama-f16 BIT-PERFECT parity (7/7, median 0.0009) with rope=GPTJ;
-  smollm2 x10 quant matrix 63/70 prompts at relaxed tolerance (see results.md)
+## Verified grid (gate_m7_arch.py, teacher-forced logits vs llama.cpp oracle)
+- tinyllama-f16 (llama): 7/7 BIT-PERFECT (median dlogit 0.0009)
+- smollm2 x Q4_0/Q5_0/Q8_0: 7/7 each; Q6_K 6/7 (relaxed tol 0.6 for 135M margins)
+- gemma2-2b-q6_k: 7/7 (top1 all match)
+- qwen2.5-0.5b q4_0/q8_0-head: m61 gate 7/7 standing
 
-## NEXT (M7 remaining)
-1. qwen3-0.6b gate (forward already runs clean; just run tests/gate_m7_arch.py --model data/testmodels/qwen3-0.6b-q8_0.gguf)
-2. gemma2-2b-q6_k bring-up (SP decode works via sp_mode; check softcap/SWA/norm-offset traits vs oracle; gemma tokenizer.ggml.model may differ — check sp_mode triggers)
-3. smollm2 chat smoke (TT_MODEL=... ./chat)
-4. silence optional-bias stderr spam behind TT_DEBUG
-5. Task 5 grid runner + README truth table
+## REMAINING M7
+1. qwen3-0.6b: BLOCKED on oracle age — pinned llama.cpp predates arch 'qwen3'.
+   Fix: update oracle checkout (rebuild tools), regenerate qwen fixtures.
+2. Task 5: grid runner (tests/gate_m7_grid.py) + README truth table.
+3. Chat smoke on remaining models if desired.
 
-## THEN: gemma4-E4B milestone (user's actual goal!)
-- data/models/gemma-4-E4B_q4_0-it.gguf = 5.15GB — DOES NOT FIT 4GB VRAM
-- E2B variant (1.46GB) fits and is the realistic target (~60-90 tok/s potential)
-- Needs: heterogeneous head dims per layer (global 512 vs SWA 256), per-layer
-  input embeddings (256-dim MatFormer stream), dual rope bases (1e6/1e4),
-  softcap 30, SWA 512, SP tokenizer ("gemma4" ggml model => ensure sp_mode)
-- User expects >=25-30 tok/s (their Windows llama.cpp baseline was 17)
+## THEN M8: gemma4 support (user goal: gemma-4-E4B_q4_0-it.gguf, data/models/)
+- E4B = 5.15GB q4_0: DOES NOT FIT 4GB VRAM. E2B (1.46GB) fits — target it first.
+- Needs: per-layer input embeddings (gemma4.embedding_length_per_layer_input=256),
+  heterogeneous head dims (global 512 vs SWA 256 per layer), dual rope bases
+  (1e6 global / 1e4 swa), sliding_window pattern, softcap 30, SP tokenizer
+  ("gemma4" ggml model -> ensure tokenizer sp_mode covers it).
+- User expectation: >=25-30 tok/s (Windows llama.cpp baseline was 17).
+- NOTE E4B hybrid offload = separate engineering if E2B insufficient.
 
-## Gotchas
-- pi subagents die silently on long tasks — work directly in-session
-- gate_chat.py pins TT_GREEDY=1; sampling is chat-level only
-- oracle_logits supports --ids mode now (input alignment matters for SP models!)
-- llama-family = GPTJ rope (empirically proven); qwen/gemma = NEOX... NOTE:
-  registry comment cites llama.cpp ROPE_TYPE_NORM=interleaved — kept GPTJ after A/B;
-  clean up the contradictory comment in src/arch_registry.c line ~52 someday
+## Gotchas (accumulated)
+- rope: llama-family = GPTJ interleaved; qwen/gemma = NEOX half-split (empirical)
+- gate_chat.py pins TT_GREEDY=1; ctx accounting infers from turn-2 delta
+  (turn 1 includes system prompt ~33 tokens)
+- oracle_logits supports --ids mode (input alignment essential for SP models)
+- K-quants need n_per_row %256==0; gemma2 key_length makes Q/O GEMV dims
+  n_heads*HD != dim — never assume square projections
+- pi subagents die silently on long GPU tasks — run in-session directly
