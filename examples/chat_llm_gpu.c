@@ -47,6 +47,10 @@ int main(void) {
         qwen2_engine_set_sampling(eng, temp, 40, pen);
     }
 
+    static const char *SYSTEM_PROMPT =
+        "You are a helpful assistant. Respond in English by default unless the "
+        "user writes in another language. Keep answers concise.";
+    int session_started = 0;
     char user_input[1024];
     while (1) {
         printf("\nUser > ");
@@ -60,8 +64,17 @@ int main(void) {
         if (!strcmp(user_input, "/exit") || !strcmp(user_input, "quit")) break;
 
         char formatted[1400];
-        snprintf(formatted, sizeof(formatted),
-                 "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", user_input);
+        if (!session_started) {
+            /* system prompt steers language/behavior; standard chat-UI practice */
+            snprintf(formatted, sizeof(formatted),
+                     "<|im_start|>system\n%s<|im_end|>\n"
+                     "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+                     SYSTEM_PROMPT, user_input);
+            session_started = 1;
+        } else {
+            snprintf(formatted, sizeof(formatted),
+                     "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", user_input);
+        }
 
         int prompt_tokens[512];
         int n_prompt = bpe_encode(tok, formatted, prompt_tokens, 512);
