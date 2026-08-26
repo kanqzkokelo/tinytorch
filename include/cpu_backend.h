@@ -15,11 +15,19 @@ extern "C" {
  * tt_gemv_typed semantics (fp32 accumulation over 32-value blocks, same
  * dequant formulas as src/dequant_ref.c, inlined here for speed).
  *
- * Supported dtypes today (TTQ_* codes from dequant_ref.h):
- *   TTQ_Q4_0 (2): 18 B per 32 values
- *   TTQ_Q8_0 (8): 34 B per 32 values
- * Requires K % 32 == 0 for these types (same host-side contract as GPU).
- * Unsupported dtype -> -100 (mirrors tt_gemv_typed).
+ * Supported dtypes (TTQ_* codes from dequant_ref.h):
+ *   TTQ_Q4_0 (2):  18 B per 32 values
+ *   TTQ_Q8_0 (8):  34 B per 32 values
+ *   TTQ_Q4_K (12): 144 B per 256 values
+ *   TTQ_Q5_K (13): 176 B per 256 values
+ *   TTQ_Q6_K (14): 210 B per 256 values
+ * Requires K % 32 == 0 (legacy) / K % 256 == 0 (K-quants) — same host-side
+ * contract as GPU. Unsupported dtype -> -100 (mirrors tt_gemv_typed).
+ *
+ * Dispatch: on x86 with AVX2+FMA, q4_0/q8_0 rows run through intrinsics
+ * kernels (dequant-with-FMA, per-block scale folded into the accumulator);
+ * everything else is scalar. CPU_BACKEND_SCALAR=1 env forces the scalar
+ * path for A/B verification. cb_using_avx2() reports the active path.
  *
  * Threading: OpenMP row-parallel when compiled with -fopenmp and
  * n_threads > 1; serial fallback otherwise. Rows are independent, so the
@@ -42,11 +50,15 @@ extern "C" {
 
 /* Returns 0 on success, negative on error:
  *   -1   NULL pointer or M/K <= 0
- *   -100 unsupported dtype (only Q4_0/Q8_0 implemented)
- *   -101 K not a multiple of 32 for the requested block type
+ *   -100 unsupported dtype (Q4_0/Q8_0/Q4_K/Q5_K/Q6_K implemented)
+ *   -101 K not a multiple of the required block size
  */
 long tt_cpu_gemv(const void *W, int dtype, const float *x, float *y,
                  int M, int K, int n_threads);
+
+/* 1 if the AVX2+FMA fast path is active (q4_0/q8_0), 0 if scalar.
+ * Honors CPU_BACKEND_SCALAR=1 override. */
+int cb_using_avx2(void);
 
 #ifdef __cplusplus
 }
