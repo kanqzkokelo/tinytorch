@@ -255,6 +255,14 @@ int main(void) {
         int prompt_tokens[512];
         int n_prompt = bpe_encode(tok, suffix, prompt_tokens, 512);
         if (n_prompt <= 0) { fprintf(stderr, "[chat] tokenization failed\n"); continue; }
+        if (getenv("TT_DUMP_PROMPT")) {
+            fprintf(stderr, "\n[TT_DUMP_PROMPT] prompt bytes (%zu):\n----\n%s\n----\n",
+                    strlen(suffix), suffix);
+            fprintf(stderr, "[TT_DUMP_PROMPT] first %d token ids:", n_prompt);
+            for (int i = 0; i < n_prompt && i < 32; i++)
+                fprintf(stderr, " %d", prompt_tokens[i]);
+            fprintf(stderr, "\n");
+        }
 
         AsyncPrinter *ap = async_printer_start();
         struct timespec t0, t1;
@@ -296,6 +304,10 @@ int main(void) {
             } else {
                 if (qwen2_debug_copy_logits(eng, logits, VOCAB) < 0) break;
                 next_tok = tt_sample(logits, VOCAB, &sc, &rng_state, wb);
+            }
+            if (getenv("TT_DUMP_FIRST_TOK") && gen_count == 0) {
+                fprintf(stderr, "[TT_DUMP_FIRST_TOK] next_tok=%d (eos=%d, eot=151645, endoftext=151643, gemma_end_of_turn=106)\n",
+                        next_tok, tok->eos_id);
             }
             if (next_tok < 0 || next_tok == tok->eos_id ||
                 next_tok == 151643 /* <|endoftext|> */ ||

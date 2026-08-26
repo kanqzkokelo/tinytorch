@@ -193,7 +193,7 @@ check("qwen3 add_empty_think golden",
 g_conv_sys = fmt(TT_CHAT_GEMMA, [("system", SYS), ("user", U1)])
 check("gemma single+system golden",
       g_conv_sys[0],
-      f"<bos><start_of_turn>user\n{SYS}\n\n{U1}<end_of_turn>\n"
+      f"<start_of_turn>user\n{SYS}\n\n{U1}<end_of_turn>\n"
       f"<start_of_turn>model\n")
 
 check("gemma4 identical to gemma golden",
@@ -205,7 +205,7 @@ check("gemma multiturn 3 exchanges golden",
           [("user", U1), ("assistant", A1),
            ("user", U2), ("assistant", A2),
            ("user", U3)])[0],
-      f"<bos><start_of_turn>user\n{U1}<end_of_turn>\n"
+      f"<start_of_turn>user\n{U1}<end_of_turn>\n"
       f"<start_of_turn>model\n{A1}<end_of_turn>\n"
       f"<start_of_turn>user\n{U2}<end_of_turn>\n"
       f"<start_of_turn>model\n{A2}<end_of_turn>\n"
@@ -214,21 +214,21 @@ check("gemma multiturn 3 exchanges golden",
 
 check("gemma no-system golden",
       fmt(TT_CHAT_GEMMA, [("user", U1)])[0],
-      f"<bos><start_of_turn>user\n{U1}<end_of_turn>\n"
+      f"<start_of_turn>user\n{U1}<end_of_turn>\n"
       f"<start_of_turn>model\n")
 
 check("gemma trims whitespace golden",
       fmt(TT_CHAT_GEMMA, [("user", "  padded  \n")])[0],
-      "<bos><start_of_turn>user\npadded<end_of_turn>\n"
+      "<start_of_turn>user\npadded<end_of_turn>\n"
       "<start_of_turn>model\n")
 
 check("gemma empty msg golden",
       fmt(TT_CHAT_GEMMA, [("user", "")])[0],
-      "<bos><start_of_turn>user\n<end_of_turn>\n<start_of_turn>model\n")
+      "<start_of_turn>user\n<end_of_turn>\n<start_of_turn>model\n")
 
 check("gemma unicode golden",
       fmt(TT_CHAT_GEMMA, [("user", UNI)])[0],
-      f"<bos><start_of_turn>user\n{UNI}<end_of_turn>\n"
+      f"<start_of_turn>user\n{UNI}<end_of_turn>\n"
       f"<start_of_turn>model\n")
 
 check("gemma bos off (engine injects BOS id) golden",

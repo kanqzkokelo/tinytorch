@@ -179,7 +179,11 @@ static void fmt_qwen(abuf *b, const tt_msg *msgs, int n,
 
 static void fmt_gemma(abuf *b, const tt_msg *msgs, int n,
                       const tt_chat_opts *o) {
-    if (o->add_bos_text) ab_puts(b, "<bos>");
+    /* gemma's SP-mode tokenizer auto-prepends bos_id=2 in bpe_encode;
+     * emitting the literal "<bos>" string here would be mis-tokenized
+     * (BPE splits "<bos>" into '<', 'bos', '>'), garbling the prompt prefix.
+     * Always skip for gemma regardless of opts->add_bos_text. */
+    (void)o;
 
     /* HF gemma template folds a leading system message into the first
      * user turn's prefix ({system}\n\n{user}); roles must alternate. */
