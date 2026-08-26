@@ -136,6 +136,27 @@ __global__ void k_rope(float *__restrict__ q, int n_heads, int head_dim,
     row[i + head_dim / 2] = v0 * s + v1 * c;
 }
 
+/* NEOX RoPE with per-pair frequency factors (gemma4 full-attn layers):
+ * theta divided by ff[i]; large ff => identity rotation (partial rope).
+ * ff may be NULL (all factors 1). */
+__global__ void k_rope_ff(float *__restrict__ q, int n_heads, int head_dim,
+                          const int *__restrict__ d_pos, float base,
+                          const float *__restrict__ ff) {
+    const int pos = *d_pos;
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;   /* 0..head_dim/2 */
+    const int h = blockIdx.y;
+    if (h >= n_heads || i >= head_dim / 2) return;
+
+    float *row = q + (long)h * head_dim;
+    const float freq = powf(base, -2.0f * (float)i / (float)head_dim);
+    const float div = ff ? ff[i] : 1.0f;
+    const float ang = (float)pos * freq / div;
+    const float c = cosf(ang), s = sinf(ang);
+    const float v0 = row[i], v1 = row[i + head_dim / 2];
+    row[i] = v0 * c - v1 * s;
+    row[i + head_dim / 2] = v0 * s + v1 * c;
+}
+
 /* GPT-J style RoPE: interleaved consecutive pairs (2i, 2i+1).
  * This is llama.cpp's LLAMA_ROPE_TYPE_NORM convention used by the llama
  * family (mistral/tinyllama/smollm) — oracle llama-model.cpp:3854-3875.
@@ -219,12 +240,12 @@ __global__ void k_flash_gqa(const float *__restrict__ q,
     int t0 = 0;
     if (window > 0 && pos >= window) t0 = pos - window + 1;
 
-    float qreg[8];
+    float qreg[16];
 #pragma unroll
-    for (int i = 0; i < 8; i++) qreg[i] = (i < elems) ? qh[i] : 0.0f;
+    for (int i = 0; i < 16; i++) qreg[i] = (i < elems) ? qh[i] : 0.0f;
 
     float m_prev = -1e30f, l_prev = 0.0f;
-    float oreg[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float oreg[16] = {0};
 
     /* INVARIANT: callers enforce pos < max_ctx (no ring wraparound in this loop) */
     for (int t = t0; t <= pos; t++) {
@@ -234,7 +255,7 @@ __global__ void k_flash_gqa(const float *__restrict__ q,
         const float *vp = Vc + off;
         float score = 0.0f;
 #pragma unroll
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < 16; i++)
             if (i < elems) score += qreg[i] * kp[i];
         score = warp_sum(score);
         score = __shfl_sync(0xffffffff, score, 0) * scale;
@@ -244,7 +265,7 @@ __global__ void k_flash_gqa(const float *__restrict__ q,
         const float alpha = expf(m_prev - m_new);
         l_prev = l_prev * alpha + ex;
 #pragma unroll
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < 16; i++)
             if (i < elems) oreg[i] = oreg[i] * alpha + ex * vp[i];
         m_prev = m_new;
     }
@@ -252,7 +273,7 @@ __global__ void k_flash_gqa(const float *__restrict__ q,
     const float inv_l = 1.0f / (l_prev + 1e-8f);
     float *oh = out + (long)h * head_dim + lane * elems;
 #pragma unroll
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 16; i++)
         if (i < elems) oh[i] = oreg[i] * inv_l;
 }
 
@@ -484,12 +505,14 @@ struct Qwen2Engine {
     float *d_pl_tmp;              /* [n_layers*256] staging */
     float *d_ple_row;             /* [n_layers*256] active position's block */
     float *d_ones;                /* ones vector for plain V rmsnorm */
+    int pl_hd[MAX_LAYERS];
     int pl_heads[MAX_LAYERS], pl_kv[MAX_LAYERS], pl_ffn[MAX_LAYERS];
     int pl_swa[MAX_LAYERS], pl_src[MAX_LAYERS];
     int has_pl_embd;
     int pl_dim;                   /* 256 */
     int ple_cache_tok;            /* last token id dequantized into ple_pe */
     float *ple_pe;                /* cached scaled per-layer token embed row */
+    float *d_rope_freqs;          /* [256] partial-rope factors (device) */
     int pos;
     cudaStream_t stream;
 };
@@ -673,11 +696,50 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     /* activations + caches */
     cudaMalloc(&e->d_x,  D * sizeof(float));
     cudaMalloc(&e->d_xn, D * sizeof(float));
-    cudaMalloc(&e->d_q,  (long)cfg->n_heads * cfg->head_dim * sizeof(float));
-    cudaMalloc(&e->d_att, (long)cfg->n_heads * cfg->head_dim * sizeof(float));
-    cudaMalloc(&e->d_h,  F * sizeof(float));
-    cudaMalloc(&e->d_g,  F * sizeof(float));   /* split-SwiGLU staging */
-    cudaMalloc(&e->d_u,  F * sizeof(float));
+    /* heterogeneous layers (gemma4): size staging to per-layer maxima */
+    int max_heads = cfg->n_heads, max_kv = cfg->n_kv_heads;
+    long max_ffn = F;
+    if (m && strstr(m->architecture, "gemma4") == m->architecture) {
+        const int hd_meta = cfg->head_dim;
+        for (int l = 0; l < cfg->n_layers; l++) {
+            char tn[128];
+            snprintf(tn, sizeof(tn), "blk.%d.attn_q.weight", l);
+            GGUFTensor *t = gguf_get_tensor(m, tn);
+            const long qr = t && t->ndim == 2 ? (long)t->shape[1] : -1;
+            snprintf(tn, sizeof(tn), "blk.%d.attn_k.weight", l);
+            GGUFTensor *tk = gguf_get_tensor(m, tn);
+            const long kr = tk && tk->ndim == 2 ? (long)tk->shape[1] : -1;
+            /* per-layer head_dim: gemma4 full layers carry hd=512 (8 heads),
+             * swa layers hd=256. gcd of q/k rows recovers it. */
+            long a = qr, b2 = kr;
+            if (a > 0 && b2 > 0) { while (b2) { long tt = a % b2; a = b2; b2 = tt; } }
+            e->pl_hd[l] = (qr > 0 && kr > 0) ? (int)a : hd_meta;
+            if (e->pl_hd[l] <= 0 || qr % e->pl_hd[l] != 0 || kr % e->pl_hd[l] != 0)
+                e->pl_hd[l] = hd_meta;
+            e->pl_heads[l] = qr > 0 ? (int)(qr / e->pl_hd[l]) : cfg->dim / cfg->head_dim;
+            if (e->pl_heads[l] > max_heads) max_heads = e->pl_heads[l];
+            e->pl_kv[l] = kr > 0 ? (int)(kr / e->pl_hd[l]) : cfg->n_kv_heads;
+            if (e->pl_kv[l] * e->pl_hd[l] > max_kv * hd_meta)
+                max_kv = e->pl_kv[l] * e->pl_hd[l] / hd_meta;
+            snprintf(tn, sizeof(tn), "blk.%d.ffn_down.weight", l);
+            t = gguf_get_tensor(m, tn);
+            e->pl_ffn[l] = t && t->ndim == 2 ? (int)t->shape[0] : F;
+            if (e->pl_ffn[l] > max_ffn) max_ffn = e->pl_ffn[l];
+            /* gemma4 E-series pattern: full-attn layers carry hd=512
+             * (vs swa hd=256) and take no sliding window. */
+            e->pl_swa[l] = (e->pl_hd[l] > cfg->head_dim)
+                               ? 0 : (m->sliding_window > 0 ? m->sliding_window : 512);
+            e->pl_src[l] = -1;
+        }
+        fprintf(stderr, "[qwen2-engine] hetero maxes: heads=%d kv=%d ffn=%ld "
+                "hd0=%d hd4=%d\n", max_heads, max_kv, max_ffn,
+                e->pl_hd[0], e->pl_hd[4]);
+    }
+    cudaMalloc(&e->d_q,  (long)max_heads * cfg->head_dim * sizeof(float));
+    cudaMalloc(&e->d_att, (long)max_heads * cfg->head_dim * sizeof(float));
+    cudaMalloc(&e->d_h,  max_ffn * sizeof(float));
+    cudaMalloc(&e->d_g,  max_ffn * sizeof(float));   /* split-SwiGLU staging */
+    cudaMalloc(&e->d_u,  max_ffn * sizeof(float));
     /* gemma4 MatFormer per-layer embeddings */
     e->has_pl_embd = 0;
     e->pl_dim = 0;
@@ -695,6 +757,8 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
                 cudaMemcpy(dpj, tm->data, tm->size_bytes, cudaMemcpyHostToDevice);
                 e->pl_model_proj.ptr = dpj;
                 e->pl_model_proj.dtype = (int)tm->type;
+                                fprintf(stderr, "[qwen2-engine] pl_model_proj type=%d size=%ld ne=[%ld,%ld]\n",
+                        (int)tm->type, tm->size_bytes, tm->shape[0], tm->shape[1]);
             } else { e->has_pl_embd = 0; }
         }
         if (e->has_pl_embd) {
@@ -707,41 +771,36 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
                 if (tn2 && tn2->data && tn2->size_bytes >= 256*4)
                     memcpy(e->pl_proj_norm_host, tn2->data, 256 * sizeof(float));
             }
-            cudaMalloc(&e->d_ones, c_kvdim_for(cfg) * sizeof(float));
+            const int ones_n = max_kv * cfg->head_dim;
+            cudaMalloc(&e->d_ones, ones_n * sizeof(float));
             {
-                float *ones = (float *)malloc(c_kvdim_for(cfg) * sizeof(float));
-                for (int i = 0; i < c_kvdim_for(cfg); i++) ones[i] = 1.0f;
-                cudaMemcpy(e->d_ones, ones, c_kvdim_for(cfg) * sizeof(float),
+                float *ones = (float *)malloc(ones_n * sizeof(float));
+                for (int i = 0; i < ones_n; i++) ones[i] = 1.0f;
+                cudaMemcpy(e->d_ones, ones, ones_n * sizeof(float),
                            cudaMemcpyHostToDevice);
                 free(ones);
             }
             e->ple_pe = (float *)malloc(row * sizeof(float));
+            cudaMalloc(&e->d_rope_freqs, 256 * sizeof(float));
+            cudaMemset(e->d_rope_freqs, 0, 256 * sizeof(float));
             fprintf(stderr, "[qwen2-engine] MatFormer per-layer embeddings ON "
                             "(pl_dim=%d)\n", e->pl_dim);
 
-            /* derive heterogeneous per-layer geometry from tensor shapes:
-             * heads = attn_q_out / head_dim; kv = attn_k_out / head_dim;
-             * ffn = ffn_down ne[0]. Global layers (every 5th on E-series)
-             * carry 16 heads vs 8, and kv 2 vs 1. */
-            const int hd_meta = m->head_dim > 0 ? m->head_dim : 256;
-            for (int l = 0; l < cfg->n_layers; l++) {
-                char qn[128], kn[128], dn[128];
-                snprintf(qn, sizeof(qn), "blk.%d.attn_q.weight", l);
-                snprintf(kn, sizeof(kn), "blk.%d.attn_k.weight", l);
-                snprintf(dn, sizeof(dn), "blk.%d.ffn_down.weight", l);
-                GGUFTensor *tq = gguf_get_tensor(m, qn);
-                GGUFTensor *tk = gguf_get_tensor(m, kn);
-                GGUFTensor *td = gguf_get_tensor(m, dn);
-                e->pl_heads[l] = tq ? (int)(tq->shape[1] / hd_meta) : cfg->dim / cfg->head_dim;
-                e->pl_kv[l]    = tk ? (int)(tk->shape[1] / hd_meta) : 0;
-                e->pl_ffn[l]   = td ? (int)(td->shape[0]) : 0;
-                e->pl_swa[l]   = m->sliding_window > 0 ? m->sliding_window : 512;
-                e->pl_src[l]   = -1;
+            /* rope_freqs [256] f32: partial-rope factors for FULL attn layers.
+             * ggml semantics: theta/ff — pairs with ff=1e30 don't rotate. */
+            {
+                GGUFTensor *trf = gguf_get_tensor(m, "rope_freqs.weight");
+                if (trf && trf->data && trf->size_bytes >= 256 * 4)
+                    cudaMemcpy(e->d_rope_freqs, trf->data, 256 * sizeof(float),
+                               cudaMemcpyHostToDevice);
             }
+
+            /* pl_heads/kv/ffn already derived above from tensor shapes */
         }
     }
     cudaMalloc(&e->d_logits, (long)e->cfg.vocab * sizeof(float));
-    const long cache_per = (long)cfg->n_kv_heads * cfg->max_ctx * cfg->head_dim;
+    /* per-layer max kv width: gemma4 full layers carry 2x the kv heads */
+    const long cache_per = (long)max_kv * cfg->max_ctx * cfg->head_dim;
     cudaMalloc(&e->d_kc, cache_per * cfg->n_layers * sizeof(float));
     cudaMalloc(&e->d_vc, cache_per * cfg->n_layers * sizeof(float));
     /* Zero every scratch/cache buffer: parity gates compare raw floats, so any
@@ -759,7 +818,7 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     cudaMemset(e->d_u, 0, F * sizeof(float));
     cudaMemset(e->d_logits, 0, (long)e->cfg.vocab * sizeof(float));
     cudaMemset(e->d_x, 0, D * sizeof(float));
-    const long kvdim_alloc = (long)cfg->n_kv_heads * cfg->head_dim;
+    const long kvdim_alloc = (long)max_kv * cfg->head_dim;   /* per-layer max */
     cudaMalloc(&e->d_k_stage, kvdim_alloc * sizeof(float));
     cudaMalloc(&e->d_v_stage, kvdim_alloc * sizeof(float));
     cudaMemset(e->d_k_stage, 0, kvdim_alloc * sizeof(float));
@@ -911,16 +970,48 @@ void qwen2_debug_profile_report(int nsteps) {
     printf("PROFILE %-12s %8.3f\n", "TOTAL(med)", total);
 }
 
+__global__ void k_fill_const(float *p, int n, float v) {
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) p[i] = v;
+}
+static void eng_rms(Qwen2Engine *e, const float *d_ptr, const char *tag, int n) {
+    static float buf[4096];
+    cudaMemcpy(buf, d_ptr, n * 4, cudaMemcpyDeviceToHost);
+    cudaStreamSynchronize(e->stream);
+    double s = 0;
+    for (int i = 0; i < n; i++) s += (double)buf[i]*buf[i];
+    fprintf(stderr, "[e4-L%d] %s rms=%.4f\n", e->pos, tag, sqrt(s/n));
+}
+static void ple_canary(Qwen2Engine *e, const char *tag, int l) {
+    static float buf[8960];
+    const long n = (long)e->cfg.n_layers * e->pl_dim;
+    cudaMemcpy(buf, e->d_ple_row, n * 4, cudaMemcpyDeviceToHost);
+    cudaStreamSynchronize(e->stream);
+    int bad = -1;
+    for (long i = 5376; i < n && bad < 0; i++) if (buf[i] != -777.0f) bad = (int)i;
+    fprintf(stderr, "[CANARY] L%d %s firstbad=%d\n", l, tag, bad);
+}
 static int forward_layers(Qwen2Engine *e) {
     const TTConfig *c = &e->cfg;
     const int HD = c->head_dim;
-    const long cache_layer = (long)c->n_kv_heads * c->max_ctx * HD;
+    long cache_layer = c->n_kv_heads * (long)c->max_ctx * HD;   /* stride matches alloc */
+    if (e->pl_hd[0] > 0) {
+        long mx = 0;
+        for (int l = 0; l < c->n_layers; l++) {
+            const long w2 = (long)e->pl_kv[l] * e->pl_hd[l];
+            if (w2 > mx) mx = w2;
+        }
+        cache_layer = mx * c->max_ctx;
+    }
     dim3 g, b;
 
+    static int trace = -1;
+    if (trace < 0) trace = getenv("TT_TRACE") ? 1 : 0;
     for (int l = 0; l < c->n_layers; l++) {
         LayerW *w = &e->L[l];
         float *Kl_f = e->d_kc + l * cache_layer;
         float *Vl_f = e->d_vc + l * cache_layer;
+        if (trace) fprintf(stderr, "[FWD] L%d enter\n", l);
 
         /* Cache layout: [slot][kv_head * head_dim] so each GEMV output of
          * width n_kv_heads*HD lands contiguously per slot.
@@ -939,12 +1030,15 @@ static int forward_layers(Qwen2Engine *e) {
         if (tt_profiling()) tt_prof_end(TT_P_RMSNORM, e->stream);
 
         CHK_STAGE("1 rmsnorm");
+        if (trace && l == 0) { eng_rms(e, e->d_xn, "xn", c->dim); }
         /* 2. projections: q -> d_q ; k,v -> KV cache slot pos */
         if (tt_profiling()) tt_prof_begin(TT_P_QKV, e->stream);
         const int H_l = e->pl_heads[l] > 0 ? e->pl_heads[l] : c->n_heads;
         const int KV_l = e->pl_kv[l] > 0 ? e->pl_kv[l] : c->n_kv_heads;
         const int FF_l = e->pl_ffn[l] > 0 ? e->pl_ffn[l] : c->hidden_dim;
-        const int attn_qout = H_l * HD;
+        const int HDl = e->pl_hd[l] > 0 ? e->pl_hd[l] : HD;
+        const int attn_qout = H_l * HDl;
+        const int kvdim_l = KV_l * HDl;
         int qrc = tt_gemv_typed(w->q.ptr, w->q.dtype, e->d_xn, e->d_q,
                       attn_qout, c->dim, e->stream);
         if (qrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] q gemv rc=%d\n", qrc);
@@ -963,11 +1057,11 @@ static int forward_layers(Qwen2Engine *e) {
          * q/k projections (+biases) and RoPE; branch is dead for every
          * family without the trait. */
         if (c->tr.qk_norm_rms) {
-            const int qkthreads = HD < 256 ? HD : 256;
-            k_qk_norm_rms<<<c->n_heads, qkthreads, qkthreads * sizeof(float), e->stream>>>
-                (e->d_q, w->q_norm, c->n_heads, HD, c->tr.qk_norm_eps);
+            const int qkthreads = HDl < 256 ? HDl : 256;
+            k_qk_norm_rms<<<H_l, qkthreads, qkthreads * sizeof(float), e->stream>>>
+                (e->d_q, w->q_norm, H_l, HDl, c->tr.qk_norm_eps);
             k_qk_norm_rms<<<KV_l, qkthreads, qkthreads * sizeof(float), e->stream>>>
-                (e->d_k_stage, w->k_norm, c->n_kv_heads, HD, c->tr.qk_norm_eps);
+                (e->d_k_stage, w->k_norm, KV_l, HDl, c->tr.qk_norm_eps);
         }
 
         CHK_STAGE("2b biases+qknorm");
@@ -977,43 +1071,66 @@ static int forward_layers(Qwen2Engine *e) {
         static int no_rope = -1;
         if (no_rope < 0) no_rope = getenv("TT_NO_ROPE") ? 1 : 0;
         if (!no_rope) {
+            /* gemma4: full-attn layers (16 heads) use base 1e6 + partial-rope
+             * freq factors (theta/ff); swa layers use base 1e4, full rotation. */
+            const int is_full_l = (e->pl_swa[l] == 0);
+            const float base_l = e->has_pl_embd
+                ? (is_full_l ? 1e6f : 1e4f) : c->rope_base;
+            const float *ff_l = (e->has_pl_embd && is_full_l) ? e->d_rope_freqs : NULL;
             void (*rope_fn)(float *, int, int, const int *, float) =
                 (c->tr.rope == ROPE_GPTJ) ? k_rope_gptj : k_rope;
-            g.x = (HD / 2 + 63) / 64; g.y = c->n_heads; g.z = 1;
+            g.x = (HDl / 2 + 63) / 64; g.y = H_l; g.z = 1;
             b.x = 64; b.y = 1; b.z = 1;
-            rope_fn<<<g, b, 0, e->stream>>>(e->d_q, c->n_heads, HD, e->d_pos, c->rope_base);
-            g.x = (HD / 2 + 63) / 64; g.y = c->n_kv_heads; g.z = 1;
-            rope_fn<<<g, b, 0, e->stream>>>(e->d_k_stage, c->n_kv_heads, HD, e->d_pos, c->rope_base);
+            if (ff_l)
+                k_rope_ff<<<g, b, 0, e->stream>>>(e->d_q, H_l, HDl, e->d_pos, base_l, ff_l);
+            else
+                rope_fn<<<g, b, 0, e->stream>>>(e->d_q, H_l, HDl, e->d_pos, base_l);
+            g.x = (HDl / 2 + 63) / 64; g.y = KV_l; g.z = 1;
+            if (ff_l)
+                k_rope_ff<<<g, b, 0, e->stream>>>(e->d_k_stage, KV_l, HDl, e->d_pos, base_l, ff_l);
+            else
+                rope_fn<<<g, b, 0, e->stream>>>(e->d_k_stage, KV_l, HDl, e->d_pos, base_l);
         }
 
         /* v projection + bias (QKV group) */
-        int vrc = tt_gemv_typed(w->v.ptr, w->v.dtype, e->d_xn, e->d_v_stage, c->n_kv_heads * HD, c->dim, e->stream);
+        int vrc = tt_gemv_typed(w->v.ptr, w->v.dtype, e->d_xn, e->d_v_stage, kvdim_l, c->dim, e->stream);
         if (vrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] v gemv rc=%d\n", vrc);
         if (w->v_bias)
             k_add<<<(kvdim + 255) / 256, 256, 0, e->stream>>>(e->d_v_stage, w->v_bias, kvdim);
+        /* gemma4: plain per-head RMSNorm on V (no gamma) — ones-gamma trick */
+        if (e->has_pl_embd) {
+            const int vt = HDl < 256 ? HDl : 256;
+            k_qk_norm_rms<<<KV_l, vt, vt * sizeof(float), e->stream>>>(
+                e->d_v_stage, e->d_ones, KV_l, HDl, c->rms_eps);
+        }
         if (tt_profiling()) tt_prof_end(TT_P_QKV, e->stream);
 
         /* scatter staged K/V into the cache slot chosen by *d_pos.
          * Must precede flash attention. */
         if (tt_profiling()) tt_prof_begin(TT_P_SCATTER, e->stream);
-        k_kv_scatter<<<(kvdim + 255) / 256, 256, 0, e->stream>>>(
+        k_kv_scatter<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(
             e->d_k_stage, e->d_v_stage, Kl_f, Vl_f, e->d_pos,
-            c->n_kv_heads, HD, c->max_ctx);
+            KV_l, HD, c->max_ctx);
         if (tt_profiling()) tt_prof_end(TT_P_SCATTER, e->stream);
 
         CHK_STAGE("3 rope");
         /* 4. GQA flash attention over slots [t0..pos]; t0 raised by the SWA
          * trait (gemma2), full [0..pos] when swa_size == 0 (qwen2 unchanged). */
         if (tt_profiling()) tt_prof_begin(TT_P_FLASH, e->stream);
-        k_flash_gqa<<<c->n_heads, 32, 0, e->stream>>>(
+        k_flash_gqa<<<H_l, 32, 0, e->stream>>>(
             e->d_q, Kl_f, Vl_f, e->d_att,
             e->d_pos,
-            c->n_heads, c->n_kv_heads, HD, c->max_ctx,
+            H_l, KV_l, HDl, c->max_ctx,
             (c->tr.attn_scale_one ? 1.0f : 1.0f / sqrtf((float)HD)),
-            c->tr.swa_size);
+            e->has_pl_embd ? e->pl_swa[l] : c->tr.swa_size);
         if (tt_profiling()) tt_prof_end(TT_P_FLASH, e->stream);
 
         CHK_STAGE("4 flash");
+        if (trace && l == 0) {
+            eng_rms(e, e->d_v_stage, "v", kvdim_l);
+            eng_rms(e, e->d_att, "ao", attn_qout);
+        }
+        if (trace && e->has_pl_embd && l >= 18 && l <= 21) ple_canary(e, "flash", l);
         /* 5. Wo projection + residual: x += att @ Wo^T */
         if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
         int orc_ = tt_gemv_typed(w->o.ptr, w->o.dtype, e->d_att, e->d_xn, c->dim, attn_qout, e->stream);
@@ -1025,6 +1142,14 @@ static int forward_layers(Qwen2Engine *e) {
                 c->tr.norm_offset);
         k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
         if (tt_profiling()) tt_prof_end(TT_P_OMLP, e->stream);
+        if (trace && l == 0) {
+            static float ao2[4096];
+            /* o-proj output lands in d_xn pre-residual */
+            eng_rms(e, e->d_xn, "attn_out_raw", c->dim);
+            (void)ao2;
+        }
+        if (trace && l == 0) eng_rms(e, e->d_x, "x_after_attn", c->dim);
+        if (trace && e->has_pl_embd && l >= 18 && l <= 21) ple_canary(e, "oproj", l);
 
         /* 6. ffn norm */
         if (tt_profiling()) tt_prof_begin(TT_P_RMSNORM, e->stream);
@@ -1037,24 +1162,25 @@ static int forward_layers(Qwen2Engine *e) {
          * Then down projection + residual. */
         if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
         const int act_gelu = (c->tr.act == ACT_GELU) ? 1 : 0;
-        if (w->gate.dtype == GGUF_TYPE_Q4_0 && w->up.dtype == GGUF_TYPE_Q4_0) {
+        if (w->gate.dtype == GGUF_TYPE_Q4_0 && w->up.dtype == GGUF_TYPE_Q4_0
+            && !e->has_pl_embd) {   /* gemma4: force typed path until fused-GELU is validated */
             tt_ffn_q4_0(w->gate.ptr, w->up.ptr, e->d_xn, e->d_h,
-                        c->hidden_dim, c->dim, act_gelu, e->stream);
+                        FF_l, c->dim, act_gelu, e->stream);
         } else {
             int grc = tt_gemv_typed(w->gate.ptr, w->gate.dtype, e->d_xn, e->d_g,
-                          c->hidden_dim, c->dim, e->stream);
+                          FF_l, c->dim, e->stream);
             if (grc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] gate gemv rc=%d\n", grc);
             CHK_STAGE("7a gate-gemv");
             int urc = tt_gemv_typed(w->up.ptr, w->up.dtype, e->d_xn, e->d_u,
-                          c->hidden_dim, c->dim, e->stream);
+                          FF_l, c->dim, e->stream);
             if (urc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] up gemv rc=%d\n", urc);
             CHK_STAGE("7b up-gemv");
-            k_swiglu_apply<<<(c->hidden_dim + 255) / 256, 256, 0, e->stream>>>(
-                e->d_g, e->d_u, e->d_h, c->hidden_dim, act_gelu);
+            k_swiglu_apply<<<(FF_l + 255) / 256, 256, 0, e->stream>>>(
+                e->d_g, e->d_u, e->d_h, FF_l, act_gelu);
             CHK_STAGE("6b swiglu-apply");
         }
         int drc = tt_gemv_typed(w->down.ptr, w->down.dtype, e->d_h, e->d_xn,
-                      c->dim, c->hidden_dim, e->stream);
+                      c->dim, FF_l, e->stream);
         if (drc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] down gemv rc=%d\n", drc);
         CHK_STAGE("7c down-gemv");
         /* gemma2 sandwich: normalize the MLP output before residual */
@@ -1066,12 +1192,28 @@ static int forward_layers(Qwen2Engine *e) {
         CHK_STAGE("7d add");
         if (tt_profiling()) tt_prof_end(TT_P_OMLP, e->stream);
         CHK_STAGE("7 mlp");
+        if (trace && l == 0) {
+            eng_rms(e, e->d_h, "gu", FF_l);
+            eng_rms(e, e->d_xn, "mlp_pre_norm", c->dim);
+        }
+        if (trace && l == 0) eng_rms(e, e->d_xn, "mlp_raw", c->dim);
+        if (trace && e->has_pl_embd && l >= 18 && l <= 21) ple_canary(e, "mlp", l);
+        if (trace) {
+            static float xt[1536];
+            cudaMemcpy(xt, e->d_x, c->dim * 4, cudaMemcpyDeviceToHost);
+            cudaStreamSynchronize(e->stream);
+            double s2 = 0; int nn = 0;
+            for (int i = 0; i < c->dim; i++) { s2 += (double)xt[i]*xt[i]; if (isnan(xt[i])) nn++; }
+            fprintf(stderr, "[FWD] L%d done rms=%.4f nan=%d\n", l, sqrt(s2/c->dim), nn);
+        }
 
         /* gemma4 MatFormer per-layer embedding block (all host round-trips;
          * pl_dim=256 so data movement is trivial). Order per build_gemma4:
          *   g = gelu(inp_gate @ x) * PLE[l] ; p = rmsnorm(pl_proj @ g) ;
          *   x += p ; x *= layer_output_scale                        */
-        if (e->has_pl_embd) {
+        static int no_ple2 = -1;
+        if (no_ple2 < 0) no_ple2 = getenv("TT_NO_PLE") ? 1 : 0;
+        if (e->has_pl_embd && !no_ple2) {
             const int slot = e->pos % c->max_ctx;
             static float gbuf[1024];
             static float ple_slice[1024];
@@ -1087,8 +1229,23 @@ static int forward_layers(Qwen2Engine *e) {
             /* fetch this position's PLE row + pe slice for layer l */
             cudaMemcpy(ple_slice, e->d_ple_row + (long)l * 256,
                        256 * sizeof(float), cudaMemcpyDeviceToHost);
+            if (trace && l >= 19 && l <= 22) {
+                static float whole[35 * 256];
+                cudaMemcpy(whole, e->d_ple_row, 35 * 256 * sizeof(float),
+                           cudaMemcpyDeviceToHost);
+                int nb = 0;
+                for (int i = 0; i < 35 * 256; i++) if (isnan(whole[i])) nb++;
+                fprintf(stderr, "[PLEW] L%d row-nan=%d slice0=%.4f\n", l, nb, whole[0]);
+            }
             memcpy(pe_slice, e->ple_pe + (long)l * 256, 256 * sizeof(float));
 
+            if (trace) {
+                int bad = 0;
+                for (int i = 0; i < e->pl_dim; i++)
+                    if (isnan(gbuf[i]) || isnan(ple_slice[i])) bad++;
+                fprintf(stderr, "[PLEB] L%d bad=%d g[0]=%.4f ps[0]=%.4f\n",
+                        l, bad, gbuf[0], ple_slice[0]);
+            }
             /* gelu then elementwise multiply by PLE slice — NOTE: per
              * build_gemma4 the multiply happens AFTER gelu but the residual
              * uses pre-gate cur; also pe is added post-projection in
@@ -1100,8 +1257,22 @@ static int forward_layers(Qwen2Engine *e) {
                 gbuf[i] *= ple_slice[i];
             }
 
+            if (getenv("TT_PLE_DEBUG") && l == 0) {
+                float s = 0, mn = 1e30f, mx = -1e30f;
+                for (int i = 0; i < e->pl_dim; i++) {
+                    s += gbuf[i];
+                    if (gbuf[i] < mn) mn = gbuf[i];
+                    if (gbuf[i] > mx) mx = gbuf[i];
+                }
+                fprintf(stderr, "[PLEDBG] L0 gated: sum=%.4f min=%.4f max=%.4f\n", s, mn, mx);
+                float ps = 0;
+                for (int i = 0; i < 8; i++) ps += ple_slice[i];
+                fprintf(stderr, "[PLEDBG] L0 ple[0..7]=%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f pe[0]=%.4f\n",
+                        ple_slice[0], ple_slice[1], ple_slice[2], ple_slice[3],
+                        ple_slice[4], ple_slice[5], ple_slice[6], ple_slice[7], pe_slice[0]);
+            }
             /* p = rmsnorm(pl_proj @ g) ; x += p ; x *= out_scale */
-            memcpy(e->d_pl_tmp, gbuf, e->pl_dim * 4);
+            cudaMemcpy(e->d_pl_tmp, gbuf, e->pl_dim * 4, cudaMemcpyHostToDevice);
             int pg = tt_gemv_typed(w->pl_proj.ptr, w->pl_proj.dtype,
                                    e->d_pl_tmp, e->d_xn, c->dim, e->pl_dim,
                                    e->stream);
@@ -1116,6 +1287,22 @@ static int forward_layers(Qwen2Engine *e) {
             if (w->out_scale_val != 0.0f && w->out_scale_val != 1.0f)
                 k_scale<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(
                     e->d_x, w->out_scale_val, c->dim);
+            if (trace) {
+                static float xs2[1536];
+                cudaMemcpy(xs2, e->d_x, c->dim * 4, cudaMemcpyDeviceToHost);
+                cudaStreamSynchronize(e->stream);
+                double s2 = 0;
+                for (int i = 0; i < c->dim; i++) s2 += (double)xs2[i]*xs2[i];
+                fprintf(stderr, "[FWD] L%d postscale_rms=%.4f\n", l, sqrt(s2/c->dim));
+            }
+            if (getenv("TT_PLE_DEBUG") && l == 0) {
+                static float xs[1536];
+                cudaMemcpy(xs, e->d_x, c->dim * 4, cudaMemcpyDeviceToHost);
+                cudaStreamSynchronize(e->stream);
+                float s = 0; int nan = 0;
+                for (int i = 0; i < c->dim; i++) { s += xs[i]; if (isnan(xs[i])) nan++; }
+                fprintf(stderr, "[PLEDBG] L0 x-after: sum=%.4f nan=%d scale=%f\n", s, nan, w->out_scale_val);
+            }
         }
 
         {
@@ -1185,16 +1372,55 @@ static int embed_token(Qwen2Engine *e, int tok) {
 
     /* gemma4: build this position's MatFormer per-layer input row.
      * Host-assisted (small data): gemv on GPU -> D2H -> CPU finish -> H2D. */
-    if (e->has_pl_embd) {
+    static int no_ple = -1;
+    if (no_ple < 0) no_ple = getenv("TT_NO_PLE") ? 1 : 0;
+    if (e->has_pl_embd && !no_ple) {
         const long row = (long)e->cfg.n_layers * e->pl_dim;
+        fprintf(stderr, "[PLE] A enter\n");
         cudaStreamSynchronize(e->stream);
+        fprintf(stderr, "[PLE] B gemv in\n");
+        cudaStreamSynchronize(e->stream);   /* ensure embed done before reading x */
+        if (getenv("TT_TRACE")) {
+            static float xt[1536];
+            cudaMemcpy(xt, e->d_x, e->cfg.dim * 4, cudaMemcpyDeviceToHost);
+            float mx = 0; int nb = 0;
+            for (int i = 0; i < e->cfg.dim; i++) {
+                if (isnan(xt[i]) || isinf(xt[i])) nb++;
+                if (fabsf(xt[i]) > mx) mx = fabsf(xt[i]);
+            }
+            fprintf(stderr, "[PLE] x-check nan/inf=%d maxabs=%.4f\n", nb, mx);
+        }
         int prc = tt_gemv_typed(e->pl_model_proj.ptr, e->pl_model_proj.dtype,
                                 e->d_x, e->d_ple_row, (int)row, e->cfg.dim,
                                 e->stream);
         cudaStreamSynchronize(e->stream);
         if (prc) return prc;
+        fprintf(stderr, "[PLE] C d2h\n");
+        if (getenv("TT_TRACE")) {
+            int nb = 0, ni = 0;
+            float mx = 0;
+            for (long i = 0; i < row; i++) {
+                if (isnan(e->ple_pe[i])) nb++;
+                if (isinf(e->ple_pe[i])) ni++;
+                if (fabsf(e->ple_pe[i]) > mx && !isinf(e->ple_pe[i])) mx = fabsf(e->ple_pe[i]);
+            }
+            fprintf(stderr, "[PLE] post-gemv nan=%d inf=%d maxabs=%.4f v[5376]=%.4f\n",
+                    nb, ni, mx, e->ple_pe[5376]);
+            {   /* CPU golden for row 5376 */
+                static float xg[1536], wg[1536];
+                cudaMemcpy(xg, e->d_x, e->cfg.dim * 4, cudaMemcpyDeviceToHost);
+                cudaStreamSynchronize(e->stream);
+                GGUFTensor *tpj = gguf_get_tensor(e->gguf, "per_layer_model_proj.weight");
+                ttq_dequant((const char *)tpj->data + 5376L * tpj->size_bytes / tpj->shape[1],
+                            tpj->type, 1536, wg);
+                double s = 0;
+                for (int i = 0; i < 1536; i++) s += (double)wg[i] * xg[i];
+                fprintf(stderr, "[PLE] cpu-row5376=%.4f gpu=%.4f\n", s, e->ple_pe[5376]);
+            }
+        }
         cudaMemcpy(e->ple_pe, e->d_ple_row, row * sizeof(float),
                    cudaMemcpyDeviceToHost);   /* reuse as staging */
+        fprintf(stderr, "[PLE] D deq\n");
 
         /* dequant per_layer_token_embd row 'tok' (q4_0), scale by sqrt(pl_dim) */
         GGUFTensor *tp = gguf_get_tensor(e->gguf, "per_layer_token_embd.weight");
@@ -1209,16 +1435,29 @@ static int embed_token(Qwen2Engine *e, int tok) {
             case TTQ_F16:  rb = row * 2; break;
             default: fprintf(stderr, "[qwen2-engine] ple: unsupported pe dtype %d (TTQ_Q5_K=%d)\n", tp->type, TTQ_Q5_K); return -11;
         }
+        /* NOTE: llama.cpp project_per_layer_inputs adds the RAW get_rows
+         * output — no sqrt(pl_dim) scaling on the token-embedding side. */
         ttq_dequant((const char *)tp->data + (long)tok * rb, tp->type, row, pe_full);
-        for (long i = 0; i < row; i++)
-            pe_full[i] *= sqrtf((float)e->pl_dim);
 
         /* CPU: per-slice rmsnorm w/ pl_proj_norm, then add pe, then *1/sqrt2 */
+        fprintf(stderr, "[PLE] E finish\n");
+        if (getenv("TT_TRACE")) {
+            int nb1 = 0, nb2 = 0;
+            for (long i = 0; i < row; i++) {
+                if (isnan(pe_full[i])) nb1++;
+                if (isnan(e->ple_pe[i])) nb2++;
+            }
+            fprintf(stderr, "[PLE] nan-check: pe_full_nan=%d ple_pe_nan=%d\n", nb1, nb2);
+        }
         ple_finish_host(e->ple_pe, e->pl_proj_norm_host, pe_full,
                         e->cfg.n_layers);
+        fprintf(stderr, "[PLE] F done\n");
 
-        cudaMemcpyAsync(e->d_ple_row, e->ple_pe, row * sizeof(float),
-                        cudaMemcpyHostToDevice, e->stream);
+        cudaMemcpy(e->d_ple_row, e->ple_pe, row * sizeof(float),
+                   cudaMemcpyHostToDevice);
+        if (getenv("TT_TRACE"))
+            k_fill_const<<<(8960*4 - 5376*4 + 255)/256, 256, 0, e->stream>>>(
+                e->d_ple_row + 5376, 8960 - 5376, -777.0f);
     }
     return rc;
 }

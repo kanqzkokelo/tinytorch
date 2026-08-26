@@ -232,7 +232,8 @@ GGUFModel *gguf_load(const char *filepath) {
          *   q6_K: ql[128] + qh[64] + int8 scales[16] + fp16 d = 210 B / 256
          */
         if (t->type == GGUF_TYPE_F32) t->size_bytes = numel * 4;
-        else if (t->type == GGUF_TYPE_F16) t->size_bytes = numel * 2;
+        else if (t->type == GGUF_TYPE_F16 || t->type == GGUF_TYPE_BF16)
+            t->size_bytes = numel * 2;
         else if (t->type == GGUF_TYPE_Q4_0) t->size_bytes = (numel / 32) * 18;
         else if (t->type == GGUF_TYPE_Q4_1) t->size_bytes = (numel / 32) * 20;
         else if (t->type == GGUF_TYPE_Q5_0) t->size_bytes = (numel / 32) * 22;

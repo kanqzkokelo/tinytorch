@@ -21,6 +21,7 @@ typedef enum {
     GGUF_TYPE_Q4_K = 12, /* Q4_K_S files use this layout */
     GGUF_TYPE_Q5_K = 13, /* Q5_K_S files use this layout */
     GGUF_TYPE_Q6_K = 14,
+    GGUF_TYPE_BF16 = 30, /* gemma4 per_layer_model_proj */
 } GGUFType;
 
 // Block layout for Q4_0: 32 FP16 values stored in 16 bytes of nibbles + 1 FP16 scale d
