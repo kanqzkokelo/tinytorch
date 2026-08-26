@@ -36,7 +36,7 @@ dequant-fp32 accumulation).
 | llama | Llama-3.2-1B | q8_0 | ✅ 7/7 unmodified (src/arch_registry.c:91) |
 | phi2 | phi-2 | — | 🚫 scoped out: needs LayerNorm kernels + epsilon-key alias; analysis in src/arch_registry.c:101 |
 | gemma2 | Gemma2-2B | q6_K | ⚠️ 6/7 (was 7/7; re-verified during M8 session) |
-| gemma4 | Gemma-4-E2B | q4_0 | 🚧 IN PROGRESS — see note below |
+| gemma4 | Gemma-4-E2B | q4_0 | ✅ 6/7 m84 gate (median ≤0.6) |
 
 Quant kernels: q4_0, q4_1, q5_0, q5_1, q8_0, q4_K(+S), q5_K(+S), q6_K — all
 golden-verified against gguf-py dequantization on real model bytes.
@@ -47,7 +47,7 @@ Gates: `./scripts/verify.sh ple` (PLE golden 3/3, ~1e-5),
 `./scripts/verify.sh tok` (tokenizer conformance vs llama-tokenize oracle —
 **honestly failing**; documented gaps: simplified pre-tokenization regex,
 greedy SP matching instead of unigram Viterbi — see header of
-`tests/gate_tokenizer.py`), `./scripts/verify.sh m84` (gemma4 parity, pending).
+`tests/gate_tokenizer.py`), `./scripts/verify.sh m84` (gemma4 parity 6/7 PASS).
 
 Unit tests / prototypes (each attributed to its file):
 
@@ -80,21 +80,27 @@ Research docs (`docs/plans/`): `2026-08-27-m11-vulkan-design.md`,
 `2026-08-27-moe-notes.md`, `2026-08-27-quant-roadmap.md` (IQ3_XXS verdict),
 `2026-08-26-m9-m11-roadmap.md`.
 
-### gemma4 status (M8, active)
+### gemma4 status (M8, closed)
 
 Heterogeneous mixture architecture (per-layer heads/kv/ffn/head_dim,
 KV-cache sharing layers 15–34, partial RoPE, PLE/MatFormer blocks) loads and
-runs end-to-end. Parity not yet green:
+runs end-to-end. Parity verified at the 7-prompt m84 gate:
 
-- Single-token median \|Δlogit\| **2.66** (was 22.06 before KV-cache sharing;
-  measured via `tests/gate_m84_gemma4.py` single-token probe)
-- Two-token median ~**9** — divergence under active bisection
-- Gate `./scripts/verify.sh m84` NOT passing
+- `./scripts/verify.sh m84` → **6/7 PASS** (gate bar ≥6, median ≤0.6).
+  Smoking-gun prompt `2,2202` flipped to oracle-exact: token 107, median 0.088.
+  Row 6 (`2,6890,12055,304`) is the only residual — top-1 wrong (14786 vs
+  ref 236743, argmax-d 0.242) but median 0.096 still well in-bar; left as a
+  known residual since the gate bar is met. See commit `ad29ac0`.
 - Ruled out so far: RoPE (exact per `tests/test_rope_ff.cu`); PLE stages reach
-  golden parity on L0; fixed this round: full-layer staging OOB (d_q/d_att
+  golden parity on L0; previously fixed: full-layer staging OOB (d_q/d_att
   2048→4096), K-projection half-width on hd-512 layers, BF16 loader size,
-  BOS-prepend tokenizer convention (commits 2052181, 48ecc40, 8263d39)
+  BOS-prepend tokenizer convention (commits 2052181, 48ecc40, 8263d39), and
+  the M8 final fix — scatter using per-layer head dim `HDl` instead of meta
+  `HD` so pos-1 K/V slots stop overlapping on full-attn layers (ad29ac0).
 - Golden reference: `tests/ref_gemma4_numpy.py` (NumPy forward from plan math)
+- Chat smoke: gemma-4-E2B-it produces non-EOS, template-correct replies
+  ("Hello" for "hi", "2" for "what is 2+2?"); template auto-detected from
+  arch `gemma4` → `TT_CHAT_GEMMA4` → `fmt_gemma` (start_of_turn/end_of_turn).
 
 ## Classic ML benchmarks
 
@@ -114,7 +120,7 @@ runs end-to-end. Parity not yet green:
 make lib pybind cuda cublas          # libraries
 make run_llm_gpu chat_llm_gpu        # LLM binaries (nvcc required)
 ./scripts/verify.sh m61              # LLM parity gate
-./scripts/verify.sh m84              # gemma4 parity gate (pending)
+./scripts/verify.sh m84              # gemma4 parity gate (6/7 PASS)
 ./scripts/verify.sh ple              # PLE golden gate (3/3)
 ./scripts/verify.sh tok              # tokenizer conformance (failing; gaps documented)
 ./scripts/verify.sh all              # full sweep incl. classic ML gates
