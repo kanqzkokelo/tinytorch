@@ -543,6 +543,110 @@ int tt_logits_typed(const void *dW, int dtype, const float *dx,
     return tt_gemv_typed(dW, dtype, dx, dlogits, vocab, K, stream);
 }
 
+/* templates need C++ linkage: temporarily leave the extern "C" block */
+} /* extern "C" (resumed below) */
+
+/* ---------------- batched prefill GEMM (M12 task: production) -------------- *
+ *
+ * tt_gemm_batched: Y[M,T] = W[M,K] @ X[K,T], W q4_0 (GGUF raw blocks),
+ * X row-major [K][T] (k-major), Y row-major [M][T]. Batches T tokens per
+ * weight stream so prefill pays DRAM for W once per tile instead of once per
+ * token (prototype tests/proto_batched_gemv.cu measured ~9x on 1536-wide
+ * layers at T=8).
+ *
+ * Kernel: one warp per output row, lanes stride the K/32 blocks (same shape
+ * as k_gemv_q4_0 above, identical dequant-inline math v=(q-8)*d), each lane
+ * keeps a TT_GEMM_BATCHED_MAX_T-wide accumulator so all T columns ride one
+ * weight pass. Accumulators stay in registers via full unroll; columns past
+ * T are predicated off (memory-bound kernel, wasted MACs are free).
+ *
+ * No header file exists for this TU (tt_gemv_typed itself is declared only
+ * via extern in its callers), so callers declare:
+ *
+ *   extern "C" int tt_gemm_batched(const void *W, int dtype,
+ *       const float *X (K*T floats), float *Y (M*T floats),
+ *       int M, int K, int T, cudaStream_t stream);
+ *
+ * Contract / error codes (mirrors tt_gemv_typed conventions):
+ *   returns 0 or a cuda error code;
+ *   -50   bad dims (NULL ptr, M<=0 or M > 2^22, T<=0 or T > MAX_T)
+ *   -100  unsupported dtype (only TTQ_Q4_0 implemented — the dominant
+ *         prompt-prefill case; extend with more kernels as needed)
+ *   -101  K not a multiple of 32 (legacy quant alignment)
+ *   T must be <= TT_GEMM_BATCHED_MAX_T (16): caller loops over column tiles
+ *   of <=16 tokens when n_tokens is larger.
+ */
+
+#define TT_GEMM_BATCHED_MAX_T 16
+#define TT_GEMM_BATCHED_WARPS 8
+
+template <int TILE>
+__global__ void k_gemm_batched_q4_0(const uint8_t *__restrict__ W,
+                                    const float *__restrict__ X,
+                                    float *__restrict__ Y,
+                                    int M, int K, int T) {
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= M) return;
+    const int lane = threadIdx.x;
+    const int col0 = blockIdx.y * TILE;
+    const int nt = min(TILE, T - col0);      /* live columns in this tile */
+    const int nb = K >> 5;
+    const uint8_t *rw = W + (long)row * nb * 18;
+
+    float acc[TILE];
+#pragma unroll
+    for (int t = 0; t < TILE; ++t) acc[t] = 0.f;
+
+    for (int b = lane; b < nb; b += 32) {
+        const uint8_t *blk = rw + b * 18;
+        const float d = half_at(blk);
+        const uint8_t *qs = blk + 2;
+        const float *xb = X + (size_t)b * 32 * T + col0;
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            const float vlo = (float)(qs[j] & 0x0F) - 8.0f;
+            const float vhi = (float)(qs[j] >>   4) - 8.0f;
+#pragma unroll
+            for (int t = 0; t < TILE; ++t) {
+                if (t >= nt) break;          /* straight-line predication */
+                acc[t] += d * (vlo * xb[(size_t)j * T + t]
+                             + vhi * xb[(size_t)(j + 16) * T + t]);
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < TILE; ++t) {
+        if (t >= nt) break;
+        const float v = warp_reduce_sum(acc[t]);
+        if (lane == 0) Y[(size_t)row * T + col0 + t] = v;
+    }
+}
+
+extern "C" {
+
+int tt_gemm_batched(const void *W, int dtype, const float *X, float *Y,
+                    int M, int K, int T, cudaStream_t stream) {
+    if (!W || !X || !Y || M <= 0 || M > (1 << 22) ||
+        T <= 0 || T > TT_GEMM_BATCHED_MAX_T)
+        return -50;
+    if (dtype != TTQ_Q4_0) {
+        fprintf(stderr, "[gemm-batched] unsupported dtype %d (only Q4_0)\n",
+                dtype);
+        return -100;
+    }
+    if (K <= 0 || K % 32 != 0) {
+        fprintf(stderr, "[gemm-batched] K=%d not a multiple of 32\n", K);
+        return -101;
+    }
+    dim3 block(32, TT_GEMM_BATCHED_WARPS), g;
+    g.x = (M + TT_GEMM_BATCHED_WARPS - 1) / TT_GEMM_BATCHED_WARPS;
+    g.y = (T + TT_GEMM_BATCHED_MAX_T - 1) / TT_GEMM_BATCHED_MAX_T;
+    g.z = 1;
+    k_gemm_batched_q4_0<TT_GEMM_BATCHED_MAX_T>
+        <<<g, block, 0, stream>>>((const uint8_t *)W, X, Y, M, K, T);
+    return (int)cudaGetLastError();
+}
+
 /* Typed embedding row lookup. Returns 0 or cuda err; -100 unsupported. */
 __global__ void k_embed_bf16(const uint16_t *__restrict__ W, int tok,
                              float *__restrict__ dx, int dim) {

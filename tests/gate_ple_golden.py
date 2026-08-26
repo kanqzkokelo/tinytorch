@@ -7,7 +7,7 @@ tests/ref_gemma4_numpy.py): for each token id in [2, 2202, 60000]
     emb  = token_embd_row * sqrt(1536)
     proj = per_layer_model_proj @ emb * (1/sqrt(1536))   -> reshape [35,256]
     proj = per-slice rmsnorm(proj) * per_layer_proj_norm
-    PLE  = (proj + per_layer_token_embd_row_slices) * (1/sqrt(2))
+    PLE  = (proj + per_layer_token_embd_row_slices * sqrt(256)) * (1/sqrt(2))
     -> [35*256] = [8960]
 
 Engine side: build/dump_logits with TT_DUMP_PLE=<path> makes the kernel dump
@@ -99,6 +99,10 @@ def ref_ple(tensors, mm, tok):
     proj = proj / np.sqrt(np.sum(proj * proj, axis=1, keepdims=True) / PL_DIM
                           + 1e-6) * plnorm
     pe = get_row(tensors, mm, "per_layer_token_embd.weight", tok).reshape(L, PL_DIM)
+    # llama.cpp build_inp_per_layer scales the raw get_rows output by
+    # tok_embd_scale = sqrt(n_embd_per_layer) before project_per_layer_inputs
+    # adds it to the normed projection (verified vs oracle cb_eval dumps).
+    pe = pe * np.sqrt(np.float32(PL_DIM))
     return ((proj + pe) * (1.0 / np.sqrt(2.0))).astype(np.float32)
 
 
