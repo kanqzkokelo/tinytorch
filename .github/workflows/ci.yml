@@ -1,0 +1,98 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Enumerate src/*.c for the lint matrix (Actions cannot glob natively).
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sources: ${{ steps.set.outputs.sources }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: set
+        run: echo "sources=$(ls src/*.c | jq -RSC .)" >> "$GITHUB_OUTPUT"
+
+  # gcc syntax-check every C source (CPU-only; runners have no NVIDIA GPU).
+  lint-compile:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        src: ${{ fromJson(needs.prepare.outputs.sources) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gcc
+        run: sudo apt-get update && sudo apt-get install -y gcc
+      - name: Syntax check (${{ matrix.src }})
+        run: |
+          mkdir -p build/ci_logs
+          gcc -std=c11 -fsyntax-only -DTT_IN_LIB -Iinclude -Isrc \
+            "${{ matrix.src }}" 2>&1 | tee "build/ci_logs/syntax-$(basename "${{ matrix.src }}").log"
+
+  # Compile libqwen objects with plain gcc (no CUDA toolchain needed).
+  build-gcc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gcc + OpenMP
+        run: sudo apt-get update && sudo apt-get install -y gcc libgomp1
+      - name: Compile all objects
+        run: |
+          mkdir -p build/obj
+          rc=0
+          for f in src/*.c; do
+            gcc -O1 -mavx2 -mfma -fopenmp -std=c11 -fPIC -DTT_IN_LIB \
+              -Iinclude -Isrc -c "$f" -o "build/obj/$(basename "${f%.c}").o" || rc=1
+          done
+          exit $rc
+
+  # CPU-runnable unit gates. Tokenizer oracle gate skipped (needs oracle
+  # binaries); kvcache suite does not exist in-repo yet.
+  unit-c:
+    runs-on: ubuntu-latest
+    needs: [lint-compile]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain + numpy
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc python3-numpy
+      - name: samplers
+        run: python3 tests/test_samplers.py 2>&1 | tee build_test_samplers.log
+      - name: specdec simulator
+        run: python3 tests/test_specdec_sim.py 2>&1 | tee build_test_specdec.log
+      - name: chat-template goldens
+        run: python3 tests/test_chat_template.py 2>&1 | tee build_test_chat_template.log
+      - name: kvcache
+        run: |
+          gcc -std=c99 -O2 -Wall -Wextra -Isrc -o build/test_kvcache \
+            src/kvcache.c tests/test_kvcache.c -lm
+          ./build/test_kvcache 2>&1 | tee build_test_kvcache.log
+      - name: cpu_backend (synthetic; golden-vs-GGUF skips without model)
+        run: |
+          mkdir -p build
+          gcc -O3 -mavx2 -mfma -fopenmp -std=c11 -Iinclude \
+            -DCPU_BACKEND_MAIN -o build/cpu_backend src/cpu_backend.c -lm
+          python3 tests/test_cpu_backend.py 2>&1 | tee build_test_cpu_backend.log
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: build_test_*.log
+          if-no-files-found: warn
+
+  # nvcc jobs are intentionally conditional: GitHub-hosted runners ship no
+  # NVIDIA GPU / CUDA toolchain, so this is a no-op placeholder that keeps
+  # the workflow shape ready for a self-hosted GPU runner.
+  cuda-conditional:
+    runs-on: ubuntu-latest
+    if: false # flip via self-hosted GPU runner labels when available
+    steps:
+      - uses: actions/checkout@v4
+      - name: make cuda
+        run: make cuda

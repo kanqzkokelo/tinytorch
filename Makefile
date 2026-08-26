@@ -66,12 +66,12 @@ $(BUILD)/run_llm_gpu: examples/run_llm_gpu.c src/loader_gguf.c src/arch_registry
 
 run_llm_gpu: $(BUILD)/run_llm_gpu
 
-$(BUILD)/chat_llm_gpu: examples/chat_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
+$(BUILD)/chat_llm_gpu: examples/chat_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/tokenizer_bpe.c src/async_printer.c src/chat_template.c src/samplers.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
 	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
-	  examples/chat_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/tokenizer_bpe.c src/async_printer.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
+	  examples/chat_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/tokenizer_bpe.c src/async_printer.c src/chat_template.c src/samplers.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
 	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
 
 chat_llm_gpu: $(BUILD)/chat_llm_gpu
@@ -134,3 +134,9 @@ $(BUILD)/test_gemv_typed: tools/test_gemv_typed.cu src/loader_gguf.c src/dequant
 test_gemv_typed: $(BUILD)/test_gemv_typed
 
 .PHONY: test_gemv_typed
+
+# CI: cheap CPU-only sanity (no GPU needed) -- same checks as GitHub CI.
+ci:
+	./scripts/ci_local.sh
+
+.PHONY: ci
