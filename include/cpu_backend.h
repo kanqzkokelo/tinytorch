@@ -24,10 +24,12 @@ extern "C" {
  * Requires K % 32 == 0 (legacy) / K % 256 == 0 (K-quants) — same host-side
  * contract as GPU. Unsupported dtype -> -100 (mirrors tt_gemv_typed).
  *
- * Dispatch: on x86 with AVX2+FMA, q4_0/q8_0 rows run through intrinsics
+ * Dispatch: on x86 with AVX2+FMA, all 5 dtypes run through intrinsics
  * kernels (dequant-with-FMA, per-block scale folded into the accumulator);
- * everything else is scalar. CPU_BACKEND_SCALAR=1 env forces the scalar
- * path for A/B verification. cb_using_avx2() reports the active path.
+ * K-quants use per-sub-block incremental dot product (not the q*q pair-
+ * sum trick — raw fp32 x has no quantization budget for the cross-term).
+ * CPU_BACKEND_SCALAR=1 env forces the scalar path for A/B verification.
+ * cb_using_avx2() reports the active path.
  *
  * Threading: OpenMP row-parallel when compiled with -fopenmp and
  * n_threads > 1; serial fallback otherwise. Rows are independent, so the
@@ -56,7 +58,7 @@ extern "C" {
 long tt_cpu_gemv(const void *W, int dtype, const float *x, float *y,
                  int M, int K, int n_threads);
 
-/* 1 if the AVX2+FMA fast path is active (q4_0/q8_0), 0 if scalar.
+/* 1 if the AVX2+FMA fast path is active (all 5 dtypes), 0 if scalar.
  * Honors CPU_BACKEND_SCALAR=1 override. */
 int cb_using_avx2(void);
 
