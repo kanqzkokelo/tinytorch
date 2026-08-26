@@ -82,5 +82,39 @@ int tt_traits_resolve(const GGUFModel *m, TTraits *out) {
 }
 
 const char *tt_traits_supported(void) {
-    return "qwen2, llama (mistral/tinyllama/smollm), qwen3, gemma, gemma2";
+    return "qwen2, llama (incl. llama3.x), qwen3, gemma, gemma2, gemma4";
 }
+
+/* ---------------------------------------------------------------------
+ * M6 family-broadening findings (llama-3.2 / phi-2 probes, gate_m7_arch):
+ *
+ * llama-3.2-1B (arch "llama"): PASSES 7/7 unmodified.
+ *  - GGUF conversion permutes q/k so HF half-split NEOX rope becomes
+ *    interleaved GPTJ -> existing { ROPE_GPTJ, ACT_SILU } entry correct.
+ *  - rope.freq_base=500000 read via loader suffix match; bartowski Q4_0
+ *    carries NO llama3 rope-scaling keys (Llama 3.2 has none in its HF
+ *    config; only 3.1+ 8B does). If a future GGUF ships
+ *    <arch>.rope.scaling.llama3.* (type + freq_factors vector), the loader
+ *    must parse them and the rope path must apply per-band freq factors --
+ *    currently ignored: exact at short ctx, drifts long-context.
+ *
+ * phi-2 (arch "phi2"): OUT OF SCOPE for the trait registry alone. All four
+ * gaps require kernels/qwen2_cuda.cu work (owned elsewhere). Verified
+ * against TheBloke/phi-2-GGUF Q4_0 metadata + tensor inventory:
+ *   1. LayerNorm, not RMSNorm: every norm carries .bias (beta) and
+ *      subtracts the mean (keys *.attn_norm.{weight,bias},
+ *      output_norm.{weight,bias}; eps under attention.layer_norm_EPSILON
+ *      -- loader only parses layer_norm_RMS_epsilon today).
+ *   2. Fused blk.N.attn_qkv.weight (+ .bias): kernel loads separate
+ *      attn_q/attn_k/attn_v; needs a fused-QKV split path.
+ *   3. Partial rotary: rope.dimension_count=32 vs head_dim=80. Both rope
+ *      kernels rotate the full head dim; need a rot-dim parameter
+ *      (GPTJ-style interleaved over first 32 channels only).
+ *   4. Biases on attn_output, ffn_up, ffn_down and output (lm_head);
+ *      FFN is plain GELU up/down with NO gate tensor, while the kernel
+ *      expects a gate+up pair.
+ * Loader change needed for phi2 is only an epsilon-key alias once kernels
+ * gain LayerNorm support. Do NOT add a "phi2" registry entry until then:
+ * TTraits cannot express any of the four gaps, so an entry would silently
+ * produce wrong logits instead of the current clear unsupported-arch error.
+ * --------------------------------------------------------------------- */
