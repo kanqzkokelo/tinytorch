@@ -34,11 +34,20 @@
 #ifndef APAD
 #define APAD 16
 #endif
+#ifndef MC
+#define MC 240   /* row-block: MC*(KC+APAD)*4 = 384KB, fits L2 (1.25MB) */
+#endif
 
 #ifdef TT_IN_LIB
 #include "tensor.h"
 #endif
 
+#ifndef PF_A
+#define PF_A "prefetcht0 256(%[a0],%[ix],1)\n\t"
+#endif
+#ifndef PF_B
+#define PF_B "prefetcht0 256(%[bp])\n\t"
+#endif
 /* scalar fallback for the ragged right edge (correctness only) */
 static void gemm_tail(int M, int N, int K, const float *A, const float *B,
                       float *C, int n0, int n1) {
@@ -52,6 +61,10 @@ static void gemm_tail(int M, int N, int K, const float *A, const float *B,
         }
 }
 
+/* A points at packed panel row ig, column kk-local 0. Rows advance by
+ * lda = KC+APAD floats. Bp is the Ki x NR packed B panel.
+ * 6x16 register tile: ymm0-11 accumulators, ymm12/13 packed B,
+ * ymm14 broadcast temp, k unrolled x4. */
 /* A points at packed panel row ig, column kk-local 0. Rows advance by
  * lda = KC+APAD floats. Bp is the Ki x NR packed B panel. */
 static void micro_kernel(const float *A, const float *bp0, float *C,
@@ -402,50 +415,57 @@ static void micro_kernel(const float *A, const float *bp0, float *C,
 
 void tt_sgemm_rowmajor(int M, int N, int K, const float *A, const float *B,
                        float *C, int nthreads) {
-    float *Bp = (float *)aligned_alloc(32, sizeof(float) * KC * NR);
-    float *Ap = (float *)aligned_alloc(32,
-                                       sizeof(float) * (size_t)M * (KC + APAD));
+    const int Nfull = (N / NR) * NR;
+    const int Msfx = (M / MR) * MR;
+    if (Nfull <= 0 || K <= 0) {
+        if (Nfull < N) gemm_tail(M, N, K, A, B, C, Nfull, N);
+        return;
+    }
+
+    const size_t bpanel = (size_t)KC * NR;
+    float *Bp = (float *)aligned_alloc(32, sizeof(float) * bpanel * NC);
+    float *Ap = (float *)aligned_alloc(
+        32, sizeof(float) * (size_t)((MC < Msfx ? MC : Msfx)) * (KC + APAD));
     if (!Bp || !Ap) {
         free(Bp);
         free(Ap);
         return;
     }
 
-    const int Nfull = (N / NR) * NR;
-    const int Msfx = (M / MR) * MR;
-
     for (int jc = 0; jc < Nfull; jc += NC) {
         const int jend = (jc + NC < Nfull) ? jc + NC : Nfull;
+        const int npj = (jend - jc) / NR;          /* NR-col panels in block */
         for (int kk = 0; kk < K; kk += KC) {
             const int Ki = (kk + KC <= K) ? KC : K - kk;
-            for (int i = 0; i < M; i++)   /* pack A panel */
-                memcpy(Ap + (size_t)i * (KC + APAD), A + (long)i * K + kk,
-                       sizeof(float) * Ki);
-            for (int jj = jc; jj < jend; jj += NR) {
-                for (int k2 = 0; k2 < Ki; k2++)   /* pack B panel */
-                    memcpy(Bp + (size_t)k2 * NR,
-                           B + (long)(kk + k2) * N + jj,
+            /* pack all B panels of this (jc,kk) block once */
+            for (int p = 0; p < npj; p++)
+                for (int k2 = 0; k2 < Ki; k2++)
+                    memcpy(Bp + p * bpanel + (size_t)k2 * NR,
+                           B + (long)(kk + k2) * N + jc + (long)p * NR,
                            sizeof(float) * NR);
+            for (int ic = 0; ic < Msfx; ic += MC) {
+                const int mi = (ic + MC <= Msfx) ? MC : Msfx - ic;
+                for (int r = 0; r < mi; r++)       /* pack A row panel */
+                    memcpy(Ap + (size_t)r * (KC + APAD),
+                           A + (long)(ic + r) * K + kk,
+                           sizeof(float) * Ki);
 #ifdef _OPENMP
-#pragma omp parallel for num_threads(nthreads) schedule(static)
+#pragma omp parallel for num_threads(nthreads) schedule(static) collapse(2)
 #endif
-                for (int ig = 0; ig < Msfx; ig += MR)
-                    micro_kernel(Ap + (size_t)ig * (KC + APAD), Bp,
-                                 C + (long)ig * N + jj, KC + APAD, N, Ki, kk == 0);
-                for (int i = Msfx; i < M; i++) {  /* tail rows */
-                    float *crow = C + (long)i * N + jj;
-                    for (int k2 = 0; k2 < Ki; k2++) {
-                        const float av = Ap[(size_t)i * (KC + APAD) + k2];
-                        const float *bq = Bp + (size_t)k2 * NR;
-                        for (int j = 0; j < NR; j++)
-                            crow[j] = (kk == 0 && k2 == 0 ? 0.0f : crow[j]) + av * bq[j];
-                    }
-                }
+                for (int p = 0; p < npj; p++)
+                    for (int ig = 0; ig < mi; ig += MR)
+                        micro_kernel(Ap + (size_t)ig * (KC + APAD),
+                                     Bp + p * bpanel,
+                                     C + (long)(ic + ig) * N + jc + (long)p * NR,
+                                     KC + APAD, N, Ki, kk == 0);
             }
         }
     }
     free(Bp);
     free(Ap);
+    if (Msfx < M)                      /* tail rows, full width */
+        gemm_tail(M - Msfx, Nfull, K, A + (long)Msfx * K, B,
+                  C + (long)Msfx * N, 0, Nfull);
     if (Nfull < N)                     /* ragged right edge, full K */
         gemm_tail(M, N, K, A, B, C, Nfull, N);
 }
