@@ -7,9 +7,25 @@
 //    tokenizer.ggml.merges, not greedy longest-substring scan.
 //  - Unknown bytes fall back to <0xNN> tokens instead of being dropped.
 //
-// Known limitation vs llama.cpp (documented in PLAN_M6): pre-tokenization uses
-// a simplified boundary rule, not Qwen's full GPT-4-style regex. Gate T2
-// (100% ID parity) may fail on exotic inputs until that regex is ported.
+// Pre-tokenization (M6.1 correctness rewrite): full hand-rolled port of the
+// llama.cpp unicode.cpp regex splitters over decoded codepoints:
+//   pre="qwen2"  -> QWEN2 splitter  ((?i:contractions)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?punct+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)
+//   pre="llama-bpe" etc -> LLAMA3 splitter (same shape, \p{N}{1,3} digit groups)
+//                          + ignore_merges (whole-piece vocab hit skips BPE)
+//   pre="smollm" -> two-pass: isolate every \p{N} codepoint, then GPT2 splitter
+//   default      -> GPT2 splitter ('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+)
+// \p{L}/\p{N}/\s classification comes from the oracle's own unicode_ranges_flags
+// table (src/tokenizer_uni_table.inc, generated from oracle/llama.cpp), so the
+// classes match bit-for-bit including the UNDEFINED-bit punct-matchable rule.
+// The \s+(?!\S) subtlety is replicated exactly: an interior whitespace run
+// emits all but its last char; the trailing space attaches to the next piece.
+//
+// Known remaining limitation (documented): sp_mode (ggml.model=="llama"/"ugm",
+// e.g. gemma SPM vocabs) still uses greedy longest-piece matching instead of a
+// scored unigram Viterbi. NOTE: every gate model in data/testmodels/ is
+// tokenizer.ggml.model=="gpt2" (BPE) — smollm2 included (pre=smollm is BPE) —
+// so the gate exercises no SP path at all and no ugm vocab is available locally
+// to validate Viterbi against.
 #include "tokenizer_bpe.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -107,6 +123,14 @@ static int hm_get(HashMap *m, const char *key, int klen) {
 
 #define MAX_SYM_BYTES 64   /* single BPE word chunk bound */
 
+/* ---------------- BPE pre-tokenizer families (mirror llama-vocab.cpp) ------- */
+enum {
+    PRE_GPT2 = 0,   /* 's|'t|... GPT-2 pattern (gpt-2, phi-2, unknown pre) */
+    PRE_LLAMA3,     /* llama-bpe / falcon3 / pixtral ... + ignore_merges */
+    PRE_QWEN2,      /* qwen2: like llama3 but single-digit \p{N} pieces */
+    PRE_SMOLLM,     /* smollm: \p{N} isolation pass, then GPT2 splitter */
+};
+
 /* ---------------- tokenizer object ----------------
  * Reuses BPETokenizer layout from the header and adds side tables via
  * internal struct extension (header fields stay ABI-stable). */
@@ -120,6 +144,8 @@ typedef struct {
     HashMap tok2id;      /* token bytes -> id */
     HashMap pair_rank;   /* merged-bytes -> merge rank */
     int sp_mode;         /* SentencePiece vocab ('llama'/'gemma4' ggml models) */
+    int pre_type;        /* BPE pre-tokenizer family (see PRE_* below) */
+    int ignore_merges;   /* llama3-style: whole-piece vocab hit skips BPE */
     int pre_add_bos;     /* tokenizer.ggml.pre implies BOS (llama3-style BPE) */
     int add_bos;         /* resolved add-BOS convention */
     int kv_add_bos_seen; /* explicit add_bos KV present (overrides defaults) */
@@ -187,6 +213,7 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
     Tok *t = (Tok *)calloc(1, sizeof(Tok));
     t->base.bos_id = -1;
     t->base.eos_id = -1;
+    t->pre_type = PRE_GPT2;
     build_byte_unicode_tables(t);
     /* defaults mirror llama-vocab.cpp: SPM prepends BOS, plain BPE does not;
      * refined after the KV scan by tokenizer.ggml.pre / add_bos_token */
@@ -258,6 +285,18 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
                 strcmp(pre, "midm-2.0") == 0 || strcmp(pre, "lfm2") == 0 ||
                 strcmp(pre, "jina-v5-nano") == 0 || strcmp(pre, "tekken") == 0 ||
                 strcmp(pre, "chameleon") == 0;
+            /* pick the exact regex-splitter family (see llama-vocab.cpp switch) */
+            if (strcmp(pre, "qwen2") == 0 || strcmp(pre, "deepseek-r1-qwen") == 0 ||
+                strcmp(pre, "kormo") == 0 || strcmp(pre, "f2llmv2") == 0 ||
+                strcmp(pre, "megrez") == 0)
+                t->pre_type = PRE_QWEN2;
+            else if (t->pre_add_bos && strcmp(pre, "tekken") != 0 &&
+                     strcmp(pre, "chameleon") != 0)
+                t->pre_type = PRE_LLAMA3;   /* tekken/chameleon use own patterns: approximated as GPT2 */
+            else if (strcmp(pre, "smollm") == 0)
+                t->pre_type = PRE_SMOLLM;
+            else
+                t->pre_type = PRE_GPT2;
         } else if (strcmp(key, "tokenizer.ggml.scores") == 0 && vtype == 9) {
             (void)read_u32(&p);
             const uint64_t n = read_u64(&p);
@@ -283,6 +322,7 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
         bpe_tokenizer_free(&t->base);
         return NULL;
     }
+    t->ignore_merges = (t->pre_type == PRE_LLAMA3);
     if (!t->kv_add_bos_seen)
         t->add_bos = t->sp_mode ? 1 : t->pre_add_bos;
     printf("[BPE] loaded: vocab=%d merges=%llu bos=%d eos=%d add_bos=%d\n",
@@ -353,52 +393,328 @@ const char *bpe_decode_token(const BPETokenizer *tok_, int token_id, int *out_le
 
 /* ---------------- encode ---------------- */
 
-/* character-class helpers (byte-level; UTF-8 multibyte sequences are treated
- * as opaque non-letter/non-digit symbols and handled via merges/fallback) */
-static int is_ascii_letter(unsigned char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+/* ---------------- unicode codepoint classification ----------------
+ * Exact copy of llama.cpp's unicode_ranges_flags semantics (categories +
+ * whitespace bit), generated from oracle/llama.cpp/src/unicode-data.cpp.
+ * Bits: 0x01 UNDEFINED, 0x02 NUMBER (\p{N}), 0x04 LETTER (\p{L}),
+ * 0x08 SEPARATOR(\p{Z}), 0x10 \p{M}, 0x20 \p{P}, 0x40 \p{S}, 0x80 \p{C},
+ * 0x100 WHITESPACE (\s). as_uint()!=0 <=> "defined"; UNDEFINED-only
+ * codepoints still match [^\s\p{L}\p{N}] in the reference splitters. */
+typedef struct { unsigned int start, end; unsigned short flags; } UniRange;
+static const UniRange k_uni_ranges[] = {
+#include "tokenizer_uni_table.inc"
+};
+#define UFF_NUMBER 0x002
+#define UFF_LETTER 0x004
+#define UFF_WS     0x100
+
+static unsigned short uni_flags(unsigned int cp) {
+    int lo = 0, hi = (int)(sizeof(k_uni_ranges) / sizeof(k_uni_ranges[0])) - 1;
+    if (cp > k_uni_ranges[hi].end) return 0x0001;   /* UNDEFINED */
+    while (lo <= hi) {
+        const int mid = (lo + hi) >> 1;
+        const UniRange *r = &k_uni_ranges[mid];
+        if (cp < r->start) hi = mid - 1;
+        else if (cp > r->end) lo = mid + 1;
+        else return r->flags;
+    }
+    return 0x0001;
 }
-static int is_ascii_digit(unsigned char c) { return c >= '0' && c <= '9'; }
 
-#define MAX_SYM_BYTES 96   /* single BPE word chunk bound; longer input splits */
+/* ---------------- regex-equivalent pre-tokenizers ----------------
+ * Hand-rolled ports of llama.cpp unicode.cpp custom splitters. Each scans a
+ * half-open codepoint range [lo,hi) and records piece END offsets (cpt units).
+ * Out-of-range lookups return cpt=OOR_CP / flags=0 exactly like the oracle's
+ * _get_cpt/_get_flags guards. */
+#define OOR_CP 0xFFFFFFFFu
 
-/* Simplified pre-tokenization boundaries (see top-of-file limitation note).
- * Mirrors the spirit of the Qwen/cl100k patterns:
- *   newline runs | space-led words | letter runs | digit runs (<=3) | punct runs */
-static int chunk_len(const char *s, int len) {
-    unsigned char c = (unsigned char)s[0];
-    int i = 1;
+typedef struct {
+    const uint32_t *cp;
+    int lo, hi;
+    int *ends; int ne, max_ends;
+    int prev;   /* last emitted end; invariant: prev == pos at loop top */
+} Splitter;
 
-    if (c == '\r' || c == '\n') {
-        while (i < len && ((unsigned char)s[i] == '\r' || (unsigned char)s[i] == '\n')) i++;
-        return i;
-    }
-    if (c == ' ') {
-        while (i < len && s[i] == ' ') i++;
-        /* a single leading space attaches to the following word/run */
-        if (i < len && is_ascii_letter((unsigned char)s[i])) {
-            i++;
-            while (i < len && is_ascii_letter((unsigned char)s[i]) &&
-                   i - 1 < MAX_SYM_BYTES) i++;
-        } else if (i < len && is_ascii_digit((unsigned char)s[i])) {
-            for (int d = 0; d < 3 && i < len && is_ascii_digit((unsigned char)s[i]); d++) i++;
+static uint32_t sp_cpt(const Splitter *S, int pos) {
+    return (pos >= S->lo && pos < S->hi) ? S->cp[pos] : OOR_CP;
+}
+static unsigned short sp_flags(const Splitter *S, int pos) {
+    return (pos >= S->lo && pos < S->hi) ? uni_flags(S->cp[pos]) : 0;
+}
+static void sp_add(Splitter *S, int end) {
+    if (end > S->prev && S->ne < S->max_ends) S->ends[S->ne++] = end;
+    S->prev = end;
+}
+static uint32_t ascii_lower(uint32_t c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
+/* GPT2: 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+ * ci_contractions=0 for plain gpt2 pre; oracle's custom impl is shared. */
+static void split_gpt2(Splitter *S, int ci_contractions) {
+    for (int pos = S->lo; pos < S->hi; ) {
+        const uint32_t cpt = sp_cpt(S, pos);
+
+        /* contractions (lowercase-only unless case-insensitive variant) */
+        if (cpt == '\'' && pos + 1 < S->hi) {
+            uint32_t nx = sp_cpt(S, pos + 1);
+            if (ci_contractions) nx = ascii_lower(nx);
+            if (nx == 's' || nx == 't' || nx == 'm' || nx == 'd') { pos += 2; sp_add(S, pos); continue; }
+            if (pos + 2 < S->hi) {
+                uint32_t n2 = sp_cpt(S, pos + 2);
+                if (ci_contractions) n2 = ascii_lower(n2);
+                if ((nx == 'r' && n2 == 'e') || (nx == 'v' && n2 == 'e') ||
+                    (nx == 'l' && n2 == 'l')) { pos += 3; sp_add(S, pos); continue; }
+            }
         }
-        return i;
+
+        /* flags of the optional-prefix position: cpt==' ' looks one ahead */
+        const unsigned short f2 = (cpt == ' ') ? sp_flags(S, pos + 1) : sp_flags(S, pos);
+        /*  ?\p{L}+ */
+        if (f2 & UFF_LETTER) {
+            pos += (cpt == ' ');
+            while (sp_flags(S, pos) & UFF_LETTER) pos++;
+            sp_add(S, pos); continue;
+        }
+        /*  ?\p{N}+ */
+        if (f2 & UFF_NUMBER) {
+            pos += (cpt == ' ');
+            while (sp_flags(S, pos) & UFF_NUMBER) pos++;
+            sp_add(S, pos); continue;
+        }
+        /*  ?[^\s\p{L}\p{N}]+  (f2!=0 keeps UNDEFINED-bit codepoints matchable,
+         * matching the oracle's flags2.as_uint() guard — emoji etc.) */
+        if (!(f2 & (UFF_WS | UFF_LETTER | UFF_NUMBER)) && f2) {
+            pos += (cpt == ' ');
+            unsigned short g;
+            while ((g = sp_flags(S, pos)) && !(g & (UFF_WS | UFF_LETTER | UFF_NUMBER))) pos++;
+            sp_add(S, pos); continue;
+        }
+
+        /* whitespace run */
+        int nw = 0;
+        while (sp_flags(S, pos + nw) & UFF_WS) nw++;
+        /* \s+(?!\S): interior run keeps its last space for the next piece */
+        if (nw > 1 && sp_cpt(S, pos + nw) != OOR_CP) { pos += nw - 1; sp_add(S, pos); continue; }
+        /* \s+ */
+        if (nw > 0) { pos += nw; sp_add(S, pos); continue; }
+
+        /* no matches: single codepoint piece */
+        pos++; sp_add(S, pos);
     }
-    if (is_ascii_letter(c)) {
-        while (i < len && is_ascii_letter((unsigned char)s[i]) && i < MAX_SYM_BYTES) i++;
-        return i;
+}
+
+/* LLAMA3/QWEN2:
+ * (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3 or 1}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+ */
+static void split_llama3(Splitter *S, int digit_group) {
+    for (int pos = S->lo; pos < S->hi; ) {
+        const uint32_t cpt = sp_cpt(S, pos);
+        const unsigned short f = sp_flags(S, pos);
+
+        /* (?i:contractions) */
+        if (cpt == '\'' && pos + 1 < S->hi) {
+            const uint32_t nx = ascii_lower(sp_cpt(S, pos + 1));
+            if (nx == 's' || nx == 't' || nx == 'm' || nx == 'd') { pos += 2; sp_add(S, pos); continue; }
+            if (pos + 2 < S->hi) {
+                const uint32_t n2 = ascii_lower(sp_cpt(S, pos + 2));
+                if ((nx == 'r' && n2 == 'e') || (nx == 'v' && n2 == 'e') ||
+                    (nx == 'l' && n2 == 'l')) { pos += 3; sp_add(S, pos); continue; }
+            }
+        }
+
+        /* [^\r\n\p{L}\p{N}]?\p{L}+: any single non-cr/lf/number prefix */
+        if (!(cpt == '\r' || cpt == '\n' || (f & UFF_NUMBER))) {
+            if ((f & UFF_LETTER) || (sp_flags(S, pos + 1) & UFF_LETTER)) {
+                pos++;
+                while (sp_flags(S, pos) & UFF_LETTER) pos++;
+                sp_add(S, pos); continue;
+            }
+        }
+
+        /* \p{N}{1,3} (llama3) or \p{N} (qwen2) */
+        if (f & UFF_NUMBER) {
+            if (digit_group <= 1) { pos++; sp_add(S, pos); continue; }
+            int ini = pos;
+            while (sp_flags(S, pos) & UFF_NUMBER) {
+                if (++pos - ini >= 3) { sp_add(S, pos); ini = pos; }
+            }
+            sp_add(S, pos); continue;
+        }
+
+        /* <space>?[^\s\p{L}\p{N}]+[\r\n]* */
+        const unsigned short f2 = (cpt == ' ') ? sp_flags(S, pos + 1) : f;
+        if (!(f2 & (UFF_WS | UFF_LETTER | UFF_NUMBER)) && f) {
+            pos += (cpt == ' ');
+            unsigned short g;
+            while ((g = sp_flags(S, pos)) && !(g & (UFF_WS | UFF_LETTER | UFF_NUMBER))) pos++;
+            while (sp_cpt(S, pos) == '\r' || sp_cpt(S, pos) == '\n') pos++;
+            sp_add(S, pos); continue;
+        }
+
+        /* whitespace run; remember end of last CR/LF inside it */
+        int nw = 0, last_rn = 0;
+        while (sp_flags(S, pos + nw) & UFF_WS) {
+            const uint32_t c2 = sp_cpt(S, pos + nw);
+            if (c2 == '\r' || c2 == '\n') last_rn = pos + nw + 1;
+            nw++;
+        }
+        /* \s*[\r\n]+ */
+        if (last_rn > 0) { pos = last_rn; sp_add(S, pos); continue; }
+        /* \s+(?!\S) */
+        if (nw > 1 && sp_cpt(S, pos + nw) != OOR_CP) { pos += nw - 1; sp_add(S, pos); continue; }
+        /* \s+ */
+        if (nw > 0) { pos += nw; sp_add(S, pos); continue; }
+
+        pos++; sp_add(S, pos);
     }
-    if (is_ascii_digit(c)) {
-        int d = 0;
-        while (d < 3 && i < len && is_ascii_digit((unsigned char)s[i])) { i++; d++; }
-        return i;
+}
+
+/* dispatch per family; returns number of piece-end offsets written */
+static int pretok_split(const Tok *t, const uint32_t *cp, int n, int *ends, int max_ends) {
+    Splitter S = { cp, 0, n, ends, 0, max_ends, 0 };
+    switch (t->pre_type) {
+        case PRE_QWEN2:  split_llama3(&S, 1); return S.ne;
+        case PRE_LLAMA3: split_llama3(&S, 3); return S.ne;
+        case PRE_SMOLLM: {
+            /* pass 1: std::regex fallback on \p{N} isolates every digit into
+             * its own piece (alternating digit / non-digit runs) ... */
+            int p = 0;
+            while (p < n) {
+                int q = p;
+                if (uni_flags(cp[p]) & UFF_NUMBER) q++;                     /* matched digit */
+                else while (q < n && !(uni_flags(cp[q]) & UFF_NUMBER)) q++; /* unmatched gap  */
+                /* pass 2: GPT2 splitter re-splits within each piece */
+                Splitter T = { cp, p, q, ends, S.ne, max_ends, p };
+                split_gpt2(&T, 0);
+                S.ne = T.ne;
+                p = q;
+            }
+            return S.ne;
+        }
+        default:         split_gpt2(&S, 0); return S.ne;
     }
-    /* punctuation / symbol run (UTF-8 lead bytes treated as opaque) */
-    while (i < len && s[i] != ' ' && s[i] != '\r' && s[i] != '\n' &&
-           !is_ascii_letter((unsigned char)s[i]) && !is_ascii_digit((unsigned char)s[i]) &&
-           i < MAX_SYM_BYTES) i++;
-    return i;
+}
+
+/* ---------------- BPE encode helpers ---------------- */
+
+/* Verbatim "<|name|>" special-token match against the vocab table. These
+ * tokens never appear in merge ranks, so they must be matched before regex
+ * splitting (mirrors llama.cpp tokenizer_st_partition ordering). Returns id
+ * and length, or -1. */
+static int match_special(Tok *t, const char *text, int len, int pos, int *out_slen) {
+    *out_slen = 0;
+    if (!(pos + 2 < len && text[pos] == '<' && text[pos + 1] == '|')) return -1;
+    for (const char *q = text + pos + 2; q + 1 < text + len; q++) {
+        if (q[0] == '|' && q[1] == '>') {
+            const int l = (int)(q - (text + pos)) + 2;
+            if (l < 128) {
+                char buf[128];
+                memcpy(buf, text + pos, (size_t)l);
+                const int id = hm_get(&t->tok2id, buf, l);
+                if (id >= 0) { *out_slen = l; return id; }
+            }
+            return -1;
+        }
+    }
+    return -1;
+}
+
+/* Encode one non-special segment: decode codepoints, split with the family
+ * pre-tokenizer, then run rank-based BPE merges inside each piece.
+ * Workspace buffers are caller-provided and sized to the full text. */
+static int encode_bpe_segment(Tok *t, const char *s, int slen,
+                              uint32_t *cps, int *bofs, int *ends,
+                              char *mapped, int *beg, int *sln,
+                              int *out, int cap) {
+    /* decode UTF-8 -> codepoints (+ byte offsets); invalid sequences become
+     * U+FFFD, matching oracle unicode_cpts_from_utf8 */
+    int nc = 0;
+    for (int i = 0; i < slen; ) {
+        unsigned int cp;
+        int n = utf8_dec(s + i, slen - i, &cp);
+        if (n < 0) { n = 1; cp = 0xFFFD; }
+        cps[nc] = cp; bofs[nc] = i; nc++; i += n;
+    }
+    bofs[nc] = slen;
+    if (nc == 0) return 0;
+
+    const int npieces = pretok_split(t, cps, nc, ends, nc);
+
+    int n_out = 0;
+    int p0 = 0;
+    for (int k = 0; k <= npieces; k++) {
+        const int p1 = (k < npieces) ? ends[k] : nc;
+        if (p1 <= p0) { p0 = p1; continue; }
+
+        /* map raw piece bytes into the BPE unicode domain (space -> 'Ġ') */
+        const int bstart = bofs[p0], bendv = bofs[p1];
+        int mlen = 0;
+        for (int b = bstart; b < bendv; b++)
+            mlen += utf8_enc(t->byte2cp[(unsigned char)s[b]], mapped + mlen);
+
+        /* seed one symbol per mapped CHARACTER; symbols are contiguous slices
+         * of `mapped`, so adjacent-pair concatenation is itself contiguous */
+        int nsym = 0;
+        for (int i = 0; i < mlen; ) {
+            unsigned int cp;
+            int n = utf8_dec(mapped + i, mlen - i, &cp);
+            if (n < 0) n = 1;
+            beg[nsym] = i; sln[nsym] = n; nsym++;
+            i += n;
+        }
+
+        /* llama3-style ignore_merges: whole-piece vocab hit skips BPE */
+        if (t->ignore_merges && nsym > 1) {
+            const int wid = hm_get(&t->tok2id, mapped, mlen);
+            if (wid >= 0) {
+                if (n_out >= cap) return n_out;
+                out[n_out++] = wid;
+                p0 = p1;
+                continue;
+            }
+        }
+
+        /* repeatedly merge the adjacent pair with lowest merge rank */
+        for (;;) {
+            int best_rank = INT_MAX, best_j = -1;
+            for (int j = 0; j + 1 < nsym; j++) {
+                const int r = hm_get(&t->pair_rank, mapped + beg[j], sln[j] + sln[j + 1]);
+                if (r >= 0 && r < best_rank) { best_rank = r; best_j = j; }
+            }
+            if (best_j < 0) break;
+            sln[best_j] += sln[best_j + 1];
+            memmove(beg + best_j + 1, beg + best_j + 2, sizeof(int) * (size_t)(nsym - best_j - 2));
+            memmove(sln + best_j + 1, sln + best_j + 2, sizeof(int) * (size_t)(nsym - best_j - 2));
+            nsym--;
+        }
+
+        /* map symbols to ids; unknown strings fall back to <0xNN> byte tokens */
+        for (int j = 0; j < nsym; j++) {
+            const int id = hm_get(&t->tok2id, mapped + beg[j], sln[j]);
+            if (id >= 0) {
+                if (n_out >= cap) return n_out;
+                out[n_out++] = id;
+                continue;
+            }
+            int i = beg[j];
+            const int iend = beg[j] + sln[j];
+            while (i < iend) {
+                unsigned int cp;
+                int n = utf8_dec(mapped + i, iend - i, &cp);
+                if (n < 0) { n = 1; cp = (unsigned char)mapped[i]; }
+                const signed int rb = (cp < 32768) ? t->cp2byte[cp] : -1;
+                char fb[8];
+                const int fl = snprintf(fb, sizeof(fb), "<0x%02X>",
+                                        rb >= 0 ? (unsigned)rb : (unsigned char)mapped[i]);
+                const int fid = hm_get(&t->tok2id, fb, fl);
+                if (fid >= 0) {
+                    if (n_out >= cap) return n_out;
+                    out[n_out++] = fid;
+                }
+                i += n;
+            }
+        }
+        p0 = p1;
+    }
+    return n_out;
 }
 
 int bpe_encode(const BPETokenizer *tok_, const char *text, int *out_tokens, int max_tokens) {
@@ -462,104 +778,42 @@ int bpe_encode(const BPETokenizer *tok_, const char *text, int *out_tokens, int 
         return n_out;
     }
 
-    while (pos < len && n_out < max_tokens) {
-        /* Special/control tokens have the literal form "<|name|>" and live in
-         * the vocab table but NOT in the merge ranks, so the normal chunk+BPE
-         * path can never produce them. Match them verbatim first, else chat
-         * templates degrade into BPE pieces ([<][|][im][_][start][|][>]) and
-         * the model sees a garbled prompt. */
-        if (text[pos] == '<' && pos + 2 < len && text[pos + 1] == '|') {
-            const char *close = NULL;
-            for (const char *q = text + pos + 2; q + 1 < text + len; q++)
-                if (q[0] == '|' && q[1] == '>') { close = q; break; }
-            if (close) {
-                const int slen = (int)(close - (text + pos)) + 2;
-                if (slen < 128) {
-                    char buf[128];
-                    memcpy(buf, text + pos, (size_t)slen);
-                    const int id = hm_get(&t->tok2id, buf, slen);
-                    if (id >= 0) {
-                        out_tokens[n_out++] = id;
-                        pos += slen;
-                        continue;
-                    }
-                }
-            }
-        }
-        int clen = chunk_len(text + pos, len - pos);
-        if (clen <= 0) clen = 1;
-        /* A punct/symbol run can swallow the start of a following special
-         * token ("hi!" -> chunk "!<|"). Cut the chunk right before "<|"
-         * so the next iteration's verbatim special-token match can fire. */
-        for (int k = 1; k < clen; k++) {
-            if (text[pos + k] == '<' && pos + k + 1 < len &&
-                text[pos + k + 1] == '|') { clen = k; break; }
-        }
-        const char *chunk = text + pos;
-        pos += clen;
-
-        /* map raw chunk bytes into the BPE unicode domain (space -> 'Ġ' etc.) */
-        char mapped[MAX_SYM_BYTES * 4 + 4];
-        int mlen = 0;
-        for (int i = 0; i < clen; i++)
-            mlen += utf8_enc(t->byte2cp[(unsigned char)chunk[i]], mapped + mlen);
-
-        /* seed one symbol per mapped CHARACTER (not per byte): multi-byte
-         * UTF-8 encodings of mapped codepoints act as atomic units */
-        char syms[MAX_SYM_BYTES][MAX_SYM_BYTES];
-        int slen[MAX_SYM_BYTES], nsym = 0;
-        for (int i = 0; i < mlen && nsym < MAX_SYM_BYTES; ) {
-            unsigned int cp;
-            int n = utf8_dec(mapped + i, mlen - i, &cp);
-            if (n < 0) n = 1;
-            if (nsym >= MAX_SYM_BYTES) break;
-            memcpy(syms[nsym], mapped + i, (size_t)n);
-            slen[nsym] = n;
-            nsym++;
-            i += n;
-        }
-
-        /* repeatedly merge the adjacent pair with lowest merge rank */
-        for (;;) {
-            int best_rank = INT_MAX, best_j = -1;
-            for (int j = 0; j + 1 < nsym; j++) {
-                char cat[2 * MAX_SYM_BYTES];
-                memcpy(cat, syms[j], (size_t)slen[j]);
-                memcpy(cat + slen[j], syms[j + 1], (size_t)slen[j + 1]);
-                const int r = hm_get(&t->pair_rank, cat, slen[j] + slen[j + 1]);
-                if (r >= 0 && r < best_rank) { best_rank = r; best_j = j; }
-            }
-            if (best_j < 0) break;
-            if (slen[best_j] + slen[best_j + 1] >= MAX_SYM_BYTES) break;
-            memcpy(syms[best_j] + slen[best_j], syms[best_j + 1], (size_t)slen[best_j + 1]);
-            slen[best_j] += slen[best_j + 1];
-            memmove(syms[best_j + 1], syms[best_j + 2],
-                    (size_t)(nsym - best_j - 2) * MAX_SYM_BYTES);
-            memmove(slen + best_j + 1, slen + best_j + 2,
-                    sizeof(int) * (size_t)(nsym - best_j - 2));
-            nsym--;
-        }
-
-        /* map symbols to ids; unknown strings fall back to <0xNN> byte tokens */
-        for (int j = 0; j < nsym; j++) {
-            int id = hm_get(&t->tok2id, syms[j], slen[j]);
-            if (id >= 0) {
-                out_tokens[n_out++] = id;
-            } else {
-                for (int b = 0; b < slen[j]; b++) {
-                    char fb[8];
-                    const int fl = snprintf(fb, sizeof(fb), "<0x%02X>",
-                                            (unsigned char)syms[j][b]);
-                    id = hm_get(&t->tok2id, fb, fl);
-                    if (id < 0 && n_out < max_tokens) continue;  /* no fallback token */
-                    if (n_out >= max_tokens) goto done;
-                    out_tokens[n_out++] = id;
-                }
-            }
-            if (n_out >= max_tokens) goto done;
-        }
+    /* workspace sized to the full text (freed at exit) */
+    uint32_t *cps   = (uint32_t *)malloc(((size_t)len + 1) * sizeof(uint32_t));
+    int *bofs       = (int *)malloc(((size_t)len + 1) * sizeof(int));
+    int *ends       = (int *)malloc(((size_t)len + 1) * sizeof(int));
+    char *mapped    = (char *)malloc((size_t)len * 4 + 16);
+    int *beg        = (int *)malloc(((size_t)len * 4 + 4) * sizeof(int));
+    int *sln        = (int *)malloc(((size_t)len * 4 + 4) * sizeof(int));
+    if (!cps || !bofs || !ends || !mapped || !beg || !sln) {
+        free(cps); free(bofs); free(ends); free(mapped); free(beg); free(sln);
+        return n_out;
     }
-done:
+
+    while (pos < len && n_out < max_tokens) {
+        /* verbatim special <|name|> tokens first */
+        int sp_len = 0;
+        const int sp_id = match_special(t, text, len, pos, &sp_len);
+        if (sp_id >= 0) {
+            out_tokens[n_out++] = sp_id;
+            pos += sp_len;
+            continue;
+        }
+        /* segment ends at the next resolvable special token start */
+        int seg_end = len;
+        for (int q = pos + 1; q + 1 < len; q++) {
+            if (text[q] == '<' && text[q + 1] == '|') {
+                int l2 = 0;
+                if (match_special(t, text, len, q, &l2) >= 0) { seg_end = q; break; }
+            }
+        }
+        n_out += encode_bpe_segment(t, text + pos, seg_end - pos,
+                                    cps, bofs, ends, mapped, beg, sln,
+                                    out_tokens + n_out, max_tokens - n_out);
+        pos = seg_end;
+    }
+
+    free(cps); free(bofs); free(ends); free(mapped); free(beg); free(sln);
     return n_out;
 }
 
