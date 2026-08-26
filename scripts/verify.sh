@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Single source of truth. Exit 0 = gate green, nonzero = red.
-# Usage: ./scripts/verify.sh [m0|m1|m2|m3|m4|m61|m84|ple|all]
+# Usage: ./scripts/verify.sh [m0|m1|m2|m3|m4|m61|m84|ple|tok|all]
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -26,6 +26,7 @@ case "$GATE" in
        run "pybind-demo"     python3 examples/train_mnist.py --smoke ;;
   m84) run "m84-gemma4-parity" python3 tests/gate_m84_gemma4.py ;;
   ple) run "m6-ple-golden"     python3 tests/gate_ple_golden.py ;;
+  tok) run "tokenizer-oracle-parity" python3 tests/gate_tokenizer.py ;;
   all) for g in m0 m1 m2 m3 m4 m61; do "$0" "$g"; done ;;
   *) echo "unknown gate: $GATE"; exit 2 ;;
 esac
