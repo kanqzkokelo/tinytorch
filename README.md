@@ -33,11 +33,52 @@ dequant-fp32 accumulation).
 | llama | TinyLlama-1.1B | f16 | ✅ bit-perfect (median Δ = 0.0009) |
 | llama | SmolLM2-135M | f16, q4_0, q5_0, q5_1, q8_0, q4_K, q4_K_S, q5_K | ✅ |
 | llama | SmolLM2-135M | q4_1, q5_K_S, q6_K | ⚠️ 5–6/7 (top-1 flips on near-tied logits) |
+| llama | Llama-3.2-1B | q8_0 | ✅ 7/7 unmodified (src/arch_registry.c:91) |
+| phi2 | phi-2 | — | 🚫 scoped out: needs LayerNorm kernels + epsilon-key alias; analysis in src/arch_registry.c:101 |
 | gemma2 | Gemma2-2B | q6_K | ⚠️ 6/7 (was 7/7; re-verified during M8 session) |
 | gemma4 | Gemma-4-E2B | q4_0 | 🚧 IN PROGRESS — see note below |
 
 Quant kernels: q4_0, q4_1, q5_0, q5_1, q8_0, q4_K(+S), q5_K(+S), q6_K — all
 golden-verified against gguf-py dequantization on real model bytes.
+
+## M9–M11 throughput round (landed, gated separately)
+
+Gates: `./scripts/verify.sh ple` (PLE golden 3/3, ~1e-5),
+`./scripts/verify.sh tok` (tokenizer conformance vs llama-tokenize oracle —
+**honestly failing**; documented gaps: simplified pre-tokenization regex,
+greedy SP matching instead of unigram Viterbi — see header of
+`tests/gate_tokenizer.py`), `./scripts/verify.sh m84` (gemma4 parity, pending).
+
+Unit tests / prototypes (each attributed to its file):
+
+- `tests/test_rope_ff.cu` — RoPE+FFN exact vs ggml ref; rules RoPE out of the
+  gemma4 parity hunt.
+- `tests/test_flash_multi.cu` — flash GQA multi-slot kernel, 7/7 exact
+  (incl. SWA window + mixed-head-dim gemma4 shapes).
+- `tests/proto_ple_fused.cu` — fused PLE chain V2: 2 launches, graph-capturable,
+  22.3µs/layer vs 44.6 host-assist → 22% token-budget saving (commit e7e9609).
+- `tests/proto_batched_gemv.cu` — batched-GEMV prototype.
+- `bench/bench_load_strategies.cu` — root cause of slow load = alloc churn
+  (3012× cudaMalloc = 1.2s); single arena + pinned staging ≈ 4.4 GB/s warm,
+  5 GB model ~6.3s → ~1.1s (**5.7× startup**, commit b5b3fb1).
+
+New modules (all with their own tests):
+
+- `src/samplers.c` — rep/freq/presence penalty, temp, top-k/top-p/min-p;
+  12/12 tests (`tests/test_samplers.py`).
+- `src/chat_template.c` — ChatML/gemma/llama3 formatter, HF-verified goldens,
+  37 tests (`tests/test_chat_template.py`) + per-family stop strings.
+- `src/specdec.c` — ngram drafter (C99) + acceptance simulator: 1.88× best-case
+  flat-model envelope, bounded worst-case (`tests/test_specdec_sim.py`).
+- `src/cpu_backend.c` — threaded q4_0/q8_0 GEMV, golden vs numpy (3e-7 rel)
+  (`tests/test_cpu_backend.py`).
+- `src/kvcache.c`, `src/moe_router.c` — with `tests/test_kvcache.c`,
+  `tests/test_moe_router.c`.
+
+Research docs (`docs/plans/`): `2026-08-27-m11-vulkan-design.md`,
+`2026-08-27-hybrid-offload-findings.md` (E4B-on-4GB verdict 5–9 t/s),
+`2026-08-27-moe-notes.md`, `2026-08-27-quant-roadmap.md` (IQ3_XXS verdict),
+`2026-08-26-m9-m11-roadmap.md`.
 
 ### gemma4 status (M8, active)
 
@@ -49,6 +90,10 @@ runs end-to-end. Parity not yet green:
   measured via `tests/gate_m84_gemma4.py` single-token probe)
 - Two-token median ~**9** — divergence under active bisection
 - Gate `./scripts/verify.sh m84` NOT passing
+- Ruled out so far: RoPE (exact per `tests/test_rope_ff.cu`); PLE stages reach
+  golden parity on L0; fixed this round: full-layer staging OOB (d_q/d_att
+  2048→4096), K-projection half-width on hd-512 layers, BF16 loader size,
+  BOS-prepend tokenizer convention (commits 2052181, 48ecc40, 8263d39)
 - Golden reference: `tests/ref_gemma4_numpy.py` (NumPy forward from plan math)
 
 ## Classic ML benchmarks
@@ -69,6 +114,9 @@ runs end-to-end. Parity not yet green:
 make lib pybind cuda cublas          # libraries
 make run_llm_gpu chat_llm_gpu        # LLM binaries (nvcc required)
 ./scripts/verify.sh m61              # LLM parity gate
+./scripts/verify.sh m84              # gemma4 parity gate (pending)
+./scripts/verify.sh ple              # PLE golden gate (3/3)
+./scripts/verify.sh tok              # tokenizer conformance (failing; gaps documented)
 ./scripts/verify.sh all              # full sweep incl. classic ML gates
 ```
 
