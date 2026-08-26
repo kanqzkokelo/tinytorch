@@ -119,6 +119,103 @@ __global__ void k_rmsnorm(const float *__restrict__ x, const float *__restrict__
     }
 }
 
+/* ---------------- M9 PLE-fused V2 (gemma4 MatFormer block) ----------------
+ *
+ * Replaces the per-layer host-assisted PLE round-trip (D2H x2, H2D x2, plus
+ * host-side gelu*ple and rmsnorm) with a 2-launch device chain. The proto
+ * design (tests/proto_ple_fused.cu, commit e7e9609) measured 22.3 us/layer
+ * vs 44.6 us for the host path; the saving (35 layers * 22.3 us ~= 780 us
+ * per token, ~22% of the 3.5 ms decode budget) makes the per-layer chain
+ * graph-capturable for gemma4.
+ *
+ *   stage1: h = inp_gate @ x                (f32 GEMV, 256x1536)
+ *           g = gelu(h) * ple[l]            (elementwise)
+ *   stage2: p = pl_proj @ g                 (f32 GEMV, 1536x256)
+ *           p = rmsnorm(p, gamma) in place  (atomic-ticket epilogue)
+ *
+ * Engine-side dtypes for blk.{l}.inp_gate.weight and blk.{l}.proj.weight
+ * are f32 in the Q4_0/Q5_K_M/Q6_K gemma4 GGUFs (see [qwen2-engine] up
+ * logs). The f32 kernels below match exactly. For non-f32 per-layer
+ * weights the engine keeps the existing host-assisted path.
+ */
+__device__ __forceinline__ float ple_gelu_f(float x) {
+    /* tanh-approx GELU (matches the old host path's gelu byte-for-byte
+     * so the m84 goldens stay valid; proto used exact-erf as a design
+     * reference, not the production kernel). */
+    return 0.5f * x * (1.0f + tanhf(0.7978845608028654f *
+                                    (x + 0.044715f * x * x * x)));
+}
+
+/* Stage1: gemv f32 + gelu + ple mul, one warp per output row. */
+__global__ void k_ple_stage1_f32(const float *__restrict__ W1,    /* [M,K] */
+                                const float *__restrict__ x,     /* [K] */
+                                const float *__restrict__ ple_r, /* [M] */
+                                float *__restrict__ g,           /* [M] */
+                                int M, int K) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarp = blockDim.x >> 5;
+    const int row = blockIdx.x * nwarp + warp;
+    if (row >= M) return;
+    const float *rw = W1 + (long)row * K;
+    float s = 0.0f;
+    for (int j = lane; j < K; j += 32) s += rw[j] * x[j];
+    s = warp_sum(s);
+    if (lane == 0) g[row] = ple_gelu_f(s) * ple_r[row];
+}
+
+/* Stage2: gemv f32 + atomic-ticket rmsnorm epilogue (one warp per output
+ * row; last block to finish normalizes).  Matches proto design. */
+__device__ unsigned int g_ple_ticket = 0;
+
+__global__ void k_ple_stage2_f32(const float *__restrict__ W2,    /* [M,K] */
+                                const float *__restrict__ g,     /* [K] */
+                                const float *__restrict__ gamma, /* [M] */
+                                float *__restrict__ out,         /* [M] */
+                                int M, int K, float eps) {
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row < M) {
+        const float *rw = W2 + (long)row * K;
+        float s = 0.0f;
+        for (int j = lane; j < K; j += 32) s += rw[j] * g[j];
+        s = warp_sum(s);
+        if (lane == 0) out[row] = s;
+    }
+    /* grid-wide barrier via ticket: last block normalizes */
+    __shared__ bool ple_is_last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned int prev = atomicInc(&g_ple_ticket, gridDim.x - 1);
+        ple_is_last = (prev == gridDim.x - 1);
+    }
+    __syncthreads();
+    if (!ple_is_last) return;
+    /* normalize: read back out[], apply rmsnorm in place */
+    const int tid = threadIdx.x;
+    float ss = 0.0f;
+    for (int i = tid; i < M; i += blockDim.x) ss += out[i] * out[i];
+    /* warp + cross-warp reduce in smem (assumes blockDim.x is a power of 2) */
+    __shared__ float ple_red[1024];
+    /* intra-warp */
+    for (int off = 16; off > 0; off /= 2) ss += __shfl_down_sync(0xffffffff, ss, off);
+    const int warp = tid >> 5;
+    const int lane2 = tid & 31;
+    if (lane2 == 0) ple_red[warp] = ss;
+    __syncthreads();
+    if (warp == 0) {
+        const int nw = (blockDim.x + 31) >> 5;
+        ss = (lane2 < nw) ? ple_red[lane2] : 0.0f;
+        for (int off = 16; off > 0; off /= 2) ss += __shfl_down_sync(0xffffffff, ss, off);
+        if (lane2 == 0) ple_red[0] = rsqrtf(ss / (float)M + eps);
+    }
+    __syncthreads();
+    const float inv = ple_red[0];
+    for (int i = tid; i < M; i += blockDim.x) out[i] *= inv * gamma[i];
+    g_ple_ticket = 0; /* reset for next launch */
+}
+
 /* RoPE in-place on rows [n_heads, head_dim]; one thread per half-dim pair. */
 __global__ void k_rope(float *__restrict__ q, int n_heads, int head_dim,
                        const int *__restrict__ d_pos, float base) {
@@ -1240,102 +1337,167 @@ static int forward_layers(Qwen2Engine *e) {
             fprintf(stderr, "[FWD] L%d done rms=%.4f nan=%d\n", l, sqrt(s2/c->dim), nn);
         }
 
-        /* gemma4 MatFormer per-layer embedding block (all host round-trips;
-         * pl_dim=256 so data movement is trivial). Order per build_gemma4:
+        /* gemma4 MatFormer per-layer embedding block. M9 V2: 2 device
+         * launches, no host round-trips, graph-capturable. Order:
          *   g = gelu(inp_gate @ x) * PLE[l] ; p = rmsnorm(pl_proj @ g) ;
-         *   x += p ; x *= layer_output_scale                        */
+         *   x += p ; x *= layer_output_scale
+         * The fused k_ple_stage2_f32 absorbs the post-norm that used to be
+         * a separate k_rmsnorm launch. */
         static int no_ple2 = -1;
         if (no_ple2 < 0) no_ple2 = getenv("TT_NO_PLE") ? 1 : 0;
         if (e->has_pl_embd && !no_ple2) {
             const int slot = e->pos % c->max_ctx;
-            static float gbuf[1024];
-            static float ple_slice[1024];
-            static float pe_slice[1024];
-
-            /* g = inp_gate @ x (device) */
-            int ig = tt_gemv_typed(w->inp_gate.ptr, w->inp_gate.dtype,
-                                   e->d_x, e->d_pl_tmp, e->pl_dim, c->dim,
-                                   e->stream);
-            cudaStreamSynchronize(e->stream);
-            cudaMemcpy(gbuf, e->d_pl_tmp, e->pl_dim * 4, cudaMemcpyDeviceToHost);
-
-            /* fetch this position's PLE row + pe slice for layer l */
-            cudaMemcpy(ple_slice, e->d_ple_row + (long)l * 256,
-                       256 * sizeof(float), cudaMemcpyDeviceToHost);
-            if (trace && l >= 19 && l <= 22) {
-                static float whole[35 * 256];
-                cudaMemcpy(whole, e->d_ple_row, 35 * 256 * sizeof(float),
-                           cudaMemcpyDeviceToHost);
-                int nb = 0;
-                for (int i = 0; i < 35 * 256; i++) if (isnan(whole[i])) nb++;
-                fprintf(stderr, "[PLEW] L%d row-nan=%d slice0=%.4f\n", l, nb, whole[0]);
-            }
-            memcpy(pe_slice, e->ple_pe + (long)l * 256, 256 * sizeof(float));
-
-            if (trace) {
-                int bad = 0;
-                for (int i = 0; i < e->pl_dim; i++)
-                    if (isnan(gbuf[i]) || isnan(ple_slice[i])) bad++;
-                fprintf(stderr, "[PLEB] L%d bad=%d g[0]=%.4f ps[0]=%.4f\n",
-                        l, bad, gbuf[0], ple_slice[0]);
-            }
-            /* gelu then elementwise multiply by PLE slice — NOTE: per
-             * build_gemma4 the multiply happens AFTER gelu but the residual
-             * uses pre-gate cur; also pe is added post-projection in
-             * project_per_layer_inputs, already folded into ple_finish_host. */
-            for (int i = 0; i < e->pl_dim; i++) {
-                const float gv = gbuf[i];
-                gbuf[i] = 0.5f * gv * (1.0f + tanhf(0.7978845608028654f *
-                                                    (gv + 0.044715f * gv * gv * gv)));
-                gbuf[i] *= ple_slice[i];
-            }
-
-            if (getenv("TT_PLE_DEBUG") && l == 0) {
-                float s = 0, mn = 1e30f, mx = -1e30f;
-                for (int i = 0; i < e->pl_dim; i++) {
-                    s += gbuf[i];
-                    if (gbuf[i] < mn) mn = gbuf[i];
-                    if (gbuf[i] > mx) mx = gbuf[i];
+            (void)slot;
+            /* V2 fast path: 2 device launches, no host round-trips, graph-
+             * capturable. Requires f32 per-layer weights (true for the
+             * Q4_0/Q5_K_M/Q6_K gemma4 GGUFs; engine keeps the host path as
+             * a fallback for any non-f32 variant or under capture). */
+            const int use_v2 = (w->inp_gate.dtype == TTQ_F32 &&
+                                w->pl_proj.dtype  == TTQ_F32 &&
+                                w->pl_post_norm != NULL);
+            if (use_v2) {
+                /* Optional per-layer timing (TT_PLE_TIMING=1). Lazy-init a
+                 * pair of timed cudaEvents on first call; report per-layer
+                 * us for the 2-launch V2 chain. Skipped under capture. */
+                static int ple_timing = -1;
+                if (ple_timing < 0) ple_timing = getenv("TT_PLE_TIMING") ? 1 : 0;
+                static cudaEvent_t ple_ea, ple_eb;
+                static int ple_ev_inited = 0;
+                if (ple_timing && !ple_ev_inited) {
+                    cudaEventCreate(&ple_ea);
+                    cudaEventCreate(&ple_eb);
+                    ple_ev_inited = 1;
                 }
-                fprintf(stderr, "[PLEDBG] L0 gated: sum=%.4f min=%.4f max=%.4f\n", s, mn, mx);
-                float ps = 0;
-                for (int i = 0; i < 8; i++) ps += ple_slice[i];
-                fprintf(stderr, "[PLEDBG] L0 ple[0..7]=%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f pe[0]=%.4f\n",
-                        ple_slice[0], ple_slice[1], ple_slice[2], ple_slice[3],
-                        ple_slice[4], ple_slice[5], ple_slice[6], ple_slice[7], pe_slice[0]);
-            }
-            /* p = rmsnorm(pl_proj @ g) ; x += p ; x *= out_scale */
-            cudaMemcpy(e->d_pl_tmp, gbuf, e->pl_dim * 4, cudaMemcpyHostToDevice);
-            int pg = tt_gemv_typed(w->pl_proj.ptr, w->pl_proj.dtype,
-                                   e->d_pl_tmp, e->d_xn, c->dim, e->pl_dim,
-                                   e->stream);
-            cudaStreamSynchronize(e->stream);
-            if (ig || pg) fprintf(stderr, "[qwen2-engine] pl block rc ig=%d pg=%d\n", ig, pg);
-            if (w->pl_post_norm)
-                k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
-                    e->d_xn, w->pl_post_norm, e->d_xn, c->dim, c->rms_eps,
-                    c->tr.norm_offset);
-            k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
+                if (ple_timing && !g_capturing) cudaEventRecord(ple_ea, e->stream);
+                /* stage1: gemv f32 + tanh-approx gelu + ple mul, 1 warp/row */
+                const int s1_nwarp = 4;                /* 4 warps/block => 4 rows */
+                const int s1_grid  = (e->pl_dim + s1_nwarp - 1) / s1_nwarp;
+                k_ple_stage1_f32<<<s1_grid, s1_nwarp * 32, 0, e->stream>>>(
+                    (const float *)w->inp_gate.ptr,
+                    e->d_x,
+                    e->d_ple_row + (long)l * e->pl_dim,
+                    e->d_pl_tmp,
+                    e->pl_dim, c->dim);
+                /* stage2: gemv f32 + atomic-ticket fused rmsnorm, 1 warp/row.
+                 * The fused post-norm (gamma=pl_post_norm) replaces the old
+                 * separate k_rmsnorm call so the whole block is 2 launches. */
+                const int s2_nwarp = 16;
+                const int s2_grid  = (c->dim + s2_nwarp - 1) / s2_nwarp;
+                k_ple_stage2_f32<<<s2_grid, s2_nwarp * 32, 0, e->stream>>>(
+                    (const float *)w->pl_proj.ptr,
+                    e->d_pl_tmp,
+                    w->pl_post_norm,
+                    e->d_xn,
+                    c->dim, e->pl_dim, c->rms_eps);
+                k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
 
-            /* per-layer output scale (scalar by value) */
-            if (w->out_scale_val != 0.0f && w->out_scale_val != 1.0f)
-                k_scale<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(
-                    e->d_x, w->out_scale_val, c->dim);
-            if (trace) {
-                static float xs2[1536];
-                cudaMemcpy(xs2, e->d_x, c->dim * 4, cudaMemcpyDeviceToHost);
+                /* per-layer output scale (scalar by value) */
+                if (w->out_scale_val != 0.0f && w->out_scale_val != 1.0f)
+                    k_scale<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(
+                        e->d_x, w->out_scale_val, c->dim);
+                if (trace && !g_capturing) {
+                    static float xs2[1536];
+                    cudaMemcpy(xs2, e->d_x, c->dim * 4, cudaMemcpyDeviceToHost);
+                    cudaStreamSynchronize(e->stream);
+                    double s2 = 0;
+                    for (int i = 0; i < c->dim; i++) s2 += (double)xs2[i]*xs2[i];
+                    fprintf(stderr, "[FWD] L%d postscale_rms=%.4f\n", l, sqrt(s2/c->dim));
+                }
+                if (ple_timing && !g_capturing) {
+                    cudaEventRecord(ple_eb, e->stream);
+                    cudaEventSynchronize(ple_eb);
+                    float ms = 0.0f;
+                    cudaEventElapsedTime(&ms, ple_ea, ple_eb);
+                    fprintf(stderr, "[PLE-V2] L%d %.2f us\n", l, ms * 1000.0f);
+                }
+            } else {
+                /* host-assisted fallback (non-f32 per-layer weights only) */
+                static float gbuf[1024];
+                static float ple_slice[1024];
+                static float pe_slice[1024];
+
+                /* g = inp_gate @ x (device) */
+                int ig = tt_gemv_typed(w->inp_gate.ptr, w->inp_gate.dtype,
+                                       e->d_x, e->d_pl_tmp, e->pl_dim, c->dim,
+                                       e->stream);
                 cudaStreamSynchronize(e->stream);
-                double s2 = 0;
-                for (int i = 0; i < c->dim; i++) s2 += (double)xs2[i]*xs2[i];
-                fprintf(stderr, "[FWD] L%d postscale_rms=%.4f\n", l, sqrt(s2/c->dim));
-            }
-            if (getenv("TT_PLE_DEBUG") && l == 0) {
-                static float xs[1536];
-                cudaMemcpy(xs, e->d_x, c->dim * 4, cudaMemcpyDeviceToHost);
+                cudaMemcpy(gbuf, e->d_pl_tmp, e->pl_dim * 4, cudaMemcpyDeviceToHost);
+
+                /* fetch this position's PLE row + pe slice for layer l */
+                cudaMemcpy(ple_slice, e->d_ple_row + (long)l * 256,
+                           256 * sizeof(float), cudaMemcpyDeviceToHost);
+                if (trace && l >= 19 && l <= 22) {
+                    static float whole[35 * 256];
+                    cudaMemcpy(whole, e->d_ple_row, 35 * 256 * sizeof(float),
+                               cudaMemcpyDeviceToHost);
+                    int nb = 0;
+                    for (int i = 0; i < 35 * 256; i++) if (isnan(whole[i])) nb++;
+                    fprintf(stderr, "[PLEW] L%d row-nan=%d slice0=%.4f\n", l, nb, whole[0]);
+                }
+                memcpy(pe_slice, e->ple_pe + (long)l * 256, 256 * sizeof(float));
+
+                if (trace) {
+                    int bad = 0;
+                    for (int i = 0; i < e->pl_dim; i++)
+                        if (isnan(gbuf[i]) || isnan(ple_slice[i])) bad++;
+                    fprintf(stderr, "[PLEB] L%d bad=%d g[0]=%.4f ps[0]=%.4f\n",
+                            l, bad, gbuf[0], ple_slice[0]);
+                }
+                /* gelu then elementwise multiply by PLE slice */
+                for (int i = 0; i < e->pl_dim; i++) {
+                    const float gv = gbuf[i];
+                    gbuf[i] = 0.5f * gv * (1.0f + tanhf(0.7978845608028654f *
+                                                        (gv + 0.044715f * gv * gv * gv)));
+                    gbuf[i] *= ple_slice[i];
+                }
+
+                if (getenv("TT_PLE_DEBUG") && l == 0) {
+                    float s = 0, mn = 1e30f, mx = -1e30f;
+                    for (int i = 0; i < e->pl_dim; i++) {
+                        s += gbuf[i];
+                        if (gbuf[i] < mn) mn = gbuf[i];
+                        if (gbuf[i] > mx) mx = gbuf[i];
+                    }
+                    fprintf(stderr, "[PLEDBG] L0 gated: sum=%.4f min=%.4f max=%.4f\n", s, mn, mx);
+                    float ps = 0;
+                    for (int i = 0; i < 8; i++) ps += ple_slice[i];
+                    fprintf(stderr, "[PLEDBG] L0 ple[0..7]=%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f pe[0]=%.4f\n",
+                            ple_slice[0], ple_slice[1], ple_slice[2], ple_slice[3],
+                            ple_slice[4], ple_slice[5], ple_slice[6], ple_slice[7], pe_slice[0]);
+                }
+                /* p = rmsnorm(pl_proj @ g) ; x += p ; x *= out_scale */
+                cudaMemcpy(e->d_pl_tmp, gbuf, e->pl_dim * 4, cudaMemcpyHostToDevice);
+                int pg = tt_gemv_typed(w->pl_proj.ptr, w->pl_proj.dtype,
+                                       e->d_pl_tmp, e->d_xn, c->dim, e->pl_dim,
+                                       e->stream);
                 cudaStreamSynchronize(e->stream);
-                float s = 0; int nan = 0;
-                for (int i = 0; i < c->dim; i++) { s += xs[i]; if (isnan(xs[i])) nan++; }
-                fprintf(stderr, "[PLEDBG] L0 x-after: sum=%.4f nan=%d scale=%f\n", s, nan, w->out_scale_val);
+                if (ig || pg) fprintf(stderr, "[qwen2-engine] pl block rc ig=%d pg=%d\n", ig, pg);
+                if (w->pl_post_norm)
+                    k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
+                        e->d_xn, w->pl_post_norm, e->d_xn, c->dim, c->rms_eps,
+                        c->tr.norm_offset);
+                k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
+
+                /* per-layer output scale (scalar by value) */
+                if (w->out_scale_val != 0.0f && w->out_scale_val != 1.0f)
+                    k_scale<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(
+                        e->d_x, w->out_scale_val, c->dim);
+                if (trace) {
+                    static float xs2[1536];
+                    cudaMemcpy(xs2, e->d_x, c->dim * 4, cudaMemcpyDeviceToHost);
+                    cudaStreamSynchronize(e->stream);
+                    double s2 = 0;
+                    for (int i = 0; i < c->dim; i++) s2 += (double)xs2[i]*xs2[i];
+                    fprintf(stderr, "[FWD] L%d postscale_rms=%.4f\n", l, sqrt(s2/c->dim));
+                }
+                if (getenv("TT_PLE_DEBUG") && l == 0) {
+                    static float xs[1536];
+                    cudaMemcpy(xs, e->d_x, c->dim * 4, cudaMemcpyDeviceToHost);
+                    cudaStreamSynchronize(e->stream);
+                    float s = 0; int nan = 0;
+                    for (int i = 0; i < c->dim; i++) { s += xs[i]; if (isnan(xs[i])) nan++; }
+                    fprintf(stderr, "[PLEDBG] L0 x-after: sum=%.4f nan=%d scale=%f\n", s, nan, w->out_scale_val);
+                }
             }
         }
 
