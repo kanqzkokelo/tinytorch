@@ -11,9 +11,11 @@
 - [x] Fused PLE chain V2 prototype: graph-capturable, 22% token budget saved
       (tests/proto_ple_fused.cu).
 - [x] Batched-GEMV prototype (tests/proto_batched_gemv.cu).
-- [x] Load-time root cause + arena fix: 3012×cudaMalloc=1.2s churn; arena+pinned
-      staging = 5.7× startup (bench/bench_load_strategies.cu). Production wiring open:
-- [ ] Wire single-arena loader path into src/loader_gguf.c production load.
+- [x] Load-time root cause: 3012×cudaMalloc=1.2s churn; arena staging 5.7×
+      on SYNTHETIC 2GB set (bench/bench_load_strategies.cu). **Real loader
+      benchmarked: arena is 0.94× (slightly slower!) on real GGUF** because
+      mmap'd pages already pipeline cleanly to CUDA (ea7eb6a). Real win
+      is mmap-as-device into GEMV — see open work C4 below.
 - [x] Samplers module (src/samplers.c): rep/freq/presence, temp, top-k/top-p/min-p;
       12/12 (`python3 tests/test_samplers.py`).
 - [x] Chat template formatter (src/chat_template.c): ChatML/gemma/llama3,
@@ -54,16 +56,57 @@
 - [x] Staging OOB fix (d_q/d_att sized 2048 vs needed 4096) + K-projection
       half-width fix on hd-512 layers (kvdim_l).
 
-## Open (in order)
-- [ ] Two-token divergence bisection (~9 median) — agent running; do not
-      duplicate work, check its result first.
-- [ ] M8.4 Parity gate green: ./scripts/verify.sh m84
-      (tests/gate_m84_gemma4.py) — blocked on two-token fix.
-- [ ] Chat smoke E2B: TT_MODEL=<gemma-E2B gguf> ./chat (thinking-channel
-      markers in stop strings).
-- [ ] tg-128 benchmark vs llama.cpp; target ≥25–30 tok/s (Windows baseline 17).
-- [ ] Final README grid update once m84 passes.
+## Open (priority order — see docs/plans/2026-08-27-open-work.md for full detail)
+
+### Critical path (gemma-4 parity to 7/7)
+- [ ] **A1** `verify.sh m84` → 7/7. T2 bisect identified pos-1 attn_norm divergence
+      (cos=0.19). T3 applies the fix; iterate up to 3 cycles. Currently 0/7.
+- [ ] **A2** Chat smoke E2B: should auto-resolve with A1.
+- [ ] **A3** Revert T2's `TT_DUMP_POS1` instrumentation in `kernels/qwen2_cuda.cu`.
+
+### Engine correctness (trivial)
+- [ ] **B1** `SAMPLERS_MAIN` CLI driver: grow `char rest[512]` to 8192 (vocab >80
+      silently truncates → wrong argmax in tests/CLI). 1-line fix in src/.
+
+### Decode throughput (M9 — biggest user-visible wins)
+- [ ] **C1** Wire `tt_gemm_batched_q4_0` into prefill path (proto: f(8)=0.11×).
+      Dispatch rule: use batched when `n_tokens ≥ 8`. Expected pp512 100 → ~2k.
+- [ ] **C2** Wire PLE-fused V2 into `forward_layers` (proto: 22% decode budget saved,
+      graph-capturable). Re-enables CUDA graphs for gemma4.
+- [ ] **C3** Wire Split-K flash attention (proto: 12× at ctx≥512).
+- [ ] **C4** **mMAP-as-DEVICE / mmap'd Q4_0 → GEMV directly** (skip the
+      cudaMemcpy round-trip). Identified as the **REAL** startup / load-time
+      win by `arena-verify` (mmap→pinned→dev is 1.18 GB/s bound; bypassing
+      to GEMV is the unlock). Biggest near-term engine optimization.
+- [ ] **C6** Port llama.cpp's MMQ-style dequant-in-register kernels for
+      ≥0.6B models. Closes the 0.25-0.80× gap to CUDA llama.cpp.
+
+### Speculative decoding (M10)
+- [ ] **D1** Wire `src/specdec.c` ngram drafter + `src/kvcache.c` rollback
+      into engine decode loop. D2 verify-batch cost model already measured.
+- [ ] DFlash2 support: deliberately parked (no 0.5B-class drafter exists;
+      re-evaluate for 7B+ targets).
+
+### Hardware breadth (M11)
+- [ ] **E1** Vulkan backend P0 spike (q4_0-only Qwen2 decode on RADV AMD iGPU).
+- [ ] **E2** K-quant AVX2 in `src/cpu_backend.c` (in flight as `cpu-kquant-avx2`).
+- [ ] **E3** Hybrid CPU+GPU offload implementation (E4B unlock, 5-9 tok/s).
+- [ ] **E4** Server (continuous batching) P1: request queue + minimal HTTP.
+
+### Model breadth + capacity
+- [ ] **F1** Per-family gating: llama-3.1, mistral, deepseek as opportunities arise.
+- [ ] **F3** Hybrid offload is the real E4B unlock (see E3).
+- [ ] **F4** KV-cache quant: SWA cap (1d) → fp16 (hours) → q8_0 (2-4d).
+
+### Quality / hygiene (background)
+- [ ] **H1** Remaining 5 robustness audit fixes: NaN containment, unchecked
+      cudaMalloc paths, `qwen2_debug_replay_step` pos guard, etc. (~1d)
+- [ ] Final README truth-table update on each milestone close (gemma4 row,
+      M9-M11, M12).
 
 ## Deferred
-- E4B support: 5.15GB > 4GB VRAM — see BLOCKED.md.
-- CUDA graph capture for gemma4 path (PLE host stage).
+- E4B support via M11 hybrid offload (not standalone): spec'd in
+  docs/plans/2026-08-27-offload-integration.md; needs kernels/ + cpu_backend
+  integration (~3-5 days once files free).
+- CUDA graph capture for gemma4: covered by C2 (host PLE round-trips
+  removed).
