@@ -76,29 +76,6 @@ $(BUILD)/chat_llm_gpu: examples/chat_llm_gpu.c src/loader_gguf.c src/arch_regist
 
 chat_llm_gpu: $(BUILD)/chat_llm_gpu
 
-# M12 P1: minimal HTTP server (single engine, single mutex, single model).
-$(BUILD)/server_minimal: examples/server_minimal.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/tokenizer_bpe.c src/chat_template.c src/samplers.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
-	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
-	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
-	  -o $@ \
-	  examples/server_minimal.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/tokenizer_bpe.c src/chat_template.c src/samplers.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
-	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
-
-server_minimal: $(BUILD)/server_minimal
-
-# M12 P2: multi-model HTTP server (registry of engines, per-engine mutex,
-# request body "model" field selects the engine). Same source set as P1.
-$(BUILD)/server_multimodel: examples/server_multimodel.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/tokenizer_bpe.c src/chat_template.c src/samplers.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
-	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
-	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
-	  -o $@ \
-	  examples/server_multimodel.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/tokenizer_bpe.c src/chat_template.c src/samplers.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
-	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
-
-server_multimodel: $(BUILD)/server_multimodel
-
 # Oracle logits tool against the vendored llama.cpp build (parity fixtures).
 $(BUILD)/oracle_logits: tools/oracle_logits.c | $(BUILD)
 	gcc -O2 -Wno-deprecated-declarations \
@@ -109,7 +86,7 @@ $(BUILD)/oracle_logits: tools/oracle_logits.c | $(BUILD)
 
 oracle_logits: $(BUILD)/oracle_logits
 
-.PHONY: run_llm_gpu chat_llm_gpu server_minimal server_multimodel
+.PHONY: run_llm_gpu chat_llm_gpu
 
 $(BUILD)/dump_logits: tools/dump_logits.c src/loader_gguf.c src/dequant_ref.c src/arch_registry.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
 	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \

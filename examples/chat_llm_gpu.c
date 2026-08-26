@@ -256,17 +256,6 @@ int main(void) {
         int n_prompt = bpe_encode(tok, suffix, prompt_tokens, 512);
         if (n_prompt <= 0) { fprintf(stderr, "[chat] tokenization failed\n"); continue; }
 
-        /* TT_DUMP_PROMPT=1: render the exact bytes that go into the engine,
-         * the decoded UTF-8 view, and the token ids the BPE encoder chose. */
-        if (getenv("TT_DUMP_PROMPT")) {
-            fprintf(stderr, "\n[TT_DUMP_PROMPT] formatted suffix (%zu bytes):\n",
-                    strlen(suffix));
-            fprintf(stderr, "-----8<-----\n%s-----8<-----\n", suffix);
-            fprintf(stderr, "[TT_DUMP_PROMPT] first %d token ids:\n", n_prompt);
-            for (int i = 0; i < n_prompt; i++)
-                fprintf(stderr, "  [%2d] %d\n", i, prompt_tokens[i]);
-        }
-
         AsyncPrinter *ap = async_printer_start();
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -288,39 +277,10 @@ int main(void) {
          * (graph path only): first engine_next() call eager-samples greedily
          * and stashes the result as pending; we discard its choice and drive
          * every step ourselves via replay_step(). */
-        const int pos_pre = qwen2_engine_pos(eng);
-        int boot_id = -1;
-        if (!no_graph) {
-            boot_id = qwen2_engine_next(eng);
-            if (boot_id < 0) {
-                fprintf(stderr, "\n[chat] failed to score prompt\n");
-                async_printer_stop_and_flush(ap);
-                continue;
-            }
-        }
-
-        /* CUDA-graph capture can fail at runtime (e.g. gemma4 MatFormer PLE
-         * kernels insert a host round-trip that breaks capture). When that
-         * happens qwen2_engine_next falls back to eager permanently: the
-         * call returns the sampled id AND has already advanced the engine's
-         * position by one (advance(id) is invoked before the function
-         * returns). Detect this by comparing pos before/after the bootstrap
-         * call. If pos advanced, the loop below must use the no_graph body
-         * because qwen2_debug_replay_step would fail (graph not ready). */
-        int runtime_eager = no_graph;
-        if (!no_graph) {
-            const int pos_after = qwen2_engine_pos(eng);
-            if (pos_after > pos_pre) {
-                runtime_eager = 1;
-                fprintf(stderr,
-                        "[chat] engine fell back to eager (pos %d->%d) "
-                        "— using host-side sampler on engine logits\n",
-                        pos_pre, pos_after);
-                if (!greedy)
-                    qwen2_engine_set_sampling(eng, sc.temp,
-                                              sc.top_k > 0 ? sc.top_k : 40,
-                                              sc.repeat_penalty);
-            }
+        if (!no_graph && qwen2_engine_next(eng) < 0) {
+            fprintf(stderr, "\n[chat] failed to score prompt\n");
+            async_printer_stop_and_flush(ap);
+            continue;
         }
 
         int gen_count = 0;
@@ -328,49 +288,21 @@ int main(void) {
         size_t tl = 0;
         size_t emitted = 0;   /* bytes already streamed to the printer */
         int stop_cut = 0;
-        /* In runtime_eager mode the bootstrap call already sampled id1 and
-         * advanced; in graph mode the bootstrap left the engine paused with
-         * d_logits = step-1 logits, so iter 1 must call the host sampler.
-         * When the engine was created in no_graph mode the bootstrap call
-         * is skipped entirely, so there is no pre-sampled id to reuse. */
-        int boot_consumed = (runtime_eager && boot_id >= 0) ? 1 : 0;
         while (gen_count < max_tokens && qwen2_engine_pos(eng) < MAX_CTX - 1) {
             int next_tok;
-            if (runtime_eager) {
-                if (boot_consumed) {
-                    /* reuse the id the bootstrap qwen2_engine_next returned */
-                    next_tok = boot_id;
-                    boot_consumed = 0;
-                } else {
-                    /* eager engine samples AND feeds the token itself */
-                    next_tok = qwen2_engine_next(eng);
-                }
+            if (no_graph) {
+                /* eager engine samples AND feeds the token itself */
+                next_tok = qwen2_engine_next(eng);
             } else {
                 if (qwen2_debug_copy_logits(eng, logits, VOCAB) < 0) break;
                 next_tok = tt_sample(logits, VOCAB, &sc, &rng_state, wb);
-            }
-            /* TT_DUMP_FIRST_TOK=1: print the very first sampled token id +
-             * decoded text so we can see if the model is EOS-ing on turn 1. */
-            if (gen_count == 0 && getenv("TT_DUMP_FIRST_TOK")) {
-                int dl = 0;
-                const char *ds = bpe_decode_token(tok, next_tok, &dl);
-                fprintf(stderr,
-                        "\n[TT_DUMP_FIRST_TOK] id=%d decoded_len=%d bytes=\"",
-                        next_tok, dl);
-                for (int k = 0; k < dl; k++) {
-                    unsigned char c = (unsigned char)ds[k];
-                    if (c >= 0x20 && c < 0x7f) fputc(c, stderr);
-                    else fprintf(stderr, "\\x%02X", c);
-                }
-                fprintf(stderr, "\" eos_id=%d bos_id=%d\n",
-                        tok->eos_id, tok->bos_id);
             }
             if (next_tok < 0 || next_tok == tok->eos_id ||
                 next_tok == 151643 /* <|endoftext|> */ ||
                 next_tok == 151645 /* <|im_end|> */) {
                 /* close the assistant turn in the KV transcript: eager path
                  * already advanced; graph path feeds the id explicitly */
-                if (!runtime_eager && qwen2_engine_pos(eng) < MAX_CTX - 1)
+                if (!no_graph && qwen2_engine_pos(eng) < MAX_CTX - 1)
                     qwen2_debug_replay_step(eng, next_tok);
                 break;
             }
@@ -409,7 +341,7 @@ int main(void) {
              * has already advanced it internally, and feeding it on the graph
              * path keeps both KV transcripts identical (gate cross-checks). */
             if (qwen2_engine_pos(eng) >= MAX_CTX - 1) break;
-            if (!runtime_eager && qwen2_debug_replay_step(eng, next_tok) < 0) break;
+            if (!no_graph && qwen2_debug_replay_step(eng, next_tok) < 0) break;
             if (stop_cut) break;
         }
         cudaDeviceSynchronize();
