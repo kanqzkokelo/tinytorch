@@ -210,6 +210,15 @@ int main(void) {
     tt_chat_history_init(&g_hist);
     tt_chat_history_push(&g_hist, "system", SYSTEM_PROMPT);
     const tt_chat_opts opts = tt_chat_opts_default();
+    /* SP-mode gemma tokenizers auto-prepend bos_id in bpe_encode; emitting
+     * the literal "<bos>" in fmt_gemma would be mis-tokenized as several
+     * letter pieces ('<','bos','>',...) garbling the prompt prefix and
+     * causing the model to stop after one short token. Suppress the
+     * template's <bos> so the SP path inserts the single real BOS id. */
+    if (fam == TT_CHAT_GEMMA || fam == TT_CHAT_GEMMA4) {
+        tt_chat_opts *writable = (tt_chat_opts *)&opts;
+        writable->add_bos_text = 0;
+    }
 
     char user_input[1024];
     while (1) {
