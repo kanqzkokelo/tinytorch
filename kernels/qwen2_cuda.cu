@@ -1245,6 +1245,12 @@ static int forward_layers(Qwen2Engine *e) {
          *   x += p ; x *= layer_output_scale                        */
         static int no_ple2 = -1;
         if (no_ple2 < 0) no_ple2 = getenv("TT_NO_PLE") ? 1 : 0;
+        /* X1 diagnosis: TT_PLE_NEUTRAL=1 -> skip PLE multiply on ALL layers;
+         * TT_PLE_ONES_TAIL=1 -> skip only layers >= 21. */
+        static int ple_neutral = -1, ple_ones_tail = -1;
+        if (ple_neutral < 0) ple_neutral = getenv("TT_PLE_NEUTRAL") ? 1 : 0;
+        if (ple_ones_tail < 0) ple_ones_tail = getenv("TT_PLE_ONES_TAIL") ? 1 : 0;
+        const int skip_mul = ple_neutral || (ple_ones_tail && l >= 21);
         if (e->has_pl_embd && !no_ple2) {
             const int slot = e->pos % c->max_ctx;
             static float gbuf[1024];
@@ -1286,7 +1292,7 @@ static int forward_layers(Qwen2Engine *e) {
                 const float gv = gbuf[i];
                 gbuf[i] = 0.5f * gv * (1.0f + tanhf(0.7978845608028654f *
                                                     (gv + 0.044715f * gv * gv * gv)));
-                gbuf[i] *= ple_slice[i];
+                if (!skip_mul) gbuf[i] *= ple_slice[i];
             }
 
             if (getenv("TT_PLE_DEBUG") && l == 0) {
@@ -1487,9 +1493,19 @@ static int embed_token(Qwen2Engine *e, int tok) {
 
         cudaMemcpy(e->d_ple_row, e->ple_pe, row * sizeof(float),
                    cudaMemcpyHostToDevice);
-        if (getenv("TT_TRACE"))
+        if (getenv("TT_TRACE")) {
+            const float pv = getenv("TT_PLE_ZERO_TAIL") ? 0.0f : -777.0f;
             k_fill_const<<<(8960*4 - 5376*4 + 255)/256, 256, 0, e->stream>>>(
-                e->d_ple_row + 5376, 8960 - 5376, -777.0f);
+                e->d_ple_row + 5376, 8960 - 5376, pv);
+        }
+        if (getenv("TT_DUMP_PLE")) {
+            static float pled[35 * 256];
+            cudaMemcpy(pled, e->d_ple_row, row * sizeof(float), cudaMemcpyDeviceToHost);
+            char fn[512]; snprintf(fn, sizeof fn, "%s.tok%d",
+                                   getenv("TT_DUMP_PLE"), e->pos);
+            FILE *fp = fopen(fn, "wb"); if (fp) { fwrite(pled, 4, row, fp); fclose(fp); }
+            fprintf(stderr, "[PLE] dumped %s\n", fn);
+        }
     }
     return rc;
 }
