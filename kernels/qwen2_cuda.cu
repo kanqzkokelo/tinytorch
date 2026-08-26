@@ -702,6 +702,10 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     /* heterogeneous layers (gemma4): size staging to per-layer maxima */
     int max_heads = cfg->n_heads, max_kv = cfg->n_kv_heads;
     long max_ffn = F;
+    /* largest q-projection output across layers: full-attn gemma4 layers
+     * carry hd=512 (vs meta hd=256), so qout = heads*hd exceeds
+     * cfg->n_heads*cfg->head_dim. d_q/d_att must fit every layer. */
+    long max_qout = (long)cfg->n_heads * cfg->head_dim;
     if (m && strstr(m->architecture, "gemma4") == m->architecture) {
         const int hd_meta = cfg->head_dim;
         for (int l = 0; l < cfg->n_layers; l++) {
@@ -721,6 +725,8 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
                 e->pl_hd[l] = hd_meta;
             e->pl_heads[l] = qr > 0 ? (int)(qr / e->pl_hd[l]) : cfg->dim / cfg->head_dim;
             if (e->pl_heads[l] > max_heads) max_heads = e->pl_heads[l];
+            if ((long)e->pl_heads[l] * e->pl_hd[l] > max_qout)
+                max_qout = (long)e->pl_heads[l] * e->pl_hd[l];
             e->pl_kv[l] = kr > 0 ? (int)(kr / e->pl_hd[l]) : cfg->n_kv_heads;
             if (e->pl_kv[l] * e->pl_hd[l] > max_kv * hd_meta)
                 max_kv = e->pl_kv[l] * e->pl_hd[l] / hd_meta;
@@ -743,8 +749,8 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
                 "hd0=%d hd4=%d\n", max_heads, max_kv, max_ffn,
                 e->pl_hd[0], e->pl_hd[4]);
     }
-    cudaMalloc(&e->d_q,  (long)max_heads * cfg->head_dim * sizeof(float));
-    cudaMalloc(&e->d_att, (long)max_heads * cfg->head_dim * sizeof(float));
+    cudaMalloc(&e->d_q,  max_qout * sizeof(float));
+    cudaMalloc(&e->d_att, max_qout * sizeof(float));
     cudaMalloc(&e->d_h,  max_ffn * sizeof(float));
     cudaMalloc(&e->d_g,  max_ffn * sizeof(float));   /* split-SwiGLU staging */
     cudaMalloc(&e->d_u,  max_ffn * sizeof(float));
@@ -819,8 +825,8 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     cudaMemset(e->d_kc, 0, cache_per * cfg->n_layers * sizeof(float));
     cudaMemset(e->d_vc, 0, cache_per * cfg->n_layers * sizeof(float));
     cudaMemset(e->d_xn, 0, D * sizeof(float));
-    cudaMemset(e->d_q, 0, (long)cfg->n_heads * cfg->head_dim * sizeof(float));
-    cudaMemset(e->d_att, 0, (long)cfg->n_heads * cfg->head_dim * sizeof(float));
+    cudaMemset(e->d_q, 0, max_qout * sizeof(float));
+    cudaMemset(e->d_att, 0, max_qout * sizeof(float));
     cudaMemset(e->d_h, 0, F * sizeof(float));
     cudaMemset(e->d_g, 0, F * sizeof(float));
     cudaMemset(e->d_u, 0, F * sizeof(float));
@@ -1059,13 +1065,13 @@ static int forward_layers(Qwen2Engine *e) {
                       attn_qout, c->dim, e->stream);
         if (qrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] q gemv rc=%d\n", qrc);
         if (!kv_shared) {
-            int krc = tt_gemv_typed(w->k.ptr, w->k.dtype, e->d_xn, e->d_k_stage, c->n_kv_heads * HD, c->dim, e->stream);
+            int krc = tt_gemv_typed(w->k.ptr, w->k.dtype, e->d_xn, e->d_k_stage, kvdim_l, c->dim, e->stream);
             if (krc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] k gemv rc=%d\n", krc);
         }
         /* QKV biases present in some GGUF conversions of Qwen2 (applied by
          * llama.cpp whenever the tensors exist). Optional by design. */
         CHK_STAGE("2 qkv-gemv");
-        const int kvdim = KV_l * HD;
+        const int kvdim = kvdim_l;   /* per-layer: full-attn gemma4 layers carry hd=512 */
         if (w->q_bias)
             k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_q, w->q_bias, c->dim);
         if (!kv_shared && w->k_bias)
