@@ -120,6 +120,9 @@ typedef struct {
     HashMap tok2id;      /* token bytes -> id */
     HashMap pair_rank;   /* merged-bytes -> merge rank */
     int sp_mode;         /* SentencePiece vocab ('llama'/'gemma4' ggml models) */
+    int pre_add_bos;     /* tokenizer.ggml.pre implies BOS (llama3-style BPE) */
+    int add_bos;         /* resolved add-BOS convention */
+    int kv_add_bos_seen; /* explicit add_bos KV present (overrides defaults) */
     int max_piece;       /* longest vocab piece in bytes */
     unsigned short byte2cp[256];
     signed int cp2byte[32768];       /* -1 if unused */
@@ -185,6 +188,10 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
     t->base.bos_id = -1;
     t->base.eos_id = -1;
     build_byte_unicode_tables(t);
+    /* defaults mirror llama-vocab.cpp: SPM prepends BOS, plain BPE does not;
+     * refined after the KV scan by tokenizer.ggml.pre / add_bos_token */
+    t->add_bos = 1;
+    t->kv_add_bos_seen = 0;
     t->dec_cap = 4096;
     t->dec_buf = (char *)malloc(t->dec_cap);
 
@@ -238,11 +245,28 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
             const size_t cp = slen < sizeof(tm)-1 ? slen : sizeof(tm)-1;
             memcpy(tm, p, cp); tm[cp] = '\0'; p += slen;
             t->sp_mode = (strcmp(tm, "gpt2") != 0);   /* llama/gemma4/gemma => SP */
+        } else if (strcmp(key, "tokenizer.ggml.pre") == 0 && vtype == 8) {
+            const uint64_t slen = read_u64(&p);
+            char pre[32];
+            const size_t cp2 = slen < sizeof(pre)-1 ? slen : sizeof(pre)-1;
+            memcpy(pre, p, cp2); pre[cp2] = '\0'; p += slen;
+            /* mirror llama-vocab.cpp: these BPE families prepend BOS by default */
+            t->pre_add_bos =
+                strcmp(pre, "llama3") == 0 || strcmp(pre, "llama-v3") == 0 ||
+                strcmp(pre, "llama-bpe") == 0 || strcmp(pre, "falcon3") == 0 ||
+                strcmp(pre, "falcon-h1") == 0 || strcmp(pre, "pixtral") == 0 ||
+                strcmp(pre, "midm-2.0") == 0 || strcmp(pre, "lfm2") == 0 ||
+                strcmp(pre, "jina-v5-nano") == 0 || strcmp(pre, "tekken") == 0 ||
+                strcmp(pre, "chameleon") == 0;
         } else if (strcmp(key, "tokenizer.ggml.scores") == 0 && vtype == 9) {
             (void)read_u32(&p);
             const uint64_t n = read_u64(&p);
             t->base.scores = (float *)calloc(n, sizeof(float));
             for (uint64_t j = 0; j < n; j++) { t->base.scores[j] = *(const float *)p; p += 4; }
+        } else if (strcmp(key, "tokenizer.ggml.add_bos_token") == 0 && vtype == 7) {
+            t->add_bos = *(const int8_t *)p ? 1 : 0;
+            t->kv_add_bos_seen = 1;
+            p += 1;
         } else if (strcmp(key, "tokenizer.ggml.bos_token_id") == 0) {
             t->base.bos_id = *(const int32_t *)p;
             skip_kv_value(&p, vtype);
@@ -259,9 +283,11 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
         bpe_tokenizer_free(&t->base);
         return NULL;
     }
-    printf("[BPE] loaded: vocab=%d merges=%llu bos=%d eos=%d\n",
+    if (!t->kv_add_bos_seen)
+        t->add_bos = t->sp_mode ? 1 : t->pre_add_bos;
+    printf("[BPE] loaded: vocab=%d merges=%llu bos=%d eos=%d add_bos=%d\n",
            t->base.vocab_size, (unsigned long long)n_merges,
-           t->base.bos_id, t->base.eos_id);
+           t->base.bos_id, t->base.eos_id, t->add_bos);
     return &t->base;
 }
 
@@ -381,6 +407,11 @@ int bpe_encode(const BPETokenizer *tok_, const char *text, int *out_tokens, int 
     const int len = (int)strlen(text);
     int n_out = 0;
     int pos = 0;
+
+    /* BPE-mode families (llama3 etc.) declare add_bos in GGUF metadata;
+     * honor it exactly like the SP path so prompts match family convention. */
+    if (!t->sp_mode && t->add_bos && t->base.bos_id >= 0 && max_tokens > 0)
+        out_tokens[n_out++] = t->base.bos_id;
 
     if (t->sp_mode) {
         /* SentencePiece (llama/gemma families): greedy longest-piece match.
