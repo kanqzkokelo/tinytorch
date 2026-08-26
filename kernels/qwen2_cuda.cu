@@ -374,6 +374,129 @@ __global__ void k_flash_gqa(const float *__restrict__ q,
         if (i < elems) oh[i] = oreg[i] * inv_l;
 }
 
+/* M9 split-K flash attention (proto source: tests/proto_flash_splitk.cu f7687e6).
+ *
+ * Problem the per-warp path above hits at long ctx: grid = n_heads blocks,
+ * each block serially walks pos-t0+1 slots. SM occupancy caps and the
+ * linear-in-ctx inner loop leave the GPU severely underused; the proto
+ * measured 12x at ctx>=1024 on the same kernel+hardware. Wire-in path:
+ *   - k_flash_gqa_splitk: grid = (H_l, S) blocks, each owns a slot subrange
+ *     of size ~ (nslots + S-1)/S, runs the same online-softmax loop, writes
+ *     raw (m, l, acc[hd]) partials to per-call workspace.
+ *   - k_flash_gqa_combine: one block/head, online-softmax-merges the S
+ *     partials. Order-independent to fp noise; m84/m61 goldens match the
+ *     per-warp path at short ctx.
+ *
+ * Workspace alloc: S * H_l * (HDl + 2) floats. S = clamp(ctx/256, 2, 16).
+ * Per-engine scratch in Qwen2Engine (d_split_pacc/pm/pl) sized to the worst
+ * per-layer (max heads, max hd) seen in the model. */
+__global__ void k_flash_gqa_splitk(const float *__restrict__ q,
+                                   const float *__restrict__ Kc,
+                                   const float *__restrict__ Vc,
+                                   float *__restrict__ p_acc, /* [S][H][hd] */
+                                   float *__restrict__ p_m,   /* [S][H]    */
+                                   float *__restrict__ p_l,   /* [S][H]    */
+                                   const int *__restrict__ d_pos,
+                                   int n_heads, int n_kv_heads, int head_dim,
+                                   float scale, int window, int S) {
+    const int pos = *d_pos;
+    const int h = blockIdx.x;
+    const int s = blockIdx.y;
+    const int lane = threadIdx.x;
+    const int kvh = h / (n_heads / n_kv_heads);
+    const int elems = head_dim / 32;
+
+    int t_lo = 0;
+    if (window > 0 && pos >= window) t_lo = pos - window + 1;
+    const int nslots = pos - t_lo + 1;
+    const int chunk = (nslots + S - 1) / S;
+    const int begin = t_lo + s * chunk;
+    const int end = min(pos + 1, t_lo + (s + 1) * chunk);
+
+    float *myacc = p_acc + ((size_t)s * n_heads + h) * head_dim + lane * elems;
+    float *mym = p_m + (size_t)s * n_heads + h;
+    float *myl = p_l + (size_t)s * n_heads + h;
+
+    if (begin >= end) {
+        *mym = -INFINITY;
+        *myl = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 16; i++)
+            if (i < elems) myacc[i] = 0.0f;
+        return;
+    }
+
+    const float *qh = q + (long)h * head_dim + lane * elems;
+    float qreg[16];
+#pragma unroll
+    for (int i = 0; i < 16; i++) qreg[i] = (i < elems) ? qh[i] : 0.0f;
+
+    float m_prev = -1e30f, l_prev = 0.0f;
+    float oreg[16] = {0};
+
+    for (int t = begin; t < end; t++) {
+        const long off = ((long)t * n_kv_heads + kvh) * head_dim + lane * elems;
+        const float *kp = Kc + off;
+        const float *vp = Vc + off;
+        float score = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 16; i++)
+            if (i < elems) score += qreg[i] * kp[i];
+        score = warp_sum(score);
+        score = __shfl_sync(0xffffffff, score, 0) * scale;
+
+        const float m_new = fmaxf(m_prev, score);
+        const float ex = expf(score - m_new);
+        const float alpha = expf(m_prev - m_new);
+        l_prev = l_prev * alpha + ex;
+#pragma unroll
+        for (int i = 0; i < 16; i++)
+            if (i < elems) oreg[i] = oreg[i] * alpha + ex * vp[i];
+        m_prev = m_new;
+    }
+
+    *mym = m_prev;
+    *myl = l_prev;
+#pragma unroll
+    for (int i = 0; i < 16; i++)
+        if (i < elems) myacc[i] = oreg[i];
+}
+
+__global__ void k_flash_gqa_combine(const float *__restrict__ p_acc,
+                                   const float *__restrict__ p_m,
+                                   const float *__restrict__ p_l,
+                                   float *__restrict__ out,
+                                   int n_heads, int head_dim, int S) {
+    const int h = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int elems = head_dim / 32;
+
+    float m = -INFINITY, l = 0.0f;
+    float oreg[16] = {0};
+
+    for (int s = 0; s < S; s++) {
+        const size_t idx = (size_t)s * n_heads + h;
+        const float ls = p_l[idx];
+        if (!(ls > 0.0f)) continue; /* empty split */
+        const float ms = p_m[idx];
+        const float m_new = fmaxf(m, ms);
+        const float alpha = expf(m - m_new);
+        const float beta = expf(ms - m_new);
+        const float *acc = p_acc + idx * head_dim + lane * elems;
+        l = l * alpha + ls * beta;
+#pragma unroll
+        for (int i = 0; i < 16; i++)
+            if (i < elems) oreg[i] = oreg[i] * alpha + acc[i] * beta;
+        m = m_new;
+    }
+
+    const float inv_l = 1.0f / (l + 1e-8f);
+    float *oh = out + (long)h * head_dim + lane * elems;
+#pragma unroll
+    for (int i = 0; i < 16; i++)
+        if (i < elems) oh[i] = oreg[i] * inv_l;
+}
+
 /* Scatter staged K/V rows into the cache slot given by the device position
  * scalar. Runs after K staging (+bias+RoPE), so the cache holds post-RoPE K. */
 __global__ void k_kv_scatter(const float *__restrict__ kst, const float *__restrict__ vst,
@@ -596,6 +719,13 @@ struct Qwen2Engine {
     int   *d_n_recent;            /* valid count in ring */
     int   *d_sampling_on;         /* 0/1 flag read by kernels inside graph */
     int pending_tok;              /* sampled token not yet fed through layers */
+    /* M9 split-K flash attention workspace (long-ctx decode). Sized to
+     * S=16 * max_heads * (max_hd + 2) floats in qwen2_engine_create; freed
+     * in qwen2_engine_free. S=clamp(ctx/256,2,16) at launch. */
+    float *d_split_pacc;          /* [S_MAX * max_heads * max_hd] */
+    float *d_split_pm;            /* [S_MAX * max_heads] */
+    float *d_split_pl;            /* [S_MAX * max_heads] */
+    int    d_split_S_max;         /* S at workspace alloc time (capacity) */
     /* gemma4 MatFormer per-layer embeddings */
     TTensor pl_model_proj;        /* [n_layers*256, dim] typed */
     float *pl_proj_norm_host;     /* [256] host gamma */
@@ -798,6 +928,7 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     cudaMalloc(&e->d_xn, D * sizeof(float));
     /* heterogeneous layers (gemma4): size staging to per-layer maxima */
     int max_heads = cfg->n_heads, max_kv = cfg->n_kv_heads;
+    int max_hd = cfg->head_dim;
     long max_ffn = F;
     /* largest q-projection output across layers: full-attn gemma4 layers
      * carry hd=512 (vs meta hd=256), so qout = heads*hd exceeds
@@ -820,6 +951,7 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
             e->pl_hd[l] = (qr > 0 && kr > 0) ? (int)a : hd_meta;
             if (e->pl_hd[l] <= 0 || qr % e->pl_hd[l] != 0 || kr % e->pl_hd[l] != 0)
                 e->pl_hd[l] = hd_meta;
+            if (e->pl_hd[l] > max_hd) max_hd = e->pl_hd[l];
             e->pl_heads[l] = qr > 0 ? (int)(qr / e->pl_hd[l]) : cfg->dim / cfg->head_dim;
             if (e->pl_heads[l] > max_heads) max_heads = e->pl_heads[l];
             if ((long)e->pl_heads[l] * e->pl_hd[l] > max_qout)
@@ -910,6 +1042,19 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         }
     }
     cudaMalloc(&e->d_logits, (long)e->cfg.vocab * sizeof(float));
+    /* M9 split-K flash workspace. Sized to the worst per-layer (max heads,
+     * max hd) seen in this model. S = clamp(ctx/256, 2, 16) at launch;
+     * workspace capacity = 16, sufficient for any ctx <= 4096. Peak for
+     * gemma4 (16 heads * hd 512): 16 * 16 * 514 * 4 ~= 526 KB. */
+    {
+        const int S_MAX = 16;
+        const size_t per_acc = (size_t)max_heads * max_hd;
+        const size_t per_ml  = (size_t)max_heads;
+        cudaMalloc(&e->d_split_pacc, (size_t)S_MAX * per_acc * sizeof(float));
+        cudaMalloc(&e->d_split_pm,   (size_t)S_MAX * per_ml  * sizeof(float));
+        cudaMalloc(&e->d_split_pl,   (size_t)S_MAX * per_ml  * sizeof(float));
+        e->d_split_S_max = S_MAX;
+    }
     /* per-layer max kv width: gemma4 full layers carry 2x the kv heads */
     const long cache_per = (long)max_kv * cfg->max_ctx * cfg->head_dim;
     cudaMalloc(&e->d_kc, cache_per * cfg->n_layers * sizeof(float));
@@ -975,6 +1120,9 @@ void qwen2_engine_free(Qwen2Engine *e) {
     cudaFree(e->d_logits); cudaFree(e->d_kc); cudaFree(e->d_vc);
     cudaFree(e->d_k_stage); cudaFree(e->d_v_stage); cudaFree(e->d_pos);
     cudaFree(e->d_bvals); cudaFree(e->d_bidxs); cudaFree(e->d_out);
+    if (e->d_split_pacc) cudaFree(e->d_split_pacc);
+    if (e->d_split_pm)   cudaFree(e->d_split_pm);
+    if (e->d_split_pl)   cudaFree(e->d_split_pl);
     if (e->d_recent) cudaFree(e->d_recent);
     if (e->d_n_recent) cudaFree(e->d_n_recent);
     if (e->h_sampled) cudaFreeHost(e->h_sampled);
@@ -1244,14 +1392,44 @@ static int forward_layers(Qwen2Engine *e) {
 
         CHK_STAGE("3 rope");
         /* 4. GQA flash attention over slots [t0..pos]; t0 raised by the SWA
-         * trait (gemma2), full [0..pos] when swa_size == 0 (qwen2 unchanged). */
+         * trait (gemma2), full [0..pos] when swa_size == 0 (qwen2 unchanged).
+         * M9 split-K wire-in: at long ctx the per-warp serial loop
+         * underutilizes the GPU (8-16 blocks on 20+ SMs), so dispatch to
+         * S = clamp(ctx/256, 2, 16) split-K + combine when ctx > 128.
+         * Short ctx keeps the serial path (lower launch overhead). The
+         * dispatch is host-side and runs once per forward_layers invocation;
+         * under graph capture the chosen path is fixed for the recorded
+         * graph's lifetime — safe because the serial path is functionally
+         * correct at every ctx and the test gates use short ctx. */
         if (tt_profiling()) tt_prof_begin(TT_P_FLASH, e->stream);
-        k_flash_gqa<<<H_l, 32, 0, e->stream>>>(
-            e->d_q, Kl_f, Vl_f, e->d_att,
-            e->d_pos,
-            H_l, KV_l, HDl, c->max_ctx,
-            (c->tr.attn_scale_one ? 1.0f : 1.0f / sqrtf((float)HD)),
-            e->has_pl_embd ? e->pl_swa[l] : c->tr.swa_size);
+        {
+            const int ctx_l = e->pos;            /* host mirror of *d_pos */
+            const float scale_l = c->tr.attn_scale_one ? 1.0f
+                              : 1.0f / sqrtf((float)HD);   /* match prior kernel arg */
+            const int swa_l = e->has_pl_embd ? e->pl_swa[l] : c->tr.swa_size;
+            if (ctx_l > 128) {
+                int S = ctx_l / 256;
+                if (S < 2) S = 2;
+                if (S > 16) S = 16;
+                if (S > e->d_split_S_max) S = e->d_split_S_max;
+                dim3 grid_split(H_l, S);
+                k_flash_gqa_splitk<<<grid_split, 32, 0, e->stream>>>(
+                    e->d_q, Kl_f, Vl_f,
+                    e->d_split_pacc, e->d_split_pm, e->d_split_pl,
+                    e->d_pos,
+                    H_l, KV_l, HDl,
+                    scale_l, swa_l, S);
+                k_flash_gqa_combine<<<H_l, 32, 0, e->stream>>>(
+                    e->d_split_pacc, e->d_split_pm, e->d_split_pl,
+                    e->d_att, H_l, HDl, S);
+            } else {
+                k_flash_gqa<<<H_l, 32, 0, e->stream>>>(
+                    e->d_q, Kl_f, Vl_f, e->d_att,
+                    e->d_pos,
+                    H_l, KV_l, HDl, c->max_ctx,
+                    scale_l, swa_l);
+            }
+        }
         if (tt_profiling()) tt_prof_end(TT_P_FLASH, e->stream);
 
         CHK_STAGE("4 flash");
