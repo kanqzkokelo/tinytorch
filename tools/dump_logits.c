@@ -50,6 +50,11 @@ int main(int argc, char **argv) {
         toks[n++] = (int)v;
         p = strtok_r(NULL, ",", &save);
     }
+    if (p) { // another id exists past the 512 cap — refuse silently-wrong dumps
+        fprintf(stderr, "ERROR: token list truncated at %d ids; remaining input starting at '%s' dropped\n", n, p);
+        qwen2_engine_free(e);
+        return 1;
+    }
 
     // prefill all but last; then run final norm+logits manually via next() path
     // NOTE: next() also advances; we instead replicate its norm+logits stage here
@@ -70,7 +75,13 @@ int main(int argc, char **argv) {
     printf("ARGMAX %d %.4f VOCAB %d\n", best, mv, nvocab);
     if (dump_path) {
         FILE *f = fopen(dump_path, "wb");
-        fwrite(lg, 4, nvocab, f);
+        if (!f) { perror(dump_path); qwen2_engine_free(e); return 1; }
+        if (fwrite(lg, 4, nvocab, f) != (size_t)nvocab) {
+            fprintf(stderr, "short write to %s\n", dump_path);
+            fclose(f);
+            qwen2_engine_free(e);
+            return 1;
+        }
         fclose(f);
     }
     qwen2_engine_free(e);
