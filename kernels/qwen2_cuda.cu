@@ -1141,7 +1141,7 @@ static int forward_layers(Qwen2Engine *e) {
         if (tt_profiling()) tt_prof_begin(TT_P_SCATTER, e->stream);
         k_kv_scatter<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(
             e->d_k_stage, e->d_v_stage, Kl_f, Vl_f, e->d_pos,
-            KV_l, HD, c->max_ctx);
+            KV_l, HDl, c->max_ctx);
         if (tt_profiling()) tt_prof_end(TT_P_SCATTER, e->stream);
         }
 
