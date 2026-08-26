@@ -10,6 +10,59 @@
 #include "tokenizer_bpe.h"
 #include "async_printer.h"
 
+/* ---- configurable stop strings (TT_STOP_STRINGS, ';'-separated) ---- */
+#define MAX_STOP_STRINGS 40
+#define MAX_STOP_LEN     63
+static char g_stop[MAX_STOP_STRINGS][MAX_STOP_LEN + 1];
+static int  g_nstop = 0;
+
+static void chat_add_stop(const char *s, size_t n) {
+    if (g_nstop >= MAX_STOP_STRINGS || n == 0 || n > MAX_STOP_LEN) return;
+    memcpy(g_stop[g_nstop], s, n);
+    g_stop[g_nstop][n] = '\0';
+    g_nstop++;
+}
+
+static void chat_init_stop_strings(void) {
+    /* legacy hardcoded guards stay active regardless of env */
+    chat_add_stop("<|im_end|>", 10);
+    chat_add_stop("<|endoftext|>", 13);
+    chat_add_stop("<|im_start|>", 12);
+    const char *src = getenv("TT_STOP_STRINGS");
+    if (!(src && src[0]))
+        src = "<start_of_turn>;<end_of_turn>;<bos>";
+    while (*src) {
+        const char *semi = strchr(src, ';');
+        size_t n = semi ? (size_t)(semi - src) : strlen(src);
+        chat_add_stop(src, n);
+        if (!semi) break;
+        src = semi + 1;
+    }
+}
+
+/* earliest occurrence of any stop string in NUL-terminated buf; NULL if none */
+static const char *chat_find_stop(const char *buf) {
+    const char *best = NULL;
+    for (int i = 0; i < g_nstop; i++) {
+        const char *hit = strstr(buf, g_stop[i]);
+        if (hit && (!best || hit < best)) best = hit;
+    }
+    return best;
+}
+
+/* length of longest suffix of buf[0..n) that is a PROPER PREFIX of some stop
+ * string — these bytes must be withheld until we know the marker's fate */
+static size_t chat_holdback_len(const char *buf, size_t n) {
+    size_t hold = 0;
+    for (int i = 0; i < g_nstop; i++) {
+        size_t slen = strlen(g_stop[i]);
+        size_t maxl = slen - 1 < n ? slen - 1 : n;
+        for (size_t l = maxl; l > hold; l--)
+            if (memcmp(buf + n - l, g_stop[i], l) == 0) { hold = l; break; }
+    }
+    return hold;
+}
+
 int main(void) {
     const char *model_path =
         (getenv("TT_MODEL") && getenv("TT_MODEL")[0])
@@ -22,6 +75,10 @@ int main(void) {
     printf("   Model: %s\n", model_path);
     printf("   Type '/exit' to quit.\n");
     printf("=======================================================\n\n");
+
+    chat_init_stop_strings();
+    const int max_tokens = getenv("TT_MAX_TOKENS") && atoi(getenv("TT_MAX_TOKENS")) > 0
+                               ? atoi(getenv("TT_MAX_TOKENS")) : 512;
 
     GGUFModel *model = gguf_load(model_path);
     if (!model) return 1;
@@ -96,7 +153,8 @@ int main(void) {
         int gen_count = 0;
         char turn_text[8192];
         size_t tl = 0;
-        for (int step = 0; step < 256 && qwen2_engine_pos(eng) < MAX_CTX - 1; step++) {
+        size_t emitted = 0;   /* bytes already streamed to the printer */
+        for (int step = 0; step < max_tokens && qwen2_engine_pos(eng) < MAX_CTX - 1; step++) {
             const int next_tok = qwen2_engine_next(eng);
             if (next_tok < 0 || next_tok == tok->eos_id ||
                 next_tok == 151643 /* <|endoftext|> */ ||
@@ -111,19 +169,24 @@ int main(void) {
                 tl += (size_t)out_len;
                 turn_text[tl] = '\0';
             }
-            const char *cut = NULL;
-            static const char *markers[] = {"<|im_end|>", "<|endoftext|>",
-                                            "<|im_start|>", NULL};
-            for (int mi = 0; markers[mi]; mi++)
-                if ((cut = strstr(turn_text, markers[mi]))) break;
+            /* stop-string check across the WHOLE buffer so markers spanning
+             * token boundaries ("<end" + "_of_turn>") are caught too; any
+             * suffix that is a prefix of a marker is withheld from streaming */
+            const char *cut = chat_find_stop(turn_text);
             if (cut) {
                 const size_t keep = (size_t)(cut - turn_text);
-                if (keep > tl - (size_t)out_len)          /* marker inside this token */
-                    async_printer_push(ap, turn_text + (tl - (size_t)out_len),
-                                       (int)(keep - (tl - (size_t)out_len)));
+                if (keep > emitted)
+                    async_printer_push(ap, turn_text + emitted,
+                                       (int)(keep - emitted));
                 break;
             }
-            async_printer_push(ap, s, out_len);
+            const size_t hold = chat_holdback_len(turn_text, tl);
+            const size_t safe = tl - hold;
+            if (safe > emitted) {
+                async_printer_push(ap, turn_text + emitted,
+                                   (int)(safe - emitted));
+                emitted = safe;
+            }
             gen_count++;
         }
         cudaDeviceSynchronize();
