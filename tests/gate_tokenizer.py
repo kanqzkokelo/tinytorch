@@ -11,6 +11,19 @@ For every local GGUF model in data/testmodels/ <= 1.5 GB:
      (leading BOS excluded from both legs).
 
 PASS bar: 100% id equality per model. Tokenizers are exact-match domain.
+
+KNOWN REMAINING FAILURES (documented, per-family deterministic; see also the
+header note in src/tokenizer_bpe.c):
+- BPE models (qwen3, llama3): unicode/emoji/CJK, multi-space runs,
+  code-snippet punctuation attachment, "<start_of_turn>" text — our
+  pre-tokenization is a simplified chunk rule, not the full GPT-2 regex
+  (unicode letter classes, space-run splitting `\s+(?!\S)`, optional single
+  punct attached to word pieces).
+- SP models (smollm2): same pre-tok gaps plus greedy longest-piece matching
+  instead of scored unigram Viterbi, so interior-word pieces fall back to
+  <0xNN> bytes where llama.cpp merges them.
+BOS handling is NOT among them anymore: add-BOS convention now mirrors
+llama-vocab.cpp for both modes (fixed in src/tokenizer_bpe.c).
 """
 
 import os
