@@ -1230,6 +1230,7 @@ static int forward_layers(Qwen2Engine *e) {
         }
         if (trace && l == 0) eng_rms(e, e->d_xn, "mlp_raw", c->dim);
         if (trace && e->has_pl_embd && l >= 18 && l <= 21) ple_canary(e, "mlp", l);
+
         if (trace) {
             static float xt[1536];
             cudaMemcpy(xt, e->d_x, c->dim * 4, cudaMemcpyDeviceToHost);
@@ -1245,12 +1246,6 @@ static int forward_layers(Qwen2Engine *e) {
          *   x += p ; x *= layer_output_scale                        */
         static int no_ple2 = -1;
         if (no_ple2 < 0) no_ple2 = getenv("TT_NO_PLE") ? 1 : 0;
-        /* X1 diagnosis: TT_PLE_NEUTRAL=1 -> skip PLE multiply on ALL layers;
-         * TT_PLE_ONES_TAIL=1 -> skip only layers >= 21. */
-        static int ple_neutral = -1, ple_ones_tail = -1;
-        if (ple_neutral < 0) ple_neutral = getenv("TT_PLE_NEUTRAL") ? 1 : 0;
-        if (ple_ones_tail < 0) ple_ones_tail = getenv("TT_PLE_ONES_TAIL") ? 1 : 0;
-        const int skip_mul = ple_neutral || (ple_ones_tail && l >= 21);
         if (e->has_pl_embd && !no_ple2) {
             const int slot = e->pos % c->max_ctx;
             static float gbuf[1024];
@@ -1292,7 +1287,7 @@ static int forward_layers(Qwen2Engine *e) {
                 const float gv = gbuf[i];
                 gbuf[i] = 0.5f * gv * (1.0f + tanhf(0.7978845608028654f *
                                                     (gv + 0.044715f * gv * gv * gv)));
-                if (!skip_mul) gbuf[i] *= ple_slice[i];
+                gbuf[i] *= ple_slice[i];
             }
 
             if (getenv("TT_PLE_DEBUG") && l == 0) {
@@ -1321,6 +1316,7 @@ static int forward_layers(Qwen2Engine *e) {
                     e->d_xn, w->pl_post_norm, e->d_xn, c->dim, c->rms_eps,
                     c->tr.norm_offset);
             k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
+
             /* per-layer output scale (scalar by value) */
             if (w->out_scale_val != 0.0f && w->out_scale_val != 1.0f)
                 k_scale<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(
@@ -1460,7 +1456,10 @@ static int embed_token(Qwen2Engine *e, int tok) {
                    cudaMemcpyDeviceToHost);   /* reuse as staging */
         fprintf(stderr, "[PLE] D deq\n");
 
-        /* dequant per_layer_token_embd row 'tok' (q4_0), scale by sqrt(pl_dim) */
+        /* dequant per_layer_token_embd row 'tok' (q4_0), scale by sqrt(pl_dim).
+         * llama.cpp build_inp_per_layer scales the raw get_rows output by
+         * tok_embd_scale = sqrt(n_embd_per_layer) BEFORE project_per_layer_inputs
+         * adds it to the normed projection. */
         GGUFTensor *tp = gguf_get_tensor(e->gguf, "per_layer_token_embd.weight");
         if (!tp || !tp->data) return -10;
         static float pe_full[64 * 1024];
@@ -1473,11 +1472,12 @@ static int embed_token(Qwen2Engine *e, int tok) {
             case TTQ_F16:  rb = row * 2; break;
             default: fprintf(stderr, "[qwen2-engine] ple: unsupported pe dtype %d (TTQ_Q5_K=%d)\n", tp->type, TTQ_Q5_K); return -11;
         }
-        /* NOTE: llama.cpp project_per_layer_inputs adds the RAW get_rows
-         * output — no sqrt(pl_dim) scaling on the token-embedding side. */
+        /* CPU: per-slice rmsnorm w/ pl_proj_norm, then add pe*sqrt(pl_dim),
+         * then *1/sqrt2 */
         ttq_dequant((const char *)tp->data + (long)tok * rb, tp->type, row, pe_full);
 
-        /* CPU: per-slice rmsnorm w/ pl_proj_norm, then add pe, then *1/sqrt2 */
+        /* CPU: per-slice rmsnorm w/ pl_proj_norm, then + pe*sqrt(pl_dim),
+         * then *1/sqrt2 (done inside ple_finish_host) */
         fprintf(stderr, "[PLE] E finish\n");
         if (getenv("TT_TRACE")) {
             int nb1 = 0, nb2 = 0;
@@ -1487,6 +1487,8 @@ static int embed_token(Qwen2Engine *e, int tok) {
             }
             fprintf(stderr, "[PLE] nan-check: pe_full_nan=%d ple_pe_nan=%d\n", nb1, nb2);
         }
+        const float pe_scale = sqrtf((float)e->pl_dim);
+        for (long i = 0; i < row; i++) pe_full[i] *= pe_scale;
         ple_finish_host(e->ple_pe, e->pl_proj_norm_host, pe_full,
                         e->cfg.n_layers);
         fprintf(stderr, "[PLE] F done\n");
