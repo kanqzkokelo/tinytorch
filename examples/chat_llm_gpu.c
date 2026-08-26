@@ -1,5 +1,11 @@
 // Interactive terminal chat over the M6-correct Qwen2 decode engine.
 // Real prompt encoding, real prefill (KV cache populated), real generation.
+//
+// M-latest integration:
+//   - prompt formatting via src/chat_template.h (family auto-detected from
+//     GGUF general.architecture, multi-turn accumulation via tt_chat_history)
+//   - sampling via src/samplers.h tt_sampler_chain (engine runs greedy; the
+//     chain samples on the host from the engine's logits each step)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,8 +15,13 @@
 #include "qwen2_engine.h"
 #include "tokenizer_bpe.h"
 #include "async_printer.h"
+#include "chat_template.h"
+#include "samplers.h"
 
-/* ---- configurable stop strings (TT_STOP_STRINGS, ';'-separated) ---- */
+/* ---- configurable stop strings ----
+ * Default marker comes from the chat family (tt_chat_stop_string); legacy
+ * guards and any TT_STOP_STRINGS entries (';'-separated) are ADDED ON TOP,
+ * so user overrides stay additive. */
 #define MAX_STOP_STRINGS 40
 #define MAX_STOP_LEN     63
 static char g_stop[MAX_STOP_STRINGS][MAX_STOP_LEN + 1];
@@ -23,15 +34,14 @@ static void chat_add_stop(const char *s, size_t n) {
     g_nstop++;
 }
 
-static void chat_init_stop_strings(void) {
-    /* legacy hardcoded guards stay active regardless of env */
-    chat_add_stop("<|im_end|>", 10);
+static void chat_init_stop_strings(tt_chat_family fam) {
+    const char *fs = tt_chat_stop_string(fam);
+    if (fs) chat_add_stop(fs, strlen(fs));
+    /* legacy hardcoded guards stay active regardless of family/env */
     chat_add_stop("<|endoftext|>", 13);
     chat_add_stop("<|im_start|>", 12);
     const char *src = getenv("TT_STOP_STRINGS");
-    if (!(src && src[0]))
-        src = "<start_of_turn>;<end_of_turn>;<bos>";
-    while (*src) {
+    while (src && *src) {
         const char *semi = strchr(src, ';');
         size_t n = semi ? (size_t)(semi - src) : strlen(src);
         chat_add_stop(src, n);
@@ -63,6 +73,37 @@ static size_t chat_holdback_len(const char *buf, size_t n) {
     return hold;
 }
 
+/* ---- sampler-chain env knobs ---- */
+static float env_float(const char *k, float dflt) {
+    const char *v = getenv(k);
+    return (v && v[0]) ? (float)atof(v) : dflt;
+}
+static int env_int(const char *k, int dflt) {
+    const char *v = getenv(k);
+    return (v && v[0]) ? atoi(v) : dflt;
+}
+
+/* recent-token window for repetition/frequency/presence penalties */
+#define PENALTY_WINDOW 64
+static int32_t g_recent[PENALTY_WINDOW];
+static int     g_nrecent = 0;
+static void recent_push(int32_t tok) {
+    if (PENALTY_WINDOW > 1 && g_nrecent == PENALTY_WINDOW)
+        memmove(g_recent, g_recent + 1, sizeof(int32_t) * (PENALTY_WINDOW - 1));
+    if (g_nrecent < PENALTY_WINDOW) g_nrecent++;
+    g_recent[g_nrecent - 1] = tok;
+}
+
+/* ---- multi-turn formatting state ---- */
+static tt_chat_history g_hist;
+static char   g_prev_fmt[16384];          /* last fully-formatted prompt     */
+static size_t g_prev_len = 0;             /* bytes already fed through KV    */
+
+static const char *env_or_empty(const char *k) {
+    const char *v = getenv(k);
+    return v ? v : "";
+}
+
 int main(void) {
     const char *model_path =
         (getenv("TT_MODEL") && getenv("TT_MODEL")[0])
@@ -76,15 +117,25 @@ int main(void) {
     printf("   Type '/exit' to quit.\n");
     printf("=======================================================\n\n");
 
-    chat_init_stop_strings();
-    const int max_tokens = getenv("TT_MAX_TOKENS") && atoi(getenv("TT_MAX_TOKENS")) > 0
-                               ? atoi(getenv("TT_MAX_TOKENS")) : 512;
-
     GGUFModel *model = gguf_load(model_path);
     if (!model) return 1;
 
+    /* chat template family straight from GGUF general.architecture */
+    tt_chat_family fam = tt_chat_family_from_arch(model->architecture);
+    if (fam < 0) {
+        fprintf(stderr, "[chat] unknown arch '%s' — falling back to ChatML\n",
+                model->architecture[0] ? model->architecture : "?");
+        fam = TT_CHAT_QWEN2;
+    }
+    chat_init_stop_strings(fam);
+
     BPETokenizer *tok = bpe_tokenizer_init(model);
     if (!tok) { gguf_free(model); return 1; }
+
+    /* cfg.vocab can be 0 when GGUF metadata omits <arch>.vocab_size; the
+     * tokenizer's row count always matches the embedding matrix the engine
+     * actually uses (engine re-derives it from token_embd shape itself) */
+    const int VOCAB = tok->vocab_size;
 
     TTConfig cfg = tt_config_from_gguf(model, MAX_CTX);
     if (cfg.dim == 0) {
@@ -92,25 +143,74 @@ int main(void) {
         bpe_tokenizer_free(tok); gguf_free(model); return 1;
     }
     printf("[chat] config: dim=%d ffn=%d layers=%d heads=%d kv_heads=%d head_dim=%d "
-           "vocab=%d eps=%g rope_base=%g\n",
+           "vocab=%d eps=%g rope_base=%g arch=%s\n",
            cfg.dim, cfg.hidden_dim, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads,
-           cfg.head_dim, cfg.vocab, cfg.rms_eps, cfg.rope_base);
+           cfg.head_dim, cfg.vocab, cfg.rms_eps, cfg.rope_base,
+           model->architecture[0] ? model->architecture : "?");
 
     Qwen2Engine *eng = qwen2_engine_create(&cfg, model);
     if (!eng) { fprintf(stderr, "[chat] engine init failed\n"); return 1; }
 
-    /* sampling defaults for chat (env-tunable); greedy via TT_GREEDY=1 */
-    if (!getenv("TT_GREEDY")) {
-        const float temp = getenv("TT_TEMP") ? atof(getenv("TT_TEMP")) : 0.8f;
-        const float pen  = getenv("TT_REPEAT_PENALTY")
-                           ? atof(getenv("TT_REPEAT_PENALTY")) : 1.15f;
-        qwen2_engine_set_sampling(eng, temp, 40, pen);
+    /* sampler chain from env knobs (supersedes ad-hoc temp/penalty code) */
+    tt_sampler_chain sc;
+    tt_sampler_chain_init(&sc);
+    const int greedy = env_or_empty("TT_GREEDY")[0] != '\0';
+    sc.greedy           = greedy;
+    sc.temp             = env_float("TT_TEMP", 0.8f);
+    sc.repeat_penalty   = env_float("TT_REPEAT_PENALTY", 1.15f);
+    sc.top_k            = env_int("TT_TOP_K", 0);
+    sc.top_p            = env_float("TT_TOP_P", 1.0f);
+    sc.min_p            = env_float("TT_MIN_P", 0.0f);
+    sc.freq_penalty     = env_float("TT_FREQ_PENALTY", 0.0f);
+    sc.presence_penalty = env_float("TT_PRESENCE_PENALTY", 0.0f);
+    sc.penalty_last_n   = PENALTY_WINDOW;
+    sc.freq_last_n      = PENALTY_WINDOW;
+    sc.use_rep_penalty  = sc.repeat_penalty != 1.0f;
+    sc.use_freq_presence = sc.freq_penalty != 0.0f || sc.presence_penalty != 0.0f;
+
+    /* xorshift64* state: TT_SEED for reproducibility, time-based otherwise */
+    uint64_t rng_state;
+    const char *se = getenv("TT_SEED");
+    if (se && se[0]) rng_state = strtoull(se, NULL, 10);
+    else rng_state = ((uint64_t)time(NULL) << 17) ^ (uint64_t)clock() ^
+                     0x9E3779B97F4A7C15ull;
+    if (!rng_state) rng_state = 1;
+    if (!greedy)
+        fprintf(stderr, "[chat] sampler: temp=%.2f top_k=%d top_p=%.2f min_p=%.2f "
+                "rep=%.2f freq=%.2f pres=%.2f seed=%llu%s\n",
+                sc.temp, sc.top_k, sc.top_p, sc.min_p, sc.repeat_penalty,
+                sc.freq_penalty, sc.presence_penalty,
+                (unsigned long long)(se && se[0] ? strtoull(se, NULL, 10) : 0),
+                se && se[0] ? "" : " (time-based)");
+
+    /* Engine default is GREEDY. On the graph path all stochastic sampling
+     * happens host-side via tt_sampler_chain. The eager fallback
+     * (TT_NO_GRAPH=1 / TT_PROFILE) has no injection point for host sampling,
+     * so it keeps the engine's legacy GPU Gumbel-max path (temp + repeat
+     * penalty only; top-p/min-p/freq/presence need the graph path). */
+    const int no_graph = (getenv("TT_NO_GRAPH") || getenv("TT_PROFILE")) ? 1 : 0;
+    if (no_graph && !greedy) {
+        qwen2_engine_set_sampling(eng, sc.temp,
+                                  sc.top_k > 0 ? sc.top_k : 40,
+                                  sc.repeat_penalty);
+        fprintf(stderr, "[chat] eager fallback: engine-side sampling "
+                "(temp/repeat-penalty only)\n");
     }
+
+    float *logits = malloc(sizeof(float) * (size_t)VOCAB);
+    float *wb     = malloc(sizeof(float) * (size_t)tt_sampler_workbuf_size(VOCAB));
+    if (!logits || !wb) { fprintf(stderr, "[chat] OOM (sampler buffers)\n"); return 1; }
+
+    const int max_tokens = getenv("TT_MAX_TOKENS") && atoi(getenv("TT_MAX_TOKENS")) > 0
+                               ? atoi(getenv("TT_MAX_TOKENS")) : 512;
 
     static const char *SYSTEM_PROMPT =
         "You are a helpful assistant. Respond in English by default unless "
         "the user writes in another language. Give complete, detailed answers.";
-    int session_started = 0;
+    tt_chat_history_init(&g_hist);
+    tt_chat_history_push(&g_hist, "system", SYSTEM_PROMPT);
+    const tt_chat_opts opts = tt_chat_opts_default();
+
     char user_input[1024];
     while (1) {
         printf("\nUser > ");
@@ -123,21 +223,28 @@ int main(void) {
         if (len == 0) continue;
         if (!strcmp(user_input, "/exit") || !strcmp(user_input, "quit")) break;
 
-        char formatted[1400];
-        if (!session_started) {
-            /* system prompt steers language/behavior; standard chat-UI practice */
-            snprintf(formatted, sizeof(formatted),
-                     "<|im_start|>system\n%s<|im_end|>\n"
-                     "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
-                     SYSTEM_PROMPT, user_input);
-            session_started = 1;
-        } else {
-            snprintf(formatted, sizeof(formatted),
-                     "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", user_input);
+        /* accumulate + render the full conversation, then prefill ONLY the
+         * byte-suffix that extends the previously fed prompt (KV cache keeps
+         * prior turns; the split always lands on a '<|im_start|>' boundary) */
+        tt_chat_history_push(&g_hist, "user", user_input);
+        char formatted[sizeof(g_prev_fmt)];
+        const int need = tt_chat_history_format(&g_hist, fam, &opts,
+                                                formatted, sizeof(formatted));
+        if (need < 0) { fprintf(stderr, "[chat] format failed (%d)\n", need); continue; }
+        if ((size_t)need >= sizeof(formatted)) {
+            fprintf(stderr, "[chat] formatted prompt truncated (%d bytes) — "
+                    "shorten the conversation\n", need);
+            continue;
         }
+        if (g_prev_len > (size_t)need ||
+            memcmp(formatted, g_prev_fmt, g_prev_len) != 0) {
+            fprintf(stderr, "[chat] history desync — restart session\n");
+            continue;
+        }
+        const char *suffix = formatted + g_prev_len;
 
         int prompt_tokens[512];
-        int n_prompt = bpe_encode(tok, formatted, prompt_tokens, 512);
+        int n_prompt = bpe_encode(tok, suffix, prompt_tokens, 512);
         if (n_prompt <= 0) { fprintf(stderr, "[chat] tokenization failed\n"); continue; }
 
         AsyncPrinter *ap = async_printer_start();
@@ -149,17 +256,47 @@ int main(void) {
             async_printer_stop_and_flush(ap);
             continue;
         }
+        memcpy(g_prev_fmt, formatted, (size_t)need + 1);
+        g_prev_len = (size_t)need;
+
+        /* seed the penalty window with the prompt tail */
+        for (int i = n_prompt > PENALTY_WINDOW ? n_prompt - PENALTY_WINDOW : 0;
+             i < n_prompt; i++)
+            recent_push((int32_t)prompt_tokens[i]);
+
+        /* Materialize logits for the last prompt position WITHOUT advancing
+         * (graph path only): first engine_next() call eager-samples greedily
+         * and stashes the result as pending; we discard its choice and drive
+         * every step ourselves via replay_step(). */
+        if (!no_graph && qwen2_engine_next(eng) < 0) {
+            fprintf(stderr, "\n[chat] failed to score prompt\n");
+            async_printer_stop_and_flush(ap);
+            continue;
+        }
 
         int gen_count = 0;
         char turn_text[8192];
         size_t tl = 0;
         size_t emitted = 0;   /* bytes already streamed to the printer */
-        for (int step = 0; step < max_tokens && qwen2_engine_pos(eng) < MAX_CTX - 1; step++) {
-            const int next_tok = qwen2_engine_next(eng);
+        int stop_cut = 0;
+        while (gen_count < max_tokens && qwen2_engine_pos(eng) < MAX_CTX - 1) {
+            int next_tok;
+            if (no_graph) {
+                /* eager engine samples AND feeds the token itself */
+                next_tok = qwen2_engine_next(eng);
+            } else {
+                if (qwen2_debug_copy_logits(eng, logits, VOCAB) < 0) break;
+                next_tok = tt_sample(logits, VOCAB, &sc, &rng_state, wb);
+            }
             if (next_tok < 0 || next_tok == tok->eos_id ||
                 next_tok == 151643 /* <|endoftext|> */ ||
-                next_tok == 151645 /* <|im_end|> */)
+                next_tok == 151645 /* <|im_end|> */) {
+                /* close the assistant turn in the KV transcript: eager path
+                 * already advanced; graph path feeds the id explicitly */
+                if (!no_graph && qwen2_engine_pos(eng) < MAX_CTX - 1)
+                    qwen2_debug_replay_step(eng, next_tok);
                 break;
+            }
             int out_len = 0;
             const char *s = bpe_decode_token(tok, next_tok, &out_len);
             /* stop-string guard: model sometimes spells control tokens as BPE
@@ -174,24 +311,61 @@ int main(void) {
              * suffix that is a prefix of a marker is withheld from streaming */
             const char *cut = chat_find_stop(turn_text);
             if (cut) {
-                const size_t keep = (size_t)(cut - turn_text);
-                if (keep > emitted)
+                const size_t k = (size_t)(cut - turn_text);
+                if (k > emitted)
                     async_printer_push(ap, turn_text + emitted,
-                                       (int)(keep - emitted));
-                break;
+                                       (int)(k - emitted));
+                stop_cut = 1;
+            } else {
+                const size_t hold = chat_holdback_len(turn_text, tl);
+                const size_t safe = tl - hold;
+                if (safe > emitted) {
+                    async_printer_push(ap, turn_text + emitted,
+                                       (int)(safe - emitted));
+                    emitted = safe;
+                }
+                gen_count++;
+                recent_push((int32_t)next_tok);
             }
-            const size_t hold = chat_holdback_len(turn_text, tl);
-            const size_t safe = tl - hold;
-            if (safe > emitted) {
-                async_printer_push(ap, turn_text + emitted,
-                                   (int)(safe - emitted));
-                emitted = safe;
-            }
-            gen_count++;
+            /* feed OUR sampled token through the engine (computes the next
+             * step's logits). The stopper token is fed TOO: the eager path
+             * has already advanced it internally, and feeding it on the graph
+             * path keeps both KV transcripts identical (gate cross-checks). */
+            if (qwen2_engine_pos(eng) >= MAX_CTX - 1) break;
+            if (!no_graph && qwen2_debug_replay_step(eng, next_tok) < 0) break;
+            if (stop_cut) break;
         }
         cudaDeviceSynchronize();
         clock_gettime(CLOCK_MONOTONIC, &t1);
         async_printer_stop_and_flush(ap);
+
+        /* Eager parity probe: the graph path leaves a pending token that the
+         * next prefill flushes (one greedy step past the last fed token); an
+         * explicit step here gives the eager path the same trailing token so
+         * both modes see byte-identical context next turn. */
+        if (no_graph && qwen2_engine_pos(eng) < MAX_CTX - 1)
+            qwen2_engine_next(eng);
+
+        /* record what the model actually said so future prompts include it;
+         * the formatted delta is NOT re-prefilled — those bytes are already
+         * in the KV cache as the tokens generated above (the cursor below
+         * just skips them). */
+        tt_chat_history_push(&g_hist, "assistant", turn_text);
+        {
+            /* Snapshot WITHOUT the trailing generation prompt: the prompt
+             * header moves to the end of the string on the next render, so
+             * the fed-prefix cursor must stop right after the assistant
+             * turn's <|im_end|> for the prefix check to stay valid. */
+            tt_chat_opts snap = opts;
+            snap.add_generation_prompt = 0;
+            char refmt[sizeof(g_prev_fmt)];
+            const int rneed = tt_chat_history_format(&g_hist, fam, &snap,
+                                                     refmt, sizeof(refmt));
+            if (rneed >= 0 && (size_t)rneed < sizeof(refmt)) {
+                memcpy(g_prev_fmt, refmt, (size_t)rneed + 1);
+                g_prev_len = (size_t)rneed;
+            }
+        }
 
         const double sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
         const double tps = gen_count > 0 ? gen_count / sec : 0.0;
@@ -204,6 +378,7 @@ int main(void) {
         }
     }
 
+    free(logits); free(wb);
     qwen2_engine_free(eng);
     bpe_tokenizer_free(tok);
     gguf_free(model);
