@@ -55,6 +55,7 @@ typedef struct {
     float rope_freq_base;
     char architecture[64];        /* general.architecture (M7 task 3)   */
     int sliding_window;           /* <arch>.attention.sliding_window     */
+    int shared_kv_layers;         /* <arch>.attention.shared_kv_layers   */
     float final_logit_softcapping;/* <arch>.final_logit_softcapping      */
     int tensor_count;
     GGUFTensor *tensors;

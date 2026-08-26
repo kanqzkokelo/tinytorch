@@ -33,10 +33,23 @@ dequant-fp32 accumulation).
 | llama | TinyLlama-1.1B | f16 | ✅ bit-perfect (median Δ = 0.0009) |
 | llama | SmolLM2-135M | f16, q4_0, q5_0, q5_1, q8_0, q4_K, q4_K_S, q5_K | ✅ |
 | llama | SmolLM2-135M | q4_1, q5_K_S, q6_K | ⚠️ 5–6/7 (top-1 flips on near-tied logits) |
-| gemma2 | Gemma2-2B | q6_K | ✅ 7/7 |
+| gemma2 | Gemma2-2B | q6_K | ⚠️ 6/7 (was 7/7; re-verified during M8 session) |
+| gemma4 | Gemma-4-E2B | q4_0 | 🚧 IN PROGRESS — see note below |
 
 Quant kernels: q4_0, q4_1, q5_0, q5_1, q8_0, q4_K(+S), q5_K(+S), q6_K — all
 golden-verified against gguf-py dequantization on real model bytes.
+
+### gemma4 status (M8, active)
+
+Heterogeneous mixture architecture (per-layer heads/kv/ffn/head_dim,
+KV-cache sharing layers 15–34, partial RoPE, PLE/MatFormer blocks) loads and
+runs end-to-end. Parity not yet green:
+
+- Single-token median \|Δlogit\| **2.66** (was 22.06 before KV-cache sharing;
+  measured via `tests/gate_m84_gemma4.py` single-token probe)
+- Two-token median ~**9** — divergence under active bisection
+- Gate `./scripts/verify.sh m84` NOT passing
+- Golden reference: `tests/ref_gemma4_numpy.py` (NumPy forward from plan math)
 
 ## Classic ML benchmarks
 

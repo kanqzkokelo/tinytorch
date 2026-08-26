@@ -178,6 +178,11 @@ GGUFModel *gguf_load(const char *filepath) {
             skip_kv_value(&p, value_type);
             continue;
         }
+        if (strcmp(sfx, "attention.shared_kv_layers") == 0 && value_type == 4) {
+            model->shared_kv_layers = *(const int32_t *)p;
+            skip_kv_value(&p, value_type);
+            continue;
+        }
         if (strcmp(sfx, "final_logit_softcapping") == 0 && value_type == 6) {
             model->final_logit_softcapping = *(const float *)p;
             skip_kv_value(&p, value_type);

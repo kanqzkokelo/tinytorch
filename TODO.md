@@ -1,28 +1,35 @@
 # TODO — M8: Gemma-4 port (E2B target)
 
 Spec: docs/plans/2026-08-24-m8-gemma4-port.md (complete forward math inside)
-Groundwork already committed: gemma4 registry entry, array-metadata parser,
-gcd-based head_dim derivation, E2B model downloaded (3.04GB, verified complete).
 
-- [ ] M8.1 Config derivation: hidden_dim from ffn_down tensor K (=6144, NOT meta
-      12288); verify heads=8/kv=1/hd=256 derive correctly
-- [ ] M8.2 Uploads + PLE pipeline: per_layer_model_proj/pl_proj_norm uploads,
-      host+device gamma copies, d_ple_cache [ctx x 35x256], eager PLE compute
-      at embed time (gemv -> D2H -> rmsnorm slices -> +pe*16 -> *1/sqrt2 -> H2D)
-- [ ] M8.3 Forward additions: inp_gate GEMV -> gelu -> *PLE slice -> pl_proj
-      GEMV -> norm(?) -> residual; layer_output_scale multiply; V plain RMSNorm;
-      attention scale 1.0 (trait)
-- [ ] M8.4 Parity gate: tests/gate_m7_arch.py --model gemma-E2B >=6/7
-      (debug: single-token first, then two-token; NumPy golden = math table in plan)
-- [ ] M8.5 Chat smoke: ./chat with TT_MODEL=gemma E2B; add thinking-channel
-      markers (<|channel>thought etc.) to stop strings; README grid update
+## Done
+- [x] M8.1 Config derivation: head_dim via gcd(q_rows,k_rows)=256, hidden_dim
+      from ffn_down tensor K (=6144); metadata lies on gemma4, shapes win.
+      Verified dim=1536 L=35 H=8 KV=1 HD=256 vocab=262144.
+- [x] Heterogeneous per-layer geometry: heads/kv/ffn/head_dim arrays
+      (pl_hd 256/512, ffn 6144/12288); staging buffers sized to maxima.
+- [x] Partial RoPE: rope_freqs[256] factors divide theta — pairs with ≥32
+      factors → 1e30 → identity. Full-attn layers base 1e6 + _factors;
+      SWA layers base 1e4 plain.
+- [x] Plain V-norm (ones-gamma trick) + attention scale 1.0 trait.
+- [x] KV-cache sharing: layers 15–34 reuse L13(swa)/L14(full) caches; loader
+      parses shared_kv_layers meta (src/loader_gguf.c:181; verified against
+      oracle llama-model.cpp:2502).
+- [x] BF16 loader bug fixed (size was half → NaN); TTQ_BF16 GEMV/embed kernels.
+- [x] NumPy golden reference tests/ref_gemma4_numpy.py.
+- [x] Single-token median |Δlogit| 22.06 → 2.66 after KV-share
+      (tests/gate_m84_gemma4.py single-token probe).
 
-## Open questions to resolve empirically (from plan)
-- pl_proj@g normalization gamma source (per_layer_proj_norm top-level assumed)
-- rope base per layer: try all-global 1e6 first; freq_factors second
-- layer_output_scale raw vs transformed
+## Open (in order)
+- [ ] Two-token divergence bisection (~9 median) — agent running; do not
+      duplicate work, check its result first.
+- [ ] M8.4 Parity gate green: ./scripts/verify.sh m84
+      (tests/gate_m84_gemma4.py) — blocked on two-token fix.
+- [ ] Chat smoke E2B: TT_MODEL=<gemma-E2B gguf> ./chat (thinking-channel
+      markers in stop strings).
+- [ ] tg-128 benchmark vs llama.cpp; target ≥25–30 tok/s (Windows baseline 17).
+- [ ] Final README grid update once m84 passes.
 
 ## Deferred
-- E4B support (5.15GB > 4GB VRAM): needs hybrid CPU offload — separate milestone
-- CUDA graph capture for gemma4 path (PLE host stage) — optimization later
-- qwen3 note: DONE (7/7). Oracle upgraded to 0a5ac49b.
+- E4B support: 5.15GB > 4GB VRAM — see BLOCKED.md.
+- CUDA graph capture for gemma4 path (PLE host stage).

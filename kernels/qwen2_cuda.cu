@@ -597,6 +597,9 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     e->gguf = m;
     e->cfg = *cfg;
     e->pos = 0;
+    /* KV-share source map: -1 = layer owns its K/V (default for all arches;
+     * the gemma4 hetero scan below overwrites shared layers) */
+    for (int l = 0; l < MAX_LAYERS; l++) e->pl_src[l] = -1;
     cudaStreamCreate(&e->stream);
 
     /* M7 task 3: resolve architecture traits from general.architecture.
@@ -729,7 +732,12 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
              * (vs swa hd=256) and take no sliding window. */
             e->pl_swa[l] = (e->pl_hd[l] > cfg->head_dim)
                                ? 0 : (m->sliding_window > 0 ? m->sliding_window : 512);
-            e->pl_src[l] = -1;
+            /* gemma4 KV sharing: shared_kv_layers=20 => first 15 layers hold
+             * KV; layers 15+ reuse layer 13 (swa) or 14 (full) caches.
+             * llama-model.cpp:2502: src = 15 - (is_swa ? 2 : 1). */
+            const int n_kv_own = cfg->n_layers - m->shared_kv_layers;
+            e->pl_src[l] = (l >= n_kv_own && m->shared_kv_layers > 0)
+                               ? n_kv_own - (e->pl_swa[l] ? 2 : 1) : -1;
         }
         fprintf(stderr, "[qwen2-engine] hetero maxes: heads=%d kv=%d ffn=%ld "
                 "hd0=%d hd4=%d\n", max_heads, max_kv, max_ffn,
@@ -1011,6 +1019,14 @@ static int forward_layers(Qwen2Engine *e) {
         LayerW *w = &e->L[l];
         float *Kl_f = e->d_kc + l * cache_layer;
         float *Vl_f = e->d_vc + l * cache_layer;
+        /* gemma4 KV sharing: shared layers (pl_src[l] >= 0) read the source
+         * layer's cache slab instead of computing/scattering their own K/V.
+         * llama-model.cpp:2502 semantics. */
+        const int kv_shared = e->has_pl_embd && e->pl_src[l] >= 0;
+        if (kv_shared) {
+            Kl_f = e->d_kc + (long)e->pl_src[l] * cache_layer;
+            Vl_f = e->d_vc + (long)e->pl_src[l] * cache_layer;
+        }
         if (trace) fprintf(stderr, "[FWD] L%d enter\n", l);
 
         /* Cache layout: [slot][kv_head * head_dim] so each GEMV output of
@@ -1042,15 +1058,17 @@ static int forward_layers(Qwen2Engine *e) {
         int qrc = tt_gemv_typed(w->q.ptr, w->q.dtype, e->d_xn, e->d_q,
                       attn_qout, c->dim, e->stream);
         if (qrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] q gemv rc=%d\n", qrc);
-        int krc = tt_gemv_typed(w->k.ptr, w->k.dtype, e->d_xn, e->d_k_stage, c->n_kv_heads * HD, c->dim, e->stream);
-        if (krc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] k gemv rc=%d\n", krc);
+        if (!kv_shared) {
+            int krc = tt_gemv_typed(w->k.ptr, w->k.dtype, e->d_xn, e->d_k_stage, c->n_kv_heads * HD, c->dim, e->stream);
+            if (krc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] k gemv rc=%d\n", krc);
+        }
         /* QKV biases present in some GGUF conversions of Qwen2 (applied by
          * llama.cpp whenever the tensors exist). Optional by design. */
         CHK_STAGE("2 qkv-gemv");
         const int kvdim = KV_l * HD;
         if (w->q_bias)
             k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_q, w->q_bias, c->dim);
-        if (w->k_bias)
+        if (!kv_shared && w->k_bias)
             k_add<<<(kvdim + 255) / 256, 256, 0, e->stream>>>(e->d_k_stage, w->k_bias, kvdim);
 
         /* M7 trait: qwen3 per-head q/k RMSNorm pre-rope. Sits between the
@@ -1060,6 +1078,7 @@ static int forward_layers(Qwen2Engine *e) {
             const int qkthreads = HDl < 256 ? HDl : 256;
             k_qk_norm_rms<<<H_l, qkthreads, qkthreads * sizeof(float), e->stream>>>
                 (e->d_q, w->q_norm, H_l, HDl, c->tr.qk_norm_eps);
+            if (!kv_shared)
             k_qk_norm_rms<<<KV_l, qkthreads, qkthreads * sizeof(float), e->stream>>>
                 (e->d_k_stage, w->k_norm, KV_l, HDl, c->tr.qk_norm_eps);
         }
@@ -1086,13 +1105,16 @@ static int forward_layers(Qwen2Engine *e) {
             else
                 rope_fn<<<g, b, 0, e->stream>>>(e->d_q, H_l, HDl, e->d_pos, base_l);
             g.x = (HDl / 2 + 63) / 64; g.y = KV_l; g.z = 1;
+            if (!kv_shared) {
             if (ff_l)
                 k_rope_ff<<<g, b, 0, e->stream>>>(e->d_k_stage, KV_l, HDl, e->d_pos, base_l, ff_l);
             else
                 rope_fn<<<g, b, 0, e->stream>>>(e->d_k_stage, KV_l, HDl, e->d_pos, base_l);
+            }
         }
 
         /* v projection + bias (QKV group) */
+        if (!kv_shared) {
         int vrc = tt_gemv_typed(w->v.ptr, w->v.dtype, e->d_xn, e->d_v_stage, kvdim_l, c->dim, e->stream);
         if (vrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] v gemv rc=%d\n", vrc);
         if (w->v_bias)
@@ -1103,15 +1125,19 @@ static int forward_layers(Qwen2Engine *e) {
             k_qk_norm_rms<<<KV_l, vt, vt * sizeof(float), e->stream>>>(
                 e->d_v_stage, e->d_ones, KV_l, HDl, c->rms_eps);
         }
+        }
         if (tt_profiling()) tt_prof_end(TT_P_QKV, e->stream);
 
         /* scatter staged K/V into the cache slot chosen by *d_pos.
-         * Must precede flash attention. */
+         * Must precede flash attention. Shared-KV layers skip: they read the
+         * source layer's already-populated slab. */
+        if (!kv_shared) {
         if (tt_profiling()) tt_prof_begin(TT_P_SCATTER, e->stream);
         k_kv_scatter<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(
             e->d_k_stage, e->d_v_stage, Kl_f, Vl_f, e->d_pos,
             KV_l, HD, c->max_ctx);
         if (tt_profiling()) tt_prof_end(TT_P_SCATTER, e->stream);
+        }
 
         CHK_STAGE("3 rope");
         /* 4. GQA flash attention over slots [t0..pos]; t0 raised by the SWA

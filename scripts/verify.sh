@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Single source of truth. Exit 0 = gate green, nonzero = red.
-# Usage: ./scripts/verify.sh [m0|m1|m2|m3|m4|m61|all]
+# Usage: ./scripts/verify.sh [m0|m1|m2|m3|m4|m61|m84|all]
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -24,6 +24,7 @@ case "$GATE" in
        run "cuda-bench"      python3 bench/bench_cuda.py --gate ;;
   m4)  run "cifar-cnn"       python3 tests/gate_cifar_cnn.py
        run "pybind-demo"     python3 examples/train_mnist.py --smoke ;;
+  m84) run "m84-gemma4-parity" python3 tests/gate_m84_gemma4.py ;;
   all) for g in m0 m1 m2 m3 m4 m61; do "$0" "$g"; done ;;
   *) echo "unknown gate: $GATE"; exit 2 ;;
 esac
