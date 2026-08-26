@@ -237,6 +237,27 @@ static inline float row_dot_q6_K(const uint8_t *rw, const float *x, int K) {
 
 /* ------------------------- AVX2 paths (q4_0 / q8_0) ---------------------- */
 
+/* K-quant AVX2 strategy
+ * ---------------------
+ * Each K-quant super-block (256 values) decomposes into 32-element sub-blocks
+ * each with a single fp32 scale factor. We don't try to dequantize the whole
+ * 256-element block into fp32 in registers (would need 8 ymm of fp32 plus all
+ * the nibble plumbing, and would force 4 KB of register state per row). Instead
+ * we do the dot-product *incrementally per sub-block* — for each sub-block:
+ *   1. load 16-32 bytes of nibble/quant data into 1-2 ymm,
+ *   2. extract the int8 values (0..15 for Q4/Q5_K, -32..31 for Q6_K),
+ *   3. compute 16 int16 pair-sums via _mm256_maddubs_epi16 (sums q[2i]+q[2i+1]),
+ *   4. precompute x_pair[i] = x[2i]+x[2i+1] as 16 fp32, FMA q_pair·x_pair in fp32,
+ *   5. fold the per-sub-block scale (d*sc for Q6_K, d*sc / -min*m for Q4/Q5_K)
+ *      and the per-row fp32 accumulator.
+ * The Q4_K/Q5_K subtraction `d*sc*q - min*m*1` is split: FMA the q·x part
+ * with d*sc, then a single `min*m*hsum(x)` subtraction at the sub-block end.
+ * For Q6_K there's no min term; per-16 sub-block we just FMA `d*sc*q` against x.
+ * Memory: 8 ymm for two 32-elt q loads + 2 ymm of x_pairs = 10 ymm working +
+ * 1-2 ymm acc — fits comfortably in the 16-ymm AVX2 budget. The fp16 d / dmin
+ * loads are scalar and amortized over the whole super-block.
+ */
+
 #ifdef CB_X86
 
 /* FMADD 16 signed int8 lanes against 16 floats at xp, accumulate into acc.
@@ -312,6 +333,371 @@ static inline float row_dot_q8_0_avx2(const uint8_t *rw, const float *x, int K) 
     return cb_hsum256(acc);
 }
 
+/* ---- K-quant AVX2 kernels ---------------------------------------------- */
+
+/* hsum of 32 consecutive floats (one sub-block of x). */
+__attribute__((target("avx2,fma")))
+static inline float cb_hsum32(const float *xp) {
+    __m256 a = _mm256_loadu_ps(xp);
+    __m256 b = _mm256_loadu_ps(xp + 8);
+    __m256 c = _mm256_loadu_ps(xp + 16);
+    __m256 d = _mm256_loadu_ps(xp + 24);
+    __m256 s = _mm256_add_ps(_mm256_add_ps(a, b), _mm256_add_ps(c, d));
+    __m128 hi = _mm256_extractf128_ps(s, 1);
+    __m128 lo = _mm256_castps256_ps128(s);
+    lo = _mm_add_ps(lo, hi);
+    hi = _mm_movehdup_ps(lo);
+    lo = _mm_add_ps(lo, hi);
+    hi = _mm_movehl_ps(hi, lo);
+    lo = _mm_add_ss(lo, hi);
+    return _mm_cvtss_f32(lo);
+}
+
+/* Q4_K AVX2: fp16 d, fp16 dmin, scales[12], qs[128] -> 144 B per 256.
+ * Per super-block: 4 outer iterations, each emitting 64 values via 2 sub-blocks
+ * of 32 (lo-nibble and hi-nibble, each with its own d*sc and min*m).
+ *
+ * Correctness note: we cannot use the "pair sum" trick (`(q[2i]+q[2i+1]) *
+ * (x[2i]+x[2i+1])` as a substitute for `q[2i]*x[2i] + q[2i+1]*x[2i+1]`) —
+ * that introduces a cross-term that's only negligible when the second operand
+ * is itself quantized. For raw fp32 x we must do the full dot product.
+ *
+ * Strategy: per sub-block of 32 vals, load 32 fp32 x's, convert 32 int8 nibbles
+ * to 32 fp32 via cvtepi8_epi32+cvtepi32_ps (4 ymm each: 8 from each quarter),
+ * FMA into a partial dot, then apply d*sc / -min*m at sub-block end.
+ */
+__attribute__((target("avx2,fma")))
+static inline float row_dot_q4_K_avx2(const uint8_t *rw, const float *x,
+                                      int K) {
+    const int nb = K / QK_K;
+    const __m128i f0 = _mm_set1_epi8(0x0F);
+    __m256 acc = _mm256_setzero_ps();
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *blk = rw + (long)b * QK4_K_BS;
+        const uint8_t *q   = blk + 4 + K_SCALE_SIZE;
+        const uint8_t *sc  = blk + 4;
+        uint16_t dh, dmh;
+        memcpy(&dh,  blk, 2);
+        memcpy(&dmh, blk + 2, 2);
+        const float d   = cb_fp16_to_fp32(dh);
+        const float min = cb_fp16_to_fp32(dmh);
+        const float *xb = x + (long)b * QK_K;
+        for (int j = 0; j < QK_K; j += 64) {
+            const __m256i qb = _mm256_loadu_si256((const __m256i *)q);
+            /* 32 bytes of q: 32 lo-nibble bytes AND 32 hi-nibble bytes. */
+            const __m128i qb_lo = _mm256_castsi256_si128(qb);
+            const __m128i qb_hi = _mm256_extracti128_si256(qb, 1);
+            const __m128i lo32_0 = _mm_and_si128(qb_lo, f0);  /* 16 lo vals, l=0..16 */
+            const __m128i lo32_1 = _mm_and_si128(qb_hi, f0);  /* 16 lo vals, l=16..32 */
+            const __m128i hi32_0 = _mm_and_si128(_mm_srli_epi16(qb_lo, 4), f0);  /* 16 hi vals, l=0..16 */
+            const __m128i hi32_1 = _mm_and_si128(_mm_srli_epi16(qb_hi, 4), f0);  /* 16 hi vals, l=16..32 */
+            /* Convert each 16-int8 to 16 fp32 (2 ymm: lower 8 + upper 8). */
+            const __m256 lo0_lf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo32_0));
+            const __m256 lo0_hf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_bsrli_si128(lo32_0, 8)));
+            const __m256 lo1_lf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo32_1));
+            const __m256 lo1_hf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_bsrli_si128(lo32_1, 8)));
+            const __m256 hi0_lf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi32_0));
+            const __m256 hi0_hf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_bsrli_si128(hi32_0, 8)));
+            const __m256 hi1_lf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi32_1));
+            const __m256 hi1_hf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_bsrli_si128(hi32_1, 8)));
+            /* Full 32-elt dot products: lo · x[0..32] and hi · x[32..64]. */
+            __m256 dot_lo = _mm256_mul_ps(lo0_lf, _mm256_loadu_ps(xb +  0));
+            dot_lo = _mm256_fmadd_ps(lo0_hf, _mm256_loadu_ps(xb +  8), dot_lo);
+            dot_lo = _mm256_fmadd_ps(lo1_lf, _mm256_loadu_ps(xb + 16), dot_lo);
+            dot_lo = _mm256_fmadd_ps(lo1_hf, _mm256_loadu_ps(xb + 24), dot_lo);
+            __m256 dot_hi = _mm256_mul_ps(hi0_lf, _mm256_loadu_ps(xb + 32));
+            dot_hi = _mm256_fmadd_ps(hi0_hf, _mm256_loadu_ps(xb + 40), dot_hi);
+            dot_hi = _mm256_fmadd_ps(hi1_lf, _mm256_loadu_ps(xb + 48), dot_hi);
+            dot_hi = _mm256_fmadd_ps(hi1_hf, _mm256_loadu_ps(xb + 56), dot_hi);
+            const float v_lo = cb_hsum256(dot_lo);
+            const float v_hi = cb_hsum256(dot_hi);
+            const int isb = (j >> 6) * 2;
+            uint8_t sc0, m0, sc1, m1;
+            cb_get_scale_min_k4(isb + 0, sc, &sc0, &m0);
+            cb_get_scale_min_k4(isb + 1, sc, &sc1, &m1);
+            const float d1 = d * (float)sc0, d2 = d * (float)sc1;
+            const float m1c = min * (float)m0, m2c = min * (float)m1;
+            const float sx1 = cb_hsum32(xb);
+            const float sx2 = cb_hsum32(xb + 32);
+            const __m256 pack = _mm256_set_ps(d2 * v_hi,  d1 * v_lo,
+                                              -m2c * sx2, -m1c * sx1,
+                                              0.f, 0.f, 0.f, 0.f);
+            acc = _mm256_add_ps(acc, pack);
+            q   += 32;
+            xb  += 64;
+        }
+    }
+    return cb_hsum256(acc);
+}
+
+/* Q5_K AVX2: same dequant math as Q4_K but each nibble has a 5th bit in
+ * qh[32]. The qh byte at index l holds two 1-bit masks: bit 0 (lo mask) and
+ * bit 1 (hi mask). Value becomes ql_nibble + (qh_bit << 4) in [0, 31].
+ * 4 outer iters × 2 sub-blocks of 32 vals = 8 sub-blocks per super-block.
+ * Same fp32 dot structure as Q4_K AVX2 (no pair-sum trick). */
+__attribute__((target("avx2,fma")))
+static inline float row_dot_q5_K_avx2(const uint8_t *rw, const float *x,
+                                      int K) {
+    const int nb = K / QK_K;
+    const __m128i f0 = _mm_set1_epi8(0x0F);
+    __m256 acc = _mm256_setzero_ps();
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *blk = rw + (long)b * QK5_K_BS;
+        const uint8_t *sc  = blk + 4;
+        const uint8_t *qh  = blk + 4 + K_SCALE_SIZE;
+        const uint8_t *ql  = qh + QK_K / 8;
+        uint16_t dh, dmh;
+        memcpy(&dh,  blk, 2);
+        memcpy(&dmh, blk + 2, 2);
+        const float d   = cb_fp16_to_fp32(dh);
+        const float min = cb_fp16_to_fp32(dmh);
+        const float *xb = x + (long)b * QK_K;
+        for (int j = 0; j < QK_K; j += 64) {
+            const __m256i qlb = _mm256_loadu_si256((const __m256i *)ql);
+            const __m256i qhb = _mm256_loadu_si256((const __m256i *)qh);
+            const __m128i qlb_lo = _mm256_castsi256_si128(qlb);
+            const __m128i qlb_hi = _mm256_extracti128_si256(qlb, 1);
+            const __m128i qhb_lo = _mm256_castsi256_si128(qhb);
+            const __m128i qhb_hi = _mm256_extracti128_si256(qhb, 1);
+            /* lo_value[l] = (qlb[l] & 0xF) | ((qhb[l] & 1) << 4)
+             * hi_value[l] = (qlb[l] >> 4) & 0xF | ((qhb[l] & 2) << 3) */
+            const __m128i lo32_0_raw = _mm_and_si128(qlb_lo, f0);
+            const __m128i lo32_1_raw = _mm_and_si128(qlb_hi, f0);
+            const __m128i hi32_0_raw = _mm_and_si128(_mm_srli_epi16(qlb_lo, 4), f0);
+            const __m128i hi32_1_raw = _mm_and_si128(_mm_srli_epi16(qlb_hi, 4), f0);
+            /* qh bit position depends on chunk: chunk 0 -> bit 0 (lo) / 1 (hi),
+             * chunk 1 -> 2/3, chunk 2 -> 4/5, chunk 3 -> 6/7. We shift qh right
+             * by qh_shift to bring the relevant bit to position 0, then AND 0x01
+             * and shift left by 4 to land at value 16. The shift-left of 0x10
+             * must be within 16-bit lanes to avoid byte-cross for chunks 2/3. */
+            const int qh_shift = (j >> 6) * 2;  /* 0, 2, 4, 6 */
+            const __m128i qh_lo_s = _mm_srli_epi16(qhb_lo, qh_shift);
+            const __m128i qh_hi_s = _mm_srli_epi16(qhb_hi, qh_shift);
+            const __m128i lo_bit0 = _mm_and_si128(qh_lo_s, _mm_set1_epi8(0x01));
+            const __m128i lo_bit1 = _mm_and_si128(qh_hi_s, _mm_set1_epi8(0x01));
+            const __m128i hi_bit0 = _mm_and_si128(_mm_srli_epi16(qh_lo_s, 1), _mm_set1_epi8(0x01));
+            const __m128i hi_bit1 = _mm_and_si128(_mm_srli_epi16(qh_hi_s, 1), _mm_set1_epi8(0x01));
+            const __m128i lo_mask_0 = _mm_slli_epi16(lo_bit0, 4);
+            const __m128i lo_mask_1 = _mm_slli_epi16(lo_bit1, 4);
+            const __m128i hi_mask_0 = _mm_slli_epi16(hi_bit0, 4);
+            const __m128i hi_mask_1 = _mm_slli_epi16(hi_bit1, 4);
+            const __m128i lo0 = _mm_or_si128(lo32_0_raw, lo_mask_0);
+            const __m128i lo1 = _mm_or_si128(lo32_1_raw, lo_mask_1);
+            const __m128i hi0 = _mm_or_si128(hi32_0_raw, hi_mask_0);
+            const __m128i hi1 = _mm_or_si128(hi32_1_raw, hi_mask_1);
+#define CB5K_QF(NAME, INP) do {                                                 \
+                NAME##_lo = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(INP));      \
+                NAME##_hi = _mm256_cvtepi32_ps(                                 \
+                    _mm256_cvtepi8_epi32(_mm_bsrli_si128(INP, 8)));             \
+            } while (0)
+            __m256 l0_lo, l0_hi, l1_lo, l1_hi;
+            __m256 h0_lo, h0_hi, h1_lo, h1_hi;
+            CB5K_QF(l0, lo0);
+            CB5K_QF(l1, lo1);
+            CB5K_QF(h0, hi0);
+            CB5K_QF(h1, hi1);
+#undef CB5K_QF
+            const __m256 x0 = _mm256_loadu_ps(xb +  0);
+            const __m256 x1 = _mm256_loadu_ps(xb +  8);
+            const __m256 x2 = _mm256_loadu_ps(xb + 16);
+            const __m256 x3 = _mm256_loadu_ps(xb + 24);
+            const __m256 x4 = _mm256_loadu_ps(xb + 32);
+            const __m256 x5 = _mm256_loadu_ps(xb + 40);
+            const __m256 x6 = _mm256_loadu_ps(xb + 48);
+            const __m256 x7 = _mm256_loadu_ps(xb + 56);
+            __m256 dot_lo = _mm256_mul_ps(l0_lo, x0);
+            dot_lo = _mm256_fmadd_ps(l0_hi, x1, dot_lo);
+            dot_lo = _mm256_fmadd_ps(l1_lo, x2, dot_lo);
+            dot_lo = _mm256_fmadd_ps(l1_hi, x3, dot_lo);
+            __m256 dot_hi = _mm256_mul_ps(h0_lo, x4);
+            dot_hi = _mm256_fmadd_ps(h0_hi, x5, dot_hi);
+            dot_hi = _mm256_fmadd_ps(h1_lo, x6, dot_hi);
+            dot_hi = _mm256_fmadd_ps(h1_hi, x7, dot_hi);
+            const float v_lo = cb_hsum256(dot_lo);
+            const float v_hi = cb_hsum256(dot_hi);
+            const int isb = (j >> 6) * 2;
+            uint8_t sc0, m0, sc1, m1;
+            cb_get_scale_min_k4(isb + 0, sc, &sc0, &m0);
+            cb_get_scale_min_k4(isb + 1, sc, &sc1, &m1);
+            const float d1 = d * (float)sc0, d2 = d * (float)sc1;
+            const float m1c = min * (float)m0, m2c = min * (float)m1;
+            const float sx1 = cb_hsum32(xb);
+            const float sx2 = cb_hsum32(xb + 32);
+            const __m256 pack = _mm256_set_ps(d2 * v_hi,  d1 * v_lo,
+                                              -m2c * sx2, -m1c * sx1,
+                                              0.f, 0.f, 0.f, 0.f);
+            acc = _mm256_add_ps(acc, pack);
+            ql += 32;
+            /* qh is NOT advanced within the super-block: same 32 bytes are
+             * reused for all 4 chunks with rotating u1/u2 masks. */
+            xb += 64;
+        }
+    }
+    return cb_hsum256(acc);
+}
+
+/* Q6_K AVX2: ql[128], qh[64], sc[16] int8, fp16 d -> 210 B per 256.
+ * 16 sub-blocks of 16 values, each with its own int8 scale. Two outer iters of
+ * 128 vals, each spanning l=0..32. Per l: 4 sub-blocks, all in int8 [-32,31].
+ * No min term: value = d*sc*q, contribution = d*sc * (q · x).
+ *
+ * Same correctness note as Q4_K: we must compute the full 16-elt dot product,
+ * not the pair-sum approximation (raw fp32 x has no quantization budget for
+ * the cross term). 16 int8 values -> cvtepi8_epi32 + cvtepi32_ps -> 16 fp32
+ * q-values; mul against 16 fp32 x-values; horizontal sum.
+ */
+__attribute__((target("avx2,fma")))
+static inline float row_dot_q6_K_avx2(const uint8_t *rw, const float *x,
+                                      int K) {
+    const int nb = K / QK_K;
+    const __m128i f0    = _mm_set1_epi8(0x0F);
+    const __m128i three = _mm_set1_epi8(0x03);
+    const __m128i bias  = _mm_set1_epi8(32);
+    __m256 acc = _mm256_setzero_ps();
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *blk = rw + (long)b * QK6_K_BS;
+        const uint8_t *ql = blk;
+        const uint8_t *qh = blk + QK_K / 2;
+        const int8_t  *sc = (const int8_t *)(blk + QK_K / 2 + QK_K / 4);
+        uint16_t dh;
+        memcpy(&dh, blk + QK_K / 2 + QK_K / 4 + QK_K / 16, 2);
+        const float d = cb_fp16_to_fp32(dh);
+        const float *xb = x + (long)b * QK_K;
+        for (int n = 0; n < QK_K; n += 128) {
+            /* 64 bytes of ql, 32 bytes of qh. Per outer iter, l runs 0..32. */
+            const __m256i qlA = _mm256_loadu_si256((const __m256i *)(ql + 0));
+            const __m256i qlB = _mm256_loadu_si256((const __m256i *)(ql + 32));
+            const __m256i qh_full = _mm256_loadu_si256((const __m256i *)qh);
+            const __m128i qlA_lo = _mm256_castsi256_si128(qlA);  /* ql[l+ 0..16] */
+            const __m128i qlA_hi = _mm256_extracti128_si256(qlA, 1);  /* ql[l+16..32] */
+            const __m128i qlB_lo = _mm256_castsi256_si128(qlB);  /* ql[l+32..48] */
+            const __m128i qlB_hi = _mm256_extracti128_si256(qlB, 1);  /* ql[l+48..64] */
+            const __m128i qhA = _mm256_castsi256_si128(qh_full);  /* qh[l+ 0..16] */
+            const __m128i qhB = _mm256_extracti128_si256(qh_full, 1);  /* qh[l+16..32] */
+            /* Build 8 sub-blocks of 16 int8 each:
+             *  q1_l (l=0..16, sc[0])  q1_h (l=16..32, sc[1])
+             *  q2_l (sc[2])            q2_h (sc[3])
+             *  q3_l (sc[4])            q3_h (sc[5])
+             *  q4_l (sc[6])            q4_h (sc[7]) */
+#define CB6K_BUILD(NAME, QH_BITS) do {                                          \
+                const __m128i raw = _mm_and_si128(QL, f0);                      \
+                const __m128i sh  = _mm_slli_epi16(QH_BITS, 4);                 \
+                NAME = _mm_sub_epi8(_mm_or_si128(raw, sh), bias);               \
+            } while (0)
+            __m128i q1_l, q1_h, q2_l, q2_h, q3_l, q3_h, q4_l, q4_h;
+            {
+                const __m128i QL = qlA_lo;
+                const __m128i qh_b = _mm_and_si128(qhA, three);
+                CB6K_BUILD(q1_l, qh_b);
+            }
+            {
+                const __m128i QL = qlA_hi;
+                const __m128i qh_b = _mm_and_si128(qhB, three);
+                CB6K_BUILD(q1_h, qh_b);
+            }
+            {
+                const __m128i QL = qlB_lo;
+                const __m128i qh_b = _mm_and_si128(_mm_srli_epi16(qhA, 2), three);
+                CB6K_BUILD(q2_l, qh_b);
+            }
+            {
+                const __m128i QL = qlB_hi;
+                const __m128i qh_b = _mm_and_si128(_mm_srli_epi16(qhB, 2), three);
+                CB6K_BUILD(q2_h, qh_b);
+            }
+            {
+                const __m128i QL = _mm_srli_epi16(qlA_lo, 4);
+                const __m128i qh_b = _mm_and_si128(_mm_srli_epi16(qhA, 4), three);
+                CB6K_BUILD(q3_l, qh_b);
+            }
+            {
+                const __m128i QL = _mm_srli_epi16(qlA_hi, 4);
+                const __m128i qh_b = _mm_and_si128(_mm_srli_epi16(qhB, 4), three);
+                CB6K_BUILD(q3_h, qh_b);
+            }
+            {
+                const __m128i QL = _mm_srli_epi16(qlB_lo, 4);
+                const __m128i qh_b = _mm_and_si128(_mm_srli_epi16(qhA, 6), three);
+                CB6K_BUILD(q4_l, qh_b);
+            }
+            {
+                const __m128i QL = _mm_srli_epi16(qlB_hi, 4);
+                const __m128i qh_b = _mm_and_si128(_mm_srli_epi16(qhB, 6), three);
+                CB6K_BUILD(q4_h, qh_b);
+            }
+#undef CB6K_BUILD
+            /* Convert each 16-int8 q to two ymm of fp32 (8+8). The cvtepi8_epi32
+             * extends signed int8 to int32; we need two 8-wide pieces per
+             * 16-byte input, by splitting with _mm_bsrli_si128(..., 8). */
+#define CB6K_QF(NAME, INP) do {                                                 \
+                NAME##_lo = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(INP));      \
+                NAME##_hi = _mm256_cvtepi32_ps(                                 \
+                    _mm256_cvtepi8_epi32(_mm_bsrli_si128(INP, 8)));             \
+            } while (0)
+            __m256 q1l_lo, q1l_hi, q1h_lo, q1h_hi;
+            __m256 q2l_lo, q2l_hi, q2h_lo, q2h_hi;
+            __m256 q3l_lo, q3l_hi, q3h_lo, q3h_hi;
+            __m256 q4l_lo, q4l_hi, q4h_lo, q4h_hi;
+            CB6K_QF(q1l, q1_l);
+            CB6K_QF(q1h, q1_h);
+            CB6K_QF(q2l, q2_l);
+            CB6K_QF(q2h, q2_h);
+            CB6K_QF(q3l, q3_l);
+            CB6K_QF(q3h, q3_h);
+            CB6K_QF(q4l, q4_l);
+            CB6K_QF(q4h, q4_h);
+#undef CB6K_QF
+            /* 8 sub-dots: each is 16-elt dot product of int8-as-fp32 vs x. */
+            const float *xbase = xb + n;
+            const __m256 x0  = _mm256_loadu_ps(xbase +  0);
+            const __m256 x1  = _mm256_loadu_ps(xbase +  8);
+            const __m256 x2  = _mm256_loadu_ps(xbase + 16);
+            const __m256 x3  = _mm256_loadu_ps(xbase + 24);
+            const __m256 x4  = _mm256_loadu_ps(xbase + 32);
+            const __m256 x5  = _mm256_loadu_ps(xbase + 40);
+            const __m256 x6  = _mm256_loadu_ps(xbase + 48);
+            const __m256 x7  = _mm256_loadu_ps(xbase + 56);
+            const __m256 x8  = _mm256_loadu_ps(xbase + 64);
+            const __m256 x9  = _mm256_loadu_ps(xbase + 72);
+            const __m256 x10 = _mm256_loadu_ps(xbase + 80);
+            const __m256 x11 = _mm256_loadu_ps(xbase + 88);
+            const __m256 x12 = _mm256_loadu_ps(xbase + 96);
+            const __m256 x13 = _mm256_loadu_ps(xbase +104);
+            const __m256 x14 = _mm256_loadu_ps(xbase +112);
+            const __m256 x15 = _mm256_loadu_ps(xbase +120);
+            const float v1l = cb_hsum256(_mm256_fmadd_ps(q1l_lo, x0,
+                                       _mm256_mul_ps(q1l_hi, x1)));
+            const float v1h = cb_hsum256(_mm256_fmadd_ps(q1h_lo, x2,
+                                       _mm256_mul_ps(q1h_hi, x3)));
+            const float v2l = cb_hsum256(_mm256_fmadd_ps(q2l_lo, x4,
+                                       _mm256_mul_ps(q2l_hi, x5)));
+            const float v2h = cb_hsum256(_mm256_fmadd_ps(q2h_lo, x6,
+                                       _mm256_mul_ps(q2h_hi, x7)));
+            const float v3l = cb_hsum256(_mm256_fmadd_ps(q3l_lo, x8,
+                                       _mm256_mul_ps(q3l_hi, x9)));
+            const float v3h = cb_hsum256(_mm256_fmadd_ps(q3h_lo, x10,
+                                       _mm256_mul_ps(q3h_hi, x11)));
+            const float v4l = cb_hsum256(_mm256_fmadd_ps(q4l_lo, x12,
+                                       _mm256_mul_ps(q4l_hi, x13)));
+            const float v4h = cb_hsum256(_mm256_fmadd_ps(q4h_lo, x14,
+                                       _mm256_mul_ps(q4h_hi, x15)));
+            const float ds0 = d * (float)sc[0], ds1 = d * (float)sc[1];
+            const float ds2 = d * (float)sc[2], ds3 = d * (float)sc[3];
+            const float ds4 = d * (float)sc[4], ds5 = d * (float)sc[5];
+            const float ds6 = d * (float)sc[6], ds7 = d * (float)sc[7];
+            const __m256 pack = _mm256_set_ps(ds7 * v4h, ds6 * v4l,
+                                              ds5 * v3h, ds4 * v3l,
+                                              ds3 * v2h, ds2 * v2l,
+                                              ds1 * v1h, ds0 * v1l);
+            acc = _mm256_add_ps(acc, pack);
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+    return cb_hsum256(acc);
+}
+
 #endif /* CB_X86 */
 
 /* ------------------------- dispatch -------------------------------------- */
@@ -349,9 +735,21 @@ static inline float row_dot(const uint8_t *rw, int dtype, const float *x,
             if (use_avx2) return row_dot_q8_0_avx2(rw, x, K);
 #endif
             return row_dot_q8_0(rw, x, K);
-        case TTQ_Q4_K: return row_dot_q4_K(rw, x, K);
-        case TTQ_Q5_K: return row_dot_q5_K(rw, x, K);
-        case TTQ_Q6_K: return row_dot_q6_K(rw, x, K);
+        case TTQ_Q4_K:
+#ifdef CB_X86
+            if (use_avx2) return row_dot_q4_K_avx2(rw, x, K);
+#endif
+            return row_dot_q4_K(rw, x, K);
+        case TTQ_Q5_K:
+#ifdef CB_X86
+            if (use_avx2) return row_dot_q5_K_avx2(rw, x, K);
+#endif
+            return row_dot_q5_K(rw, x, K);
+        case TTQ_Q6_K:
+#ifdef CB_X86
+            if (use_avx2) return row_dot_q6_K_avx2(rw, x, K);
+#endif
+            return row_dot_q6_K(rw, x, K);
         default: return 0.0f;
     }
 }
