@@ -120,6 +120,19 @@ make run_llm_gpu chat_llm_gpu        # LLM binaries (nvcc required)
 ./scripts/verify.sh all              # full sweep incl. classic ML gates
 ```
 
+## CI
+
+- Where: `.github/workflows/ci.yml` runs on every push to `main` and every PR.
+  Concurrency cancels older runs on the same ref so force-pushes don't pile up.
+- Day jobs (`lint-compile` matrix, `build-gcc`, `unit-c`): CPU-only, ~30s, matches
+  `./scripts/ci_local.sh` 1:1.
+- NOT covered by CI: GPU parity gates (`make cuda`, `verify.sh m61/m84`), tokenizer
+  oracle (`gate_tokenizer.py` — needs oracle binaries). Those run **manually on
+  a GPU box** and as a separate nightly (`nightly.yml`, 04:00 UTC).
+- `benchmark-snapshot` is informational only — it uploads a JSON trend file,
+  never gates.
+- Local mirror: `./scripts/ci_local.sh` (≈30s, GPU-free).
+
 ## Layout
 
 ```
