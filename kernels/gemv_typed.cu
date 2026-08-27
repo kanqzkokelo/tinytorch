@@ -265,18 +265,50 @@ __global__ void k_gemv_q6_K(const uint8_t *__restrict__ W,
 
 /* ---------------- f16 / f32 (Tier-1 completeness) -------------------------- */
 
+// M9.5 V2: two rows per warp, float4 x reads. Each lane reads 4 weights
+// (8 bytes from the f16 row) per inner step, accumulating into s0 and
+// s1; the two rows share the float4 x load (halves x re-read pressure
+// for the M=1536/4864 hidden matrices). Requires K to be a multiple of
+// 4 (every block reads 4 halfs; 4*2 = 8-byte alignment = 16-byte stride
+// = 4 floats of x in float4) and the row stride K*2 = multiple of 8
+// (i.e. K a multiple of 4) so the f16 row base is 8-byte aligned; on
+// smollm2 (K=576) and tinyllama (K=2048) both hold. The 2-rows-per-warp
+// layout matches gemv_dims2 used by tt_gemv_q4_0 (same math shape).
 __global__ void k_gemv_f16(const uint8_t *__restrict__ W,
                            const float *__restrict__ x, float *__restrict__ y,
                            int M, int K) {
-    const int row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= M) return;
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 2;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;                    // caller pads M to even
     const int lane = threadIdx.x;
-    const __half *rw = (const __half *)((const char *)W + (long)row * K * 2);
-    float s = 0.0f;
-    for (int i = lane; i < K; i += 32)
-        s += __half2float(rw[i]) * x[i];
-    s = warp_reduce_sum(s);
-    if (lane == 0) y[row] = s;
+    const int K4 = K >> 2;                        // 4-weight groups per row
+    const __half *rw0 = (const __half *)((const char *)W + (long)row0 * K * 2);
+    const __half *rw1 = (const __half *)((const char *)W + (long)row1 * K * 2);
+    const float4 *x4 = (const float4 *)x;
+    float s0 = 0.0f, s1 = 0.0f;
+    for (int g = lane; g < K4; g += 32) {
+        const float4 xg = x4[g];
+        const __half2 *h0 = (const __half2 *)(rw0 + (g << 2));
+        const __half2 *h1 = (const __half2 *)(rw1 + (g << 2));
+        const float2 w0a = __half22float2(h0[0]);
+        const float2 w0b = __half22float2(h0[1]);
+        const float2 w1a = __half22float2(h1[0]);
+        const float2 w1b = __half22float2(h1[1]);
+        s0 = fmaf(w0a.x, xg.x, s0);
+        s0 = fmaf(w0a.y, xg.y, s0);
+        s0 = fmaf(w0b.x, xg.z, s0);
+        s0 = fmaf(w0b.y, xg.w, s0);
+        s1 = fmaf(w1a.x, xg.x, s1);
+        s1 = fmaf(w1a.y, xg.y, s1);
+        s1 = fmaf(w1b.x, xg.z, s1);
+        s1 = fmaf(w1b.y, xg.w, s1);
+    }
+    s0 = warp_reduce_sum(s0);
+    s1 = warp_reduce_sum(s1);
+    if (lane == 0) {
+        y[row0] = s0;
+        if (row1 < M) y[row1] = s1;
+    }
 }
 
 __global__ void k_gemv_f32(const float *__restrict__ W,

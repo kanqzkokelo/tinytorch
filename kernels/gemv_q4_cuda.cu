@@ -201,6 +201,8 @@ __global__ void k_fused_swiglu_q4_0(const BlockQ4_0 *__restrict__ W_gate,
 }
 
 // LM head / tied-embedding projection over vocab rows (same math as GEMV).
+// Scalar fallback. Kept for the odd-nb case where the V2 uint32 streaming
+// cannot satisfy its alignment contract; tt_logits_dispatch routes here then.
 __global__ void k_logits_q4_0(const BlockQ4_0 *__restrict__ W,
                               const float *__restrict__ x,
                               float *__restrict__ logits,
@@ -222,6 +224,73 @@ __global__ void k_logits_q4_0(const BlockQ4_0 *__restrict__ W,
     }
     sum = warp_reduce_sum(sum);
     if (lane == 0) logits[v] = sum;
+}
+
+// V2 LM head over q4_0 weights. Two vocab rows per warp, sharing the
+// float4 x loads. Same uint32-streaming + __byte_perm merge scheme as
+// k_gemv_q4_0 / k_logits_q8_0; the same per-byte low-nibble->xa /
+// high-nibble->xb pairing (byte j: low nibble -> x[4k+(j%4)], high
+// nibble -> x[16+4k+(j%4)] when j in [4k, 4k+3]) is required for the
+// dot product to match scalar k_logits_q4_0. Requires nb = K/32 even
+// (caller must check; otherwise fall back to scalar). Caller pads vocab
+// to even (vocab is always even in our LLM heads).
+__global__ void k_logits_q4_0_v2(const BlockQ4_0 *__restrict__ W,
+                                 const float *__restrict__ x,
+                                 float *__restrict__ logits,
+                                 int vocab, int K) {
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 2;
+    if (row0 >= vocab) return;
+    const int row1 = row0 + 1;
+
+    const int lane = threadIdx.x;
+    const int nb = K / 32;
+    const uint32_t *rw0 = (const uint32_t *)((const char *)W + (long)row0 * nb * 18);
+    const uint32_t *rw1 = (const uint32_t *)((const char *)W + (long)row1 * nb * 18);
+    float s0 = 0.0f, s1 = 0.0f;
+
+    for (int b = lane; b < nb; b += 32) {
+        const int wsc = (18 * b) >> 2;                 // word holding blk.d
+        const unsigned short d16a = (unsigned short)
+            (((18 * b) & 2) ? (rw0[wsc] >> 16) : (rw0[wsc] & 0xFFFFu));
+        const unsigned short d16b = (unsigned short)
+            (((18 * b) & 2) ? (rw1[wsc] >> 16) : (rw1[wsc] & 0xFFFFu));
+        const float da = __half2float(__ushort_as_half(d16a));
+        const float db = __half2float(__ushort_as_half(d16b));
+        const int a0 = (18 * b + 2) >> 2;              // first qs word
+        const int sh  = (18 * b + 2) & 2;              // 2 => misaligned merge
+        const float4 *x4 = (const float4 *)(x + b * 32);
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const uint32_t la = rw0[a0 + k];
+            const uint32_t lb = rw1[a0 + k];
+            const uint32_t va = sh ? __byte_perm(la, rw0[a0 + k + 1], 0x5432) : la;
+            const uint32_t vb = sh ? __byte_perm(lb, rw1[a0 + k + 1], 0x5432) : lb;
+            const float4 xa = x4[k];       // x[4k .. 4k+3]   <- low nibbles of bytes 4k..4k+3
+            const float4 xb = x4[k + 4];   // x[16+4k .. +3]  <- high nibbles of bytes 4k..4k+3
+            s0 += (float)((int)(va         & 0xFu) - 8) * da * xa.x;
+            s0 += (float)((int)((va >>  4) & 0xFu) - 8) * da * xb.x;
+            s0 += (float)((int)((va >>  8) & 0xFu) - 8) * da * xa.y;
+            s0 += (float)((int)((va >> 12) & 0xFu) - 8) * da * xb.y;
+            s0 += (float)((int)((va >> 16) & 0xFu) - 8) * da * xa.z;
+            s0 += (float)((int)((va >> 20) & 0xFu) - 8) * da * xb.z;
+            s0 += (float)((int)((va >> 24) & 0xFu) - 8) * da * xa.w;
+            s0 += (float)((int)(va >> 28) - 8) * da * xb.w;
+            s1 += (float)((int)(vb         & 0xFu) - 8) * db * xa.x;
+            s1 += (float)((int)((vb >>  4) & 0xFu) - 8) * db * xb.x;
+            s1 += (float)((int)((vb >>  8) & 0xFu) - 8) * db * xa.y;
+            s1 += (float)((int)((vb >> 12) & 0xFu) - 8) * db * xb.y;
+            s1 += (float)((int)((vb >> 16) & 0xFu) - 8) * db * xa.z;
+            s1 += (float)((int)((vb >> 20) & 0xFu) - 8) * db * xb.z;
+            s1 += (float)((int)((vb >> 24) & 0xFu) - 8) * db * xa.w;
+            s1 += (float)((int)(vb >> 28) - 8) * db * xb.w;
+        }
+    }
+    s0 = warp_reduce_sum(s0);
+    s1 = warp_reduce_sum(s1);
+    if (lane == 0) {
+        logits[row0] = s0;
+        if (row1 < vocab) logits[row1] = s1;
+    }
 }
 
 // q8_0 block: fp16 scale d + 32 int8 values.
@@ -403,6 +472,17 @@ int tt_logits_q4_0(const void *dW, const float *dx, float *dlogits,
     return (int)cudaGetLastError();
 }
 
+/* M9.5: V2 LM head for q4_0 (2-rows-per-warp, uint32 word streaming).
+ * Closes the qwen2.5-q4_0 0.72x gap by vectorizing the 1.7 ms scalar
+ * logits path. Requires K/32 even; otherwise fall back to scalar via
+ * tt_logits_dispatch. Caller pads vocab to even. */
+int tt_logits_q4_0_v2(const void *dW, const float *dx, float *dlogits,
+                      int vocab, int K, cudaStream_t stream) {
+    dim3 g, b; gemv_dims2(vocab, &g, &b);
+    k_logits_q4_0_v2<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW, dx, dlogits, vocab, K);
+    return (int)cudaGetLastError();
+}
+
 int tt_embed_q4_0(const void *dW, int tok, float *dx, int dim, cudaStream_t stream) {
     const int threads = dim / 32;
     k_embed_q4_0<<<(threads + 255) / 256, 256, 0, stream>>>((const BlockQ4_0 *)dW, tok, dx, dim);
@@ -431,8 +511,24 @@ int tt_logits_dispatch(const void *dW, int dtype, const float *dx,
     }
     if (dtype == 8)
         k_logits_q8_0<<<g, b, 0, stream>>>((const BlockQ8_0 *)dW, dx, dlogits, vocab, K);
-    else
-        k_logits_q4_0<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW, dx, dlogits, vocab, K);
+    else {
+        /* M9.5: route q4_0 to the V2 vectorized LM head when K/32 is even
+         * (the uint32 streaming + __byte_perm merge contract; same nb-even
+         * requirement as the q4_0 layer GEMV V2 in this file). qwen2.5-0.5b
+         * (K=896, nb=28), llama-3.2-1b (K=2048, nb=64), gemma q4_0 (K=1024
+         * dim sections) all satisfy it; odd-K or odd-nb shapes fall back to
+         * the scalar k_logits_q4_0 above. */
+        if (((K >> 5) & 1) == 0 && (K & 31) == 0) {
+            /* V2 needs grid.x * blockDim.y * 2 >= vocab. Re-derive via
+             * gemv_dims2 (same as tt_gemv_q4_0) so we don't waste warps. */
+            gemv_dims2(vocab, &g, &b);
+            k_logits_q4_0_v2<<<g, b, 0, stream>>>(
+                (const BlockQ4_0 *)dW, dx, dlogits, vocab, K);
+        } else {
+            k_logits_q4_0<<<g, b, 0, stream>>>(
+                (const BlockQ4_0 *)dW, dx, dlogits, vocab, K);
+        }
+    }
     return (int)cudaGetLastError();
 }
 
