@@ -56,9 +56,29 @@ int tt_embed_typed(const void *dW, int dtype, int tok, float *dx, int dim,
 int tt_logits_dispatch(const void *dW, int dtype, const float *dx,
                        float *dlogits, int vocab, int K, cudaStream_t stream);
 int tt_embed_q4_0(const void *dW, int tok, float *dx, int dim, cudaStream_t stream);
+/* M9.5+ V4 dispatch: routes q4_0 layer GEMVs to 4-rows-per-warp kernel
+ * when eligible (M%4==0, K%32==0, nb even), else falls back to V2.
+ * Bit-exact vs V2 (V4 == V2 == scalar up to FMA order, which is identical
+ * between V2 and V4). Returns 0 on success. */
+int tt_gemv_q4_0_dispatch(const void *dW, const float *dx, float *dy,
+                          int M, int K, cudaStream_t stream);
 }
 
 static size_t q4_bytes(long numel) { return (size_t)(numel / Q4_VALS_PER_BLOCK) * Q4_BYTES_PER_BLOCK; }
+
+/* M9.5+ V4-aware per-layer GEMV: q4_0 uses tt_gemv_q4_0_dispatch which
+ * routes to V4 when eligible (4-rows/warp, 1.5-1.6x on FFN shapes per
+ * the microbench) and falls back to V2 when not. Other dtypes continue
+ * to use tt_gemv_typed (q8_0/f16/q4_k/q5_k/etc.). Bit-exact vs the
+ * pre-V4 path: V4 output == V2 output == typed output for the same
+ * weight tensor and x. */
+static inline int tt_gemv_layer_dispatch(void *w_ptr, int w_dtype,
+                                          const float *dx, float *dy,
+                                          int M, int K, cudaStream_t s) {
+    if (w_dtype == 2 /* GGUF_TYPE_Q4_0 */)
+        return tt_gemv_q4_0_dispatch(w_ptr, dx, dy, M, K, s);
+    return tt_gemv_typed(w_ptr, w_dtype, dx, dy, M, K, s);
+}
 
 /* Type-blind weight handle: device pointer + GGML type code for dispatch. */
 typedef struct { void *ptr; int dtype; } TTensor;
@@ -1343,11 +1363,11 @@ static int forward_layers(Qwen2Engine *e) {
         const int HDl = e->pl_hd[l] > 0 ? e->pl_hd[l] : HD;
         const int attn_qout = H_l * HDl;
         const int kvdim_l = KV_l * HDl;
-        int qrc = tt_gemv_typed(w->q.ptr, w->q.dtype, e->d_xn, e->d_q,
+        int qrc = tt_gemv_layer_dispatch(w->q.ptr, w->q.dtype, e->d_xn, e->d_q,
                       attn_qout, c->dim, e->stream);
         if (qrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] q gemv rc=%d\n", qrc);
         if (!kv_shared) {
-            int krc = tt_gemv_typed(w->k.ptr, w->k.dtype, e->d_xn, e->d_k_stage, kvdim_l, c->dim, e->stream);
+            int krc = tt_gemv_layer_dispatch(w->k.ptr, w->k.dtype, e->d_xn, e->d_k_stage, kvdim_l, c->dim, e->stream);
             if (krc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] k gemv rc=%d\n", krc);
         }
         /* QKV biases present in some GGUF conversions of Qwen2 (applied by
@@ -1403,7 +1423,7 @@ static int forward_layers(Qwen2Engine *e) {
 
         /* v projection + bias (QKV group) */
         if (!kv_shared) {
-        int vrc = tt_gemv_typed(w->v.ptr, w->v.dtype, e->d_xn, e->d_v_stage, kvdim_l, c->dim, e->stream);
+        int vrc = tt_gemv_layer_dispatch(w->v.ptr, w->v.dtype, e->d_xn, e->d_v_stage, kvdim_l, c->dim, e->stream);
         if (vrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] v gemv rc=%d\n", vrc);
         if (w->v_bias)
             k_add<<<(kvdim + 255) / 256, 256, 0, e->stream>>>(e->d_v_stage, w->v_bias, kvdim);
@@ -1477,7 +1497,7 @@ static int forward_layers(Qwen2Engine *e) {
         if (trace && e->has_pl_embd && l >= 18 && l <= 21) ple_canary(e, "flash", l);
         /* 5. Wo projection + residual: x += att @ Wo^T */
         if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
-        int orc_ = tt_gemv_typed(w->o.ptr, w->o.dtype, e->d_att, e->d_xn, c->dim, attn_qout, e->stream);
+        int orc_ = tt_gemv_layer_dispatch(w->o.ptr, w->o.dtype, e->d_att, e->d_xn, c->dim, attn_qout, e->stream);
         if (orc_ && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] o gemv rc=%d\n", orc_);
         /* gemma2 sandwich: normalize the attention output before residual */
         if (w->post_attn_norm)
@@ -1511,11 +1531,11 @@ static int forward_layers(Qwen2Engine *e) {
             tt_ffn_q4_0(w->gate.ptr, w->up.ptr, e->d_xn, e->d_h,
                         FF_l, c->dim, act_gelu, e->stream);
         } else {
-            int grc = tt_gemv_typed(w->gate.ptr, w->gate.dtype, e->d_xn, e->d_g,
+            int grc = tt_gemv_layer_dispatch(w->gate.ptr, w->gate.dtype, e->d_xn, e->d_g,
                           FF_l, c->dim, e->stream);
             if (grc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] gate gemv rc=%d\n", grc);
             CHK_STAGE("7a gate-gemv");
-            int urc = tt_gemv_typed(w->up.ptr, w->up.dtype, e->d_xn, e->d_u,
+            int urc = tt_gemv_layer_dispatch(w->up.ptr, w->up.dtype, e->d_xn, e->d_u,
                           FF_l, c->dim, e->stream);
             if (urc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] up gemv rc=%d\n", urc);
             CHK_STAGE("7b up-gemv");
@@ -1523,7 +1543,7 @@ static int forward_layers(Qwen2Engine *e) {
                 e->d_g, e->d_u, e->d_h, FF_l, act_gelu);
             CHK_STAGE("6b swiglu-apply");
         }
-        int drc = tt_gemv_typed(w->down.ptr, w->down.dtype, e->d_h, e->d_xn,
+        int drc = tt_gemv_layer_dispatch(w->down.ptr, w->down.dtype, e->d_h, e->d_xn,
                       c->dim, FF_l, e->stream);
         if (drc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] down gemv rc=%d\n", drc);
         CHK_STAGE("7c down-gemv");
@@ -1632,7 +1652,7 @@ static int forward_layers(Qwen2Engine *e) {
                 static float pe_slice[1024];
 
                 /* g = inp_gate @ x (device) */
-                int ig = tt_gemv_typed(w->inp_gate.ptr, w->inp_gate.dtype,
+                int ig = tt_gemv_layer_dispatch(w->inp_gate.ptr, w->inp_gate.dtype,
                                        e->d_x, e->d_pl_tmp, e->pl_dim, c->dim,
                                        e->stream);
                 cudaStreamSynchronize(e->stream);
@@ -1682,7 +1702,7 @@ static int forward_layers(Qwen2Engine *e) {
                 }
                 /* p = rmsnorm(pl_proj @ g) ; x += p ; x *= out_scale */
                 cudaMemcpy(e->d_pl_tmp, gbuf, e->pl_dim * 4, cudaMemcpyHostToDevice);
-                int pg = tt_gemv_typed(w->pl_proj.ptr, w->pl_proj.dtype,
+                int pg = tt_gemv_layer_dispatch(w->pl_proj.ptr, w->pl_proj.dtype,
                                        e->d_pl_tmp, e->d_xn, c->dim, e->pl_dim,
                                        e->stream);
                 cudaStreamSynchronize(e->stream);
@@ -1801,7 +1821,7 @@ static int embed_token(Qwen2Engine *e, int tok) {
             }
             fprintf(stderr, "[PLE] x-check nan/inf=%d maxabs=%.4f\n", nb, mx);
         }
-        int prc = tt_gemv_typed(e->pl_model_proj.ptr, e->pl_model_proj.dtype,
+        int prc = tt_gemv_layer_dispatch(e->pl_model_proj.ptr, e->pl_model_proj.dtype,
                                 e->d_x, e->d_ple_row, (int)row, e->cfg.dim,
                                 e->stream);
         cudaStreamSynchronize(e->stream);

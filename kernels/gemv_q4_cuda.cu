@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <math.h>
 
 typedef struct {
@@ -290,6 +291,215 @@ __global__ void k_logits_q4_0_v2(const BlockQ4_0 *__restrict__ W,
     if (lane == 0) {
         logits[row0] = s0;
         if (row1 < vocab) logits[row1] = s1;
+    }
+}
+
+// M9.5+ V4: 4-rows-per-warp q4_0 LM head. Same uint32-streaming +
+// __byte_perm merge scheme as k_logits_q4_0_v2; extends to 4 rows per
+// warp so each lane keeps more weight bytes in flight and amortizes
+// the float4 x loads across 4 outputs (vs 2 in V2). Bit-exact against
+// V2 (verified in tools/micro_v4.cu; max |V2-V4| = 0 for the LM head
+// shape and across the FFN shapes in the microbench). Requires
+//   1. M >= 4 and M is a multiple of 4 (caller pads; vocab is
+//      even and 151936 for the qwen2 LM head is divisible by 4).
+//   2. K % 32 == 0 (q4_0 contract; standard for our LLM shapes).
+//   3. nb = K/32 even (same as V2; qwen2.5 K=896 -> nb=28 even,
+//      llama-3.2-1b K=2048 -> nb=64 even, gemma q4_0 K=1024 -> nb=32).
+// When M is not a multiple of 4 the trailing 1..3 rows fall through
+// the row>=M guard. When M is not a multiple of 8 there can be 1..3
+// unprocessed rows at the tail; the caller (dispatcher) MUST fall back
+// to V2 in that case so those rows are still produced.
+__global__ void k_logits_q4_0_v4(const BlockQ4_0 *__restrict__ W,
+                                 const float *__restrict__ x,
+                                 float *__restrict__ logits,
+                                 int vocab, int K) {
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 4;
+    if (row0 >= vocab) return;
+    const int row1 = row0 + 1;
+    const int row2 = row0 + 2;
+    const int row3 = row0 + 3;
+
+    const int lane = threadIdx.x;
+    const int nb = K / 32;
+    const uint32_t *rw0 = (const uint32_t *)((const char *)W + (long)row0 * nb * 18);
+    const uint32_t *rw1 = (const uint32_t *)((const char *)W + (long)row1 * nb * 18);
+    const uint32_t *rw2 = (const uint32_t *)((const char *)W + (long)row2 * nb * 18);
+    const uint32_t *rw3 = (const uint32_t *)((const char *)W + (long)row3 * nb * 18);
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+
+    for (int b = lane; b < nb; b += 32) {
+        const int wsc = (18 * b) >> 2;                 // word holding blk.d
+        const unsigned short d16a = (unsigned short)
+            (((18 * b) & 2) ? (rw0[wsc] >> 16) : (rw0[wsc] & 0xFFFFu));
+        const unsigned short d16b = (unsigned short)
+            (((18 * b) & 2) ? (rw1[wsc] >> 16) : (rw1[wsc] & 0xFFFFu));
+        const unsigned short d16c = (unsigned short)
+            (((18 * b) & 2) ? (rw2[wsc] >> 16) : (rw2[wsc] & 0xFFFFu));
+        const unsigned short d16d = (unsigned short)
+            (((18 * b) & 2) ? (rw3[wsc] >> 16) : (rw3[wsc] & 0xFFFFu));
+        const float da = __half2float(__ushort_as_half(d16a));
+        const float db = __half2float(__ushort_as_half(d16b));
+        const float dc = __half2float(__ushort_as_half(d16c));
+        const float dd = __half2float(__ushort_as_half(d16d));
+        const int a0 = (18 * b + 2) >> 2;              // first qs word
+        const int sh  = (18 * b + 2) & 2;              // 2 => misaligned merge
+        const float4 *x4 = (const float4 *)(x + b * 32);
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const uint32_t la = rw0[a0 + k];
+            const uint32_t lb = rw1[a0 + k];
+            const uint32_t lc = rw2[a0 + k];
+            const uint32_t ld = rw3[a0 + k];
+            const uint32_t va = sh ? __byte_perm(la, rw0[a0 + k + 1], 0x5432) : la;
+            const uint32_t vb = sh ? __byte_perm(lb, rw1[a0 + k + 1], 0x5432) : lb;
+            const uint32_t vc = sh ? __byte_perm(lc, rw2[a0 + k + 1], 0x5432) : lc;
+            const uint32_t vd = sh ? __byte_perm(ld, rw3[a0 + k + 1], 0x5432) : ld;
+            const float4 xa = x4[k];
+            const float4 xb = x4[k + 4];
+            // row0
+            s0 += (float)((int)(va         & 0xFu) - 8) * da * xa.x;
+            s0 += (float)((int)((va >>  4) & 0xFu) - 8) * da * xb.x;
+            s0 += (float)((int)((va >>  8) & 0xFu) - 8) * da * xa.y;
+            s0 += (float)((int)((va >> 12) & 0xFu) - 8) * da * xb.y;
+            s0 += (float)((int)((va >> 16) & 0xFu) - 8) * da * xa.z;
+            s0 += (float)((int)((va >> 20) & 0xFu) - 8) * da * xb.z;
+            s0 += (float)((int)((va >> 24) & 0xFu) - 8) * da * xa.w;
+            s0 += (float)((int)(va >> 28) - 8) * da * xb.w;
+            // row1
+            s1 += (float)((int)(vb         & 0xFu) - 8) * db * xa.x;
+            s1 += (float)((int)((vb >>  4) & 0xFu) - 8) * db * xb.x;
+            s1 += (float)((int)((vb >>  8) & 0xFu) - 8) * db * xa.y;
+            s1 += (float)((int)((vb >> 12) & 0xFu) - 8) * db * xb.y;
+            s1 += (float)((int)((vb >> 16) & 0xFu) - 8) * db * xa.z;
+            s1 += (float)((int)((vb >> 20) & 0xFu) - 8) * db * xb.z;
+            s1 += (float)((int)((vb >> 24) & 0xFu) - 8) * db * xa.w;
+            s1 += (float)((int)(vb >> 28) - 8) * db * xb.w;
+            // row2
+            s2 += (float)((int)(vc         & 0xFu) - 8) * dc * xa.x;
+            s2 += (float)((int)((vc >>  4) & 0xFu) - 8) * dc * xb.x;
+            s2 += (float)((int)((vc >>  8) & 0xFu) - 8) * dc * xa.y;
+            s2 += (float)((int)((vc >> 12) & 0xFu) - 8) * dc * xb.y;
+            s2 += (float)((int)((vc >> 16) & 0xFu) - 8) * dc * xa.z;
+            s2 += (float)((int)((vc >> 20) & 0xFu) - 8) * dc * xb.z;
+            s2 += (float)((int)((vc >> 24) & 0xFu) - 8) * dc * xa.w;
+            s2 += (float)((int)(vc >> 28) - 8) * dc * xb.w;
+            // row3
+            s3 += (float)((int)(vd         & 0xFu) - 8) * dd * xa.x;
+            s3 += (float)((int)((vd >>  4) & 0xFu) - 8) * dd * xb.x;
+            s3 += (float)((int)((vd >>  8) & 0xFu) - 8) * dd * xa.y;
+            s3 += (float)((int)((vd >> 12) & 0xFu) - 8) * dd * xb.y;
+            s3 += (float)((int)((vd >> 16) & 0xFu) - 8) * dd * xa.z;
+            s3 += (float)((int)((vd >> 20) & 0xFu) - 8) * dd * xb.z;
+            s3 += (float)((int)((vd >> 24) & 0xFu) - 8) * dd * xa.w;
+            s3 += (float)((int)(vd >> 28) - 8) * dd * xb.w;
+        }
+    }
+    s0 = warp_reduce_sum(s0);
+    s1 = warp_reduce_sum(s1);
+    s2 = warp_reduce_sum(s2);
+    s3 = warp_reduce_sum(s3);
+    if (lane == 0) {
+        logits[row0] = s0;
+        if (row1 < vocab) logits[row1] = s1;
+        if (row2 < vocab) logits[row2] = s2;
+        if (row3 < vocab) logits[row3] = s3;
+    }
+}
+
+// M9.5+ V4: 4-rows-per-warp q4_0 layer GEMV. Same shape contract as
+// k_gemv_q4_0 (V2) but with 4 rows per warp instead of 2. M must be
+// a multiple of 4; caller pads and falls back to V2 when not. Bit-
+// exact against V2 (microbench verified across LM head + FFN shapes).
+__global__ void k_gemv_q4_0_v4(const BlockQ4_0 *__restrict__ W,
+                               const float *__restrict__ x,
+                               float *__restrict__ y,
+                               int M, int K) {
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 4;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;
+    const int row2 = row0 + 2;
+    const int row3 = row0 + 3;
+
+    const int lane = threadIdx.x;
+    const int nb = K / 32;
+    const uint32_t *rw0 = (const uint32_t *)((const char *)W + (long)row0 * nb * 18);
+    const uint32_t *rw1 = (const uint32_t *)((const char *)W + (long)row1 * nb * 18);
+    const uint32_t *rw2 = (const uint32_t *)((const char *)W + (long)row2 * nb * 18);
+    const uint32_t *rw3 = (const uint32_t *)((const char *)W + (long)row3 * nb * 18);
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+
+    for (int b = lane; b < nb; b += 32) {
+        const int wsc = (18 * b) >> 2;
+        const unsigned short d16a = (unsigned short)
+            (((18 * b) & 2) ? (rw0[wsc] >> 16) : (rw0[wsc] & 0xFFFFu));
+        const unsigned short d16b = (unsigned short)
+            (((18 * b) & 2) ? (rw1[wsc] >> 16) : (rw1[wsc] & 0xFFFFu));
+        const unsigned short d16c = (unsigned short)
+            (((18 * b) & 2) ? (rw2[wsc] >> 16) : (rw2[wsc] & 0xFFFFu));
+        const unsigned short d16d = (unsigned short)
+            (((18 * b) & 2) ? (rw3[wsc] >> 16) : (rw3[wsc] & 0xFFFFu));
+        const float da = __half2float(__ushort_as_half(d16a));
+        const float db = __half2float(__ushort_as_half(d16b));
+        const float dc = __half2float(__ushort_as_half(d16c));
+        const float dd = __half2float(__ushort_as_half(d16d));
+        const int a0 = (18 * b + 2) >> 2;
+        const int sh  = (18 * b + 2) & 2;
+        const float4 *x4 = (const float4 *)(x + b * 32);
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const uint32_t la = rw0[a0 + k];
+            const uint32_t lb = rw1[a0 + k];
+            const uint32_t lc = rw2[a0 + k];
+            const uint32_t ld = rw3[a0 + k];
+            const uint32_t va = sh ? __byte_perm(la, rw0[a0 + k + 1], 0x5432) : la;
+            const uint32_t vb = sh ? __byte_perm(lb, rw1[a0 + k + 1], 0x5432) : lb;
+            const uint32_t vc = sh ? __byte_perm(lc, rw2[a0 + k + 1], 0x5432) : lc;
+            const uint32_t vd = sh ? __byte_perm(ld, rw3[a0 + k + 1], 0x5432) : ld;
+            const float4 xa = x4[k];
+            const float4 xb = x4[k + 4];
+            s0 += (float)((int)(va         & 0xFu) - 8) * da * xa.x;
+            s0 += (float)((int)((va >>  4) & 0xFu) - 8) * da * xb.x;
+            s0 += (float)((int)((va >>  8) & 0xFu) - 8) * da * xa.y;
+            s0 += (float)((int)((va >> 12) & 0xFu) - 8) * da * xb.y;
+            s0 += (float)((int)((va >> 16) & 0xFu) - 8) * da * xa.z;
+            s0 += (float)((int)((va >> 20) & 0xFu) - 8) * da * xb.z;
+            s0 += (float)((int)((va >> 24) & 0xFu) - 8) * da * xa.w;
+            s0 += (float)((int)(va >> 28) - 8) * da * xb.w;
+            s1 += (float)((int)(vb         & 0xFu) - 8) * db * xa.x;
+            s1 += (float)((int)((vb >>  4) & 0xFu) - 8) * db * xb.x;
+            s1 += (float)((int)((vb >>  8) & 0xFu) - 8) * db * xa.y;
+            s1 += (float)((int)((vb >> 12) & 0xFu) - 8) * db * xb.y;
+            s1 += (float)((int)((vb >> 16) & 0xFu) - 8) * db * xa.z;
+            s1 += (float)((int)((vb >> 20) & 0xFu) - 8) * db * xb.z;
+            s1 += (float)((int)((vb >> 24) & 0xFu) - 8) * db * xa.w;
+            s1 += (float)((int)(vb >> 28) - 8) * db * xb.w;
+            s2 += (float)((int)(vc         & 0xFu) - 8) * dc * xa.x;
+            s2 += (float)((int)((vc >>  4) & 0xFu) - 8) * dc * xb.x;
+            s2 += (float)((int)((vc >>  8) & 0xFu) - 8) * dc * xa.y;
+            s2 += (float)((int)((vc >> 12) & 0xFu) - 8) * dc * xb.y;
+            s2 += (float)((int)((vc >> 16) & 0xFu) - 8) * dc * xa.z;
+            s2 += (float)((int)((vc >> 20) & 0xFu) - 8) * dc * xb.z;
+            s2 += (float)((int)((vc >> 24) & 0xFu) - 8) * dc * xa.w;
+            s2 += (float)((int)(vc >> 28) - 8) * dc * xb.w;
+            s3 += (float)((int)(vd         & 0xFu) - 8) * dd * xa.x;
+            s3 += (float)((int)((vd >>  4) & 0xFu) - 8) * dd * xb.x;
+            s3 += (float)((int)((vd >>  8) & 0xFu) - 8) * dd * xa.y;
+            s3 += (float)((int)((vd >> 12) & 0xFu) - 8) * dd * xb.y;
+            s3 += (float)((int)((vd >> 16) & 0xFu) - 8) * dd * xa.z;
+            s3 += (float)((int)((vd >> 20) & 0xFu) - 8) * dd * xb.z;
+            s3 += (float)((int)((vd >> 24) & 0xFu) - 8) * dd * xa.w;
+            s3 += (float)((int)(vd >> 28) - 8) * dd * xb.w;
+        }
+    }
+    s0 = warp_reduce_sum(s0);
+    s1 = warp_reduce_sum(s1);
+    s2 = warp_reduce_sum(s2);
+    s3 = warp_reduce_sum(s3);
+    if (lane == 0) {
+        y[row0] = s0;
+        if (row1 < M) y[row1] = s1;
+        if (row2 < M) y[row2] = s2;
+        if (row3 < M) y[row3] = s3;
     }
 }
 
@@ -598,6 +808,50 @@ int tt_logits_q4_0_v2(const void *dW, const float *dx, float *dlogits,
     return (int)cudaGetLastError();
 }
 
+/* M9.5+ V4 launcher: 4-rows-per-warp q4_0 LM head. Caller (dispatcher)
+ * must already have verified (K%32==0) and (vocab%4==0). Same nb-even
+ * contract as tt_logits_q4_0_v2. Returns the cuda error code (0 on ok). */
+int tt_logits_q4_0_v4(const void *dW, const float *dx, float *dlogits,
+                      int vocab, int K, cudaStream_t stream) {
+    /* 4 rows per warp -> blockDim.y = 8 warps; grid covers vocab/4/8 tiles. */
+    dim3 g, b; b.x = 32; b.y = 8; b.z = 1;
+    g.x = (vocab + b.y * 4 - 1) / (b.y * 4); g.y = 1; g.z = 1;
+    k_logits_q4_0_v4<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW, dx, dlogits, vocab, K);
+    return (int)cudaGetLastError();
+}
+
+/* M9.5+ V4 launcher: 4-rows-per-warp q4_0 layer GEMV. Caller (dispatcher)
+ * must have verified (K%32==0) and (M%4==0). Same nb-even contract. */
+int tt_gemv_q4_0_v4(const void *dW, const float *dx, float *dy,
+                    int M, int K, cudaStream_t stream) {
+    dim3 g, b; b.x = 32; b.y = 8; b.z = 1;
+    g.x = (M + b.y * 4 - 1) / (b.y * 4); g.y = 1; g.z = 1;
+    k_gemv_q4_0_v4<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW, dx, dy, M, K);
+    return (int)cudaGetLastError();
+}
+
+/* M9.5+ V4 dispatch helper for q4_0 layer GEMVs. Returns 0 on success
+ * (V4 or V2 selected, row coverage complete), 1 if the call fell
+ * through to the scalar fallback (caller must then dispatch to
+ * tt_gemv_typed or a scalar kernel). Bit-exact against the scalar
+ * path; no precision delta vs V2 alone (V4 == V2 == scalar up to
+ * the FMA order, which is identical in V2 and V4 so outputs match
+ * bit-exact). M must be a multiple of 4 for V4 to be eligible; we
+ * pad to 4 by passing padded_M = (M+3)&~3 internally and writing
+ * y[i] for i < M only. */
+int tt_gemv_q4_0_dispatch(const void *dW, const float *dx, float *dy,
+                           int M, int K, cudaStream_t stream) {
+    const int nb = K / 32;
+    if ((K & 31) == 0 && (nb & 1) == 0 && (M & 3) == 0 && M >= 4) {
+        int rc = tt_gemv_q4_0_v4(dW, dx, dy, M, K, stream);
+        if (rc == 0) return 0;
+        /* fall through to V2 on launch failure */
+    }
+    dim3 g, b; gemv_dims2(M, &g, &b);
+    k_gemv_q4_0<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW, dx, dy, M, K);
+    return (int)cudaGetLastError();
+}
+
 int tt_embed_q4_0(const void *dW, int tok, float *dx, int dim, cudaStream_t stream) {
     const int threads = dim / 32;
     k_embed_q4_0<<<(threads + 255) / 256, 256, 0, stream>>>((const BlockQ4_0 *)dW, tok, dx, dim);
@@ -627,14 +881,21 @@ int tt_logits_dispatch(const void *dW, int dtype, const float *dx,
     if (dtype == 8)
         k_logits_q8_0<<<g, b, 0, stream>>>((const BlockQ8_0 *)dW, dx, dlogits, vocab, K);
     else {
-        /* M9.5: route q4_0 to the V2 vectorized LM head when K/32 is even
-         * (the uint32 streaming + __byte_perm merge contract; same nb-even
-         * requirement as the q4_0 layer GEMV V2 in this file). qwen2.5-0.5b
-         * (K=896, nb=28), llama-3.2-1b (K=2048, nb=64), gemma q4_0 (K=1024
-         * dim sections) all satisfy it; odd-K or odd-nb shapes fall back to
-         * the scalar k_logits_q4_0 above. */
-        if (((K >> 5) & 1) == 0 && (K & 31) == 0) {
-            /* V2 needs grid.x * blockDim.y * 2 >= vocab. Re-derive via
+        /* M9.5+: route q4_0 to V4 (4 rows/warp) when eligible, else V2,
+         * else scalar. V4 wins 1.7x on the LM head shape and 1.5-1.6x
+         * on FFN shapes vs V2 in the microbench (bit-exact).
+         *   V4 needs: K%32==0, nb=K/32 even, vocab%4==0 (vocab is always
+         *     even in our heads; check 4 explicitly so any future odd-vocab
+         *     model falls through cleanly to V2).
+         *   V2 needs: K%32==0, nb even (same uint32 streaming contract).
+         *   scalar k_logits_q4_0 is the fallback for odd-nb or odd-K. */
+        if ((K & 31) == 0 && ((K >> 5) & 1) == 0 && (vocab & 3) == 0) {
+            b.x = 32; b.y = 8; b.z = 1;
+            g.x = (vocab + b.y * 4 - 1) / (b.y * 4); g.y = 1; g.z = 1;
+            k_logits_q4_0_v4<<<g, b, 0, stream>>>(
+                (const BlockQ4_0 *)dW, dx, dlogits, vocab, K);
+        } else if (((K >> 5) & 1) == 0 && (K & 31) == 0) {
+            /* V2 path: grid.x * blockDim.y * 2 >= vocab. Re-derive via
              * gemv_dims2 (same as tt_gemv_q4_0) so we don't waste warps. */
             gemv_dims2(vocab, &g, &b);
             k_logits_q4_0_v2<<<g, b, 0, stream>>>(
