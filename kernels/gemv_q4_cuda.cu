@@ -838,11 +838,19 @@ int tt_gemv_q4_0_v4(const void *dW, const float *dx, float *dy,
  * the FMA order, which is identical in V2 and V4 so outputs match
  * bit-exact). M must be a multiple of 4 for V4 to be eligible; we
  * pad to 4 by passing padded_M = (M+3)&~3 internally and writing
- * y[i] for i < M only. */
+ * y[i] for i < M only.
+ *
+ * M9.5+ conditional dispatch: route to V4 only when M >= 128. Microbench
+ * (tools/micro_v4.cu, K=896) shows V4 ≈ V2 below M=128 (both at the
+ * ~0.005 ms noise floor) and V4 wins 1.14-1.49x for M >= 128. M=1 cases
+ * (Q/K/V projections, head dim projections in small models) now fall
+ * through to V2, which is at worst equal to V4 and at best modestly
+ * faster. Threshold matches the microbench data; the q4_0 LM head
+ * (M=151936) and FFN shapes (M=4864) remain on V4. */
 int tt_gemv_q4_0_dispatch(const void *dW, const float *dx, float *dy,
                            int M, int K, cudaStream_t stream) {
     const int nb = K / 32;
-    if ((K & 31) == 0 && (nb & 1) == 0 && (M & 3) == 0 && M >= 4) {
+    if ((K & 31) == 0 && (nb & 1) == 0 && (M & 3) == 0 && M >= 128) {
         int rc = tt_gemv_q4_0_v4(dW, dx, dy, M, K, stream);
         if (rc == 0) return 0;
         /* fall through to V2 on launch failure */
