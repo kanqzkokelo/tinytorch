@@ -357,18 +357,29 @@ GGUFModel *gguf_load(const char *filepath) {
 
     // Resolve binary data pointers using GGUF tensor offsets, validating each
     // tensor's [offset, offset+size_bytes) window against EOF (audit finding 3).
+    // A tensor whose data window is past EOF is left as data=NULL with a warning
+    // — a truncated GGUF (e.g. an interrupted download) can still be partially
+    // usable when the engine's tensor-name guards skip the missing entries
+    // (e.g. Gemma4 PLE's per_layer_token_embd.weight). Hard-failing here
+    // would prevent benching the tensors that DID land in the file.
     uint64_t avail = (uint64_t)(file_size - aligned_offset);
+    int truncated_count = 0;
     for (int i = 0; i < model->tensor_count; i++) {
         GGUFTensor *t = &model->tensors[i];
         if (t->offset > avail || t->size_bytes > avail - t->offset) {
             fprintf(stderr,
-                    "[GGUF] Tensor '%s' data out of bounds: offset=%llu size=%zu avail=%llu\n",
+                    "[GGUF] WARN: Tensor '%s' data out of bounds (offset=%llu size=%zu avail=%llu) — marking NULL\n",
                     t->name, (unsigned long long)t->offset, t->size_bytes,
                     (unsigned long long)avail);
-            goto fail;
+            t->data = NULL;   /* engine falls back to skip if it sees NULL */
+            truncated_count++;
+            continue;
         }
         t->data = (void *)(binary_base + t->offset);
     }
+    if (truncated_count > 0)
+        fprintf(stderr, "[GGUF] %d/%d tensor(s) truncated past EOF; load continues\n",
+                truncated_count, model->tensor_count);
 
     printf("[GGUF] Loaded model: arch=%s dim=%d, hidden=%d, layers=%d, heads=%d, kv_heads=%d, tensors=%d (gguf v%u)\n",
            model->architecture[0] ? model->architecture : "?",
