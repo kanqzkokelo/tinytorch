@@ -272,6 +272,64 @@ __global__ void k_logits_q8_0(const BlockQ8_0 *__restrict__ W,
     if (lane == 0) logits[v] = sum;
 }
 
+// V2 layer GEMV over q8_0 weights (closes the qwen3-0.6b-q8_0 0.25x gap
+// to llama.cpp CUDA). Same shape as k_gemv_q4_0: two rows per warp, each
+// lane strides the K/32 q8_0 blocks, each block loads 8 uint32 words of
+// qs and sign-extends in-line to compute `sum += (int8)q * d * x` per
+// element. x is re-read once per row but loaded as float4, so two rows
+// per warp halve the x bandwidth pressure vs one-row-per-warp. Requires
+// nb even (same contract as k_gemv_q4_0; qwen3-0.6b q8_0 K values are
+// 1024/3072 -> nb=32/96, both even).
+__global__ void k_gemv_q8_0(const BlockQ8_0 *__restrict__ W,
+                            const float *__restrict__ x,
+                            float *__restrict__ y,
+                            int M, int K) {
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 2;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;                    // caller pads M to even
+
+    const int lane = threadIdx.x;
+    const int nb = K / 32;                        // q8_0 blocks per row
+    const uint32_t *rw0 = (const uint32_t *)((const char *)W + (long)row0 * nb * 34);
+    const uint32_t *rw1 = (const uint32_t *)((const char *)W + (long)row1 * nb * 34);
+    float s0 = 0.0f, s1 = 0.0f;
+
+    for (int b = lane; b < nb; b += 32) {
+        const int wsc = (34 * b) >> 2;                 // word holding blk.d
+        const int sh  = (34 * b + 2) & 2;              // 2 => misaligned merge
+        const unsigned short d16a = (unsigned short)
+            (((34 * b) & 2) ? (rw0[wsc] >> 16) : (rw0[wsc] & 0xFFFFu));
+        const unsigned short d16b = (unsigned short)
+            (((34 * b) & 2) ? (rw1[wsc] >> 16) : (rw1[wsc] & 0xFFFFu));
+        const float da = __half2float(__ushort_as_half(d16a));
+        const float db = __half2float(__ushort_as_half(d16b));
+        const int a0 = (34 * b + 2) >> 2;              // first qs word
+        const float4 *x4 = (const float4 *)(x + b * 32);
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const uint32_t la = rw0[a0 + k];
+            const uint32_t lb = rw1[a0 + k];
+            const uint32_t va = sh ? __byte_perm(la, rw0[a0 + k + 1], 0x5432) : la;
+            const uint32_t vb = sh ? __byte_perm(lb, rw1[a0 + k + 1], 0x5432) : lb;
+            const float4 xv = x4[k];
+            s0 += ((float)((int)(va << 24) >> 24)) * da * xv.x;
+            s0 += ((float)((int)(va << 16) >> 24)) * da * xv.y;
+            s0 += ((float)((int)(va <<  8) >> 24)) * da * xv.z;
+            s0 += ((float)((int)(va       ) >> 24)) * da * xv.w;
+            s1 += ((float)((int)(vb << 24) >> 24)) * db * xv.x;
+            s1 += ((float)((int)(vb << 16) >> 24)) * db * xv.y;
+            s1 += ((float)((int)(vb <<  8) >> 24)) * db * xv.z;
+            s1 += ((float)((int)(vb       ) >> 24)) * db * xv.w;
+        }
+    }
+    s0 = warp_reduce_sum(s0);
+    s1 = warp_reduce_sum(s1);
+    if (lane == 0) {
+        y[row0] = s0;
+        if (row1 < M) y[row1] = s1;
+    }
+}
+
 // Embedding lookup: dequantize row `tok` of a q4_0 matrix into dx[0..dim).
 __global__ void k_embed_q4_0(const BlockQ4_0 *__restrict__ W, int tok,
                              float *__restrict__ dx, int dim) {
@@ -308,6 +366,15 @@ int tt_gemv_q4_0(const void *dW, const float *dx, float *dy, int M, int K,
                  cudaStream_t stream) {
     dim3 g, b; gemv_dims2(M, &g, &b);
     k_gemv_q4_0<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW, dx, dy, M, K);
+    return (int)cudaGetLastError();
+}
+
+/* M9.5: V2 layer GEMV for q8_0 — used by the qwen3-0.6b-q8_0 decode path.
+ * Same 2-rows-per-warp shape as tt_gemv_q4_0; requires K/32 (nb) even. */
+int tt_gemv_q8_0(const void *dW, const float *dx, float *dy, int M, int K,
+                 cudaStream_t stream) {
+    dim3 g, b; gemv_dims2(M, &g, &b);
+    k_gemv_q8_0<<<g, b, 0, stream>>>((const BlockQ8_0 *)dW, dx, dy, M, K);
     return (int)cudaGetLastError();
 }
 

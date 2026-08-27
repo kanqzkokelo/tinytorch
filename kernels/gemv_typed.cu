@@ -500,9 +500,20 @@ int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
         case TTQ_Q5_1:
             k_gemv_q5_1<<<g, b, 0, stream>>>((const uint8_t *)W, x, y, M, K);
             break;
-        case TTQ_Q8_0:
+        case TTQ_Q8_0: {
+            /* M9.5: V2 path closes the qwen3-0.6b-q8_0 0.25x gap to
+             * llama.cpp CUDA. Delegate to the 2-rows-per-warp kernel in
+             * gemv_q4_cuda.cu when K/32 (nb) is even — the alignment
+             * contract of the uint32-streaming inner loop. Otherwise fall
+             * back to the scalar k_gemv_q8_0 above. */
+            if ((K & 31) == 0 && (((K >> 5)) & 1) == 0) {
+                extern int tt_gemv_q8_0(const void *, const float *, float *,
+                                        int, int, cudaStream_t);
+                return tt_gemv_q8_0(W, x, y, M, K, stream);
+            }
             k_gemv_q8_0<<<g, b, 0, stream>>>((const uint8_t *)W, x, y, M, K);
             break;
+        }
         case TTQ_Q4_K:
         case TTQ_Q5_K:
         case TTQ_Q6_K:
