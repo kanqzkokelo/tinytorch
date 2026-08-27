@@ -177,6 +177,21 @@ test_spec_verify: $(BUILD)/test_spec_verify
 
 .PHONY: test_spec_verify
 
+# M10+ True Batched-4 GEMV (q4_0 + q8_0) randomized correctness test.
+# Compares tt_gemv_q4_0_batch4 against 4 sequential tt_gemv_q4_0 calls
+# across engine-relevant shapes; same for q8_0.
+$(BUILD)/test_batch4_gemv: tests/test_batch4_gemv.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu | $(BUILD)
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	  -I$(CUDA_INC) -Iinclude -Xcompiler -fPIC \
+	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
+	  -o $@ \
+	  tests/test_batch4_gemv.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu \
+	  -L$(HOME)/mmcuda/lib -lcudart -lpthread -lm
+
+test_batch4_gemv: $(BUILD)/test_batch4_gemv
+
+.PHONY: test_batch4_gemv
+
 # CI: cheap CPU-only sanity (no GPU needed) -- same checks as GitHub CI.
 ci:
 	./scripts/ci_local.sh

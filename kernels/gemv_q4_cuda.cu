@@ -609,6 +609,349 @@ __global__ void k_gemv_q8_0(const BlockQ8_0 *__restrict__ W,
     }
 }
 
+// M10+ True Batched-4 GEMV (q4_0 + q8_0).
+//
+// Design: each warp processes 4 weight rows x 4 candidate x vectors in
+// a single launch, producing 16 outputs per warp. The 4 candidate x
+// vectors are loaded into shared memory ONCE per block and reused by
+// all 16 warps; weights are streamed from gmem (4 rows in parallel so
+// each q4_0/q8_0 word is read once per K-position). This is the
+// 3.2-4.4x speedup kernel verified in tools/micro_batch4.cu.
+//
+// Constraints (caller must check):
+//   - K % 32 == 0
+//   - nb = K/32 even (same uint32 streaming + __byte_perm merge contract
+//     as k_gemv_q4_0 / k_gemv_q8_0 V2 kernels)
+//   - M multiple of 4 (4 rows per warp)
+//   - shmem budget: 4 * K * 4 bytes for the 4 candidate x's; for K=4864
+//     that is 76 KB (single block/SM on Ampere; opt in via
+//     cudaFuncSetAttribute(MaxDynamicSharedMemorySize) when > 48 KB).
+//
+// Layout:
+//   X is [4, K] flat, indexed as X[c*K + k]
+//   Y is [4, M] flat, indexed as Y[c*M + m]
+//   W is [M, K] (q4_0 or q8_0 blocks)
+//
+// Output[ c ][ m ] = sum_k dequant( W[m, k] ) * X[c, k]
+//
+// Returns -1 from the launcher if any constraint is violated (caller
+// should fall back to 4 sequential single calls).
+
+// M10+ q4_0 BATCHED-4: 4 rows/warp x 4 candidate x in shmem.
+__global__ void k_gemv_q4_0_batch4(const BlockQ4_0 *__restrict__ W,
+                                    const float    *__restrict__ X,
+                                    float          *__restrict__ Y,
+                                    int M, int K) {
+    extern __shared__ float sx[];   // [4][K]
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int row0 = (blockIdx.x * blockDim.y + warp) * 4;
+    const int row1 = row0 + 1, row2 = row0 + 2, row3 = row0 + 3;
+    const int nb   = K / 32;
+
+    // Cooperatively load 4 candidate x vectors into shmem (float4 vectorized).
+    // The load + __syncthreads MUST execute on all warps; the row-out-of-
+    // range early-return is deferred until after the barrier so the
+    // collective sync is well-defined even when only a few warps have
+    // real work (e.g. M < blockDim.y * 4). Use a per-warp strided load
+    // (32 lanes cover the buffer in stride-32 chunks); this works for
+    // any K >= 32 (when K < 32, the launcher rejects the call).
+    {
+        const int total_f4 = 4 * K / 4;          // K float4 per K floats
+        const float4 *src  = (const float4 *)X;
+        float4       *dst  = (float4 *)sx;
+        for (int i = lane; i < total_f4; i += 32) {
+            dst[i] = src[i];
+        }
+    }
+    __syncthreads();
+    if (row0 >= M) return;       // safe: barrier already passed
+
+    const uint32_t *rw0 = (const uint32_t *)((const char *)W + (long)row0 * nb * 18);
+    const uint32_t *rw1 = (const uint32_t *)((const char *)W + (long)row1 * nb * 18);
+    const uint32_t *rw2 = (const uint32_t *)((const char *)W + (long)row2 * nb * 18);
+    const uint32_t *rw3 = (const uint32_t *)((const char *)W + (long)row3 * nb * 18);
+
+    const float4 *sx4_0 = (const float4 *)(sx + 0 * K);
+    const float4 *sx4_1 = (const float4 *)(sx + 1 * K);
+    const float4 *sx4_2 = (const float4 *)(sx + 2 * K);
+    const float4 *sx4_3 = (const float4 *)(sx + 3 * K);
+
+    float s00 = 0.f, s01 = 0.f, s02 = 0.f, s03 = 0.f;
+    float s10 = 0.f, s11 = 0.f, s12 = 0.f, s13 = 0.f;
+    float s20 = 0.f, s21 = 0.f, s22 = 0.f, s23 = 0.f;
+    float s30 = 0.f, s31 = 0.f, s32 = 0.f, s33 = 0.f;
+
+    for (int b = lane; b < nb; b += 32) {
+        const int wsc = (18 * b) >> 2;
+        const int sh  = (18 * b + 2) & 2;
+        const unsigned short d16a = (unsigned short)
+            (((18 * b) & 2) ? (rw0[wsc] >> 16) : (rw0[wsc] & 0xFFFFu));
+        const unsigned short d16b = (unsigned short)
+            (((18 * b) & 2) ? (rw1[wsc] >> 16) : (rw1[wsc] & 0xFFFFu));
+        const unsigned short d16c = (unsigned short)
+            (((18 * b) & 2) ? (rw2[wsc] >> 16) : (rw2[wsc] & 0xFFFFu));
+        const unsigned short d16d = (unsigned short)
+            (((18 * b) & 2) ? (rw3[wsc] >> 16) : (rw3[wsc] & 0xFFFFu));
+        const float da = __half2float(__ushort_as_half(d16a));
+        const float db = __half2float(__ushort_as_half(d16b));
+        const float dc = __half2float(__ushort_as_half(d16c));
+        const float dd = __half2float(__ushort_as_half(d16d));
+        const int a0 = (18 * b + 2) >> 2;
+        /* x float4 offset for block b: each q4_0 block covers 32 values
+         * = 8 float4s, so the float4 stride is 8 per b. */
+        const int x_off = b * 8;
+
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const uint32_t la0 = __ldg(rw0 + a0 + k);
+            const uint32_t la1 = __ldg(rw1 + a0 + k);
+            const uint32_t la2 = __ldg(rw2 + a0 + k);
+            const uint32_t la3 = __ldg(rw3 + a0 + k);
+            const uint32_t va0 = sh ? __byte_perm(la0, __ldg(rw0 + a0 + k + 1), 0x5432) : la0;
+            const uint32_t va1 = sh ? __byte_perm(la1, __ldg(rw1 + a0 + k + 1), 0x5432) : la1;
+            const uint32_t va2 = sh ? __byte_perm(la2, __ldg(rw2 + a0 + k + 1), 0x5432) : la2;
+            const uint32_t va3 = sh ? __byte_perm(la3, __ldg(rw3 + a0 + k + 1), 0x5432) : la3;
+
+            const float a0_0 = (float)((int)( va0         & 0xFu) - 8) * da;
+            const float a0_1 = (float)((int)((va0 >>  4)  & 0xFu) - 8) * da;
+            const float a0_2 = (float)((int)((va0 >>  8)  & 0xFu) - 8) * da;
+            const float a0_3 = (float)((int)((va0 >> 12)  & 0xFu) - 8) * da;
+            const float a0_4 = (float)((int)((va0 >> 16)  & 0xFu) - 8) * da;
+            const float a0_5 = (float)((int)((va0 >> 20)  & 0xFu) - 8) * da;
+            const float a0_6 = (float)((int)((va0 >> 24)  & 0xFu) - 8) * da;
+            const float a0_7 = (float)((int)( va0 >> 28)        - 8) * da;
+            const float a1_0 = (float)((int)( va1         & 0xFu) - 8) * db;
+            const float a1_1 = (float)((int)((va1 >>  4)  & 0xFu) - 8) * db;
+            const float a1_2 = (float)((int)((va1 >>  8)  & 0xFu) - 8) * db;
+            const float a1_3 = (float)((int)((va1 >> 12)  & 0xFu) - 8) * db;
+            const float a1_4 = (float)((int)((va1 >> 16)  & 0xFu) - 8) * db;
+            const float a1_5 = (float)((int)((va1 >> 20)  & 0xFu) - 8) * db;
+            const float a1_6 = (float)((int)((va1 >> 24)  & 0xFu) - 8) * db;
+            const float a1_7 = (float)((int)( va1 >> 28)        - 8) * db;
+            const float a2_0 = (float)((int)( va2         & 0xFu) - 8) * dc;
+            const float a2_1 = (float)((int)((va2 >>  4)  & 0xFu) - 8) * dc;
+            const float a2_2 = (float)((int)((va2 >>  8)  & 0xFu) - 8) * dc;
+            const float a2_3 = (float)((int)((va2 >> 12)  & 0xFu) - 8) * dc;
+            const float a2_4 = (float)((int)((va2 >> 16)  & 0xFu) - 8) * dc;
+            const float a2_5 = (float)((int)((va2 >> 20)  & 0xFu) - 8) * dc;
+            const float a2_6 = (float)((int)((va2 >> 24)  & 0xFu) - 8) * dc;
+            const float a2_7 = (float)((int)( va2 >> 28)        - 8) * dc;
+            const float a3_0 = (float)((int)( va3         & 0xFu) - 8) * dd;
+            const float a3_1 = (float)((int)((va3 >>  4)  & 0xFu) - 8) * dd;
+            const float a3_2 = (float)((int)((va3 >>  8)  & 0xFu) - 8) * dd;
+            const float a3_3 = (float)((int)((va3 >> 12)  & 0xFu) - 8) * dd;
+            const float a3_4 = (float)((int)((va3 >> 16)  & 0xFu) - 8) * dd;
+            const float a3_5 = (float)((int)((va3 >> 20)  & 0xFu) - 8) * dd;
+            const float a3_6 = (float)((int)((va3 >> 24)  & 0xFu) - 8) * dd;
+            const float a3_7 = (float)((int)( va3 >> 28)        - 8) * dd;
+
+            const float4 xa0 = sx4_0[x_off + k],     xb0 = sx4_0[x_off + k + 4];
+            const float4 xa1 = sx4_1[x_off + k],     xb1 = sx4_1[x_off + k + 4];
+            const float4 xa2 = sx4_2[x_off + k],     xb2 = sx4_2[x_off + k + 4];
+            const float4 xa3 = sx4_3[x_off + k],     xb3 = sx4_3[x_off + k + 4];
+
+            s00 += a0_0 * xa0.x;  s00 += a0_1 * xb0.x;
+            s00 += a0_2 * xa0.y;  s00 += a0_3 * xb0.y;
+            s00 += a0_4 * xa0.z;  s00 += a0_5 * xb0.z;
+            s00 += a0_6 * xa0.w;  s00 += a0_7 * xb0.w;
+            s01 += a0_0 * xa1.x;  s01 += a0_1 * xb1.x;
+            s01 += a0_2 * xa1.y;  s01 += a0_3 * xb1.y;
+            s01 += a0_4 * xa1.z;  s01 += a0_5 * xb1.z;
+            s01 += a0_6 * xa1.w;  s01 += a0_7 * xb1.w;
+            s02 += a0_0 * xa2.x;  s02 += a0_1 * xb2.x;
+            s02 += a0_2 * xa2.y;  s02 += a0_3 * xb2.y;
+            s02 += a0_4 * xa2.z;  s02 += a0_5 * xb2.z;
+            s02 += a0_6 * xa2.w;  s02 += a0_7 * xb2.w;
+            s03 += a0_0 * xa3.x;  s03 += a0_1 * xb3.x;
+            s03 += a0_2 * xa3.y;  s03 += a0_3 * xb3.y;
+            s03 += a0_4 * xa3.z;  s03 += a0_5 * xb3.z;
+            s03 += a0_6 * xa3.w;  s03 += a0_7 * xb3.w;
+            s10 += a1_0 * xa0.x;  s10 += a1_1 * xb0.x;
+            s10 += a1_2 * xa0.y;  s10 += a1_3 * xb0.y;
+            s10 += a1_4 * xa0.z;  s10 += a1_5 * xb0.z;
+            s10 += a1_6 * xa0.w;  s10 += a1_7 * xb0.w;
+            s11 += a1_0 * xa1.x;  s11 += a1_1 * xb1.x;
+            s11 += a1_2 * xa1.y;  s11 += a1_3 * xb1.y;
+            s11 += a1_4 * xa1.z;  s11 += a1_5 * xb1.z;
+            s11 += a1_6 * xa1.w;  s11 += a1_7 * xb1.w;
+            s12 += a1_0 * xa2.x;  s12 += a1_1 * xb2.x;
+            s12 += a1_2 * xa2.y;  s12 += a1_3 * xb2.y;
+            s12 += a1_4 * xa2.z;  s12 += a1_5 * xb2.z;
+            s12 += a1_6 * xa2.w;  s12 += a1_7 * xb2.w;
+            s13 += a1_0 * xa3.x;  s13 += a1_1 * xb3.x;
+            s13 += a1_2 * xa3.y;  s13 += a1_3 * xb3.y;
+            s13 += a1_4 * xa3.z;  s13 += a1_5 * xb3.z;
+            s13 += a1_6 * xa3.w;  s13 += a1_7 * xb3.w;
+            s20 += a2_0 * xa0.x;  s20 += a2_1 * xb0.x;
+            s20 += a2_2 * xa0.y;  s20 += a2_3 * xb0.y;
+            s20 += a2_4 * xa0.z;  s20 += a2_5 * xb0.z;
+            s20 += a2_6 * xa0.w;  s20 += a2_7 * xb0.w;
+            s21 += a2_0 * xa1.x;  s21 += a2_1 * xb1.x;
+            s21 += a2_2 * xa1.y;  s21 += a2_3 * xb1.y;
+            s21 += a2_4 * xa1.z;  s21 += a2_5 * xb1.z;
+            s21 += a2_6 * xa1.w;  s21 += a2_7 * xb1.w;
+            s22 += a2_0 * xa2.x;  s22 += a2_1 * xb2.x;
+            s22 += a2_2 * xa2.y;  s22 += a2_3 * xb2.y;
+            s22 += a2_4 * xa2.z;  s22 += a2_5 * xb2.z;
+            s22 += a2_6 * xa2.w;  s22 += a2_7 * xb2.w;
+            s23 += a2_0 * xa3.x;  s23 += a2_1 * xb3.x;
+            s23 += a2_2 * xa3.y;  s23 += a2_3 * xb3.y;
+            s23 += a2_4 * xa3.z;  s23 += a2_5 * xb3.z;
+            s23 += a2_6 * xa3.w;  s23 += a2_7 * xb3.w;
+            s30 += a3_0 * xa0.x;  s30 += a3_1 * xb0.x;
+            s30 += a3_2 * xa0.y;  s30 += a3_3 * xb0.y;
+            s30 += a3_4 * xa0.z;  s30 += a3_5 * xb0.z;
+            s30 += a3_6 * xa0.w;  s30 += a3_7 * xb0.w;
+            s31 += a3_0 * xa1.x;  s31 += a3_1 * xb1.x;
+            s31 += a3_2 * xa1.y;  s31 += a3_3 * xb1.y;
+            s31 += a3_4 * xa1.z;  s31 += a3_5 * xb1.z;
+            s31 += a3_6 * xa1.w;  s31 += a3_7 * xb1.w;
+            s32 += a3_0 * xa2.x;  s32 += a3_1 * xb2.x;
+            s32 += a3_2 * xa2.y;  s32 += a3_3 * xb2.y;
+            s32 += a3_4 * xa2.z;  s32 += a3_5 * xb2.z;
+            s32 += a3_6 * xa2.w;  s32 += a3_7 * xb2.w;
+            s33 += a3_0 * xa3.x;  s33 += a3_1 * xb3.x;
+            s33 += a3_2 * xa3.y;  s33 += a3_3 * xb3.y;
+            s33 += a3_4 * xa3.z;  s33 += a3_5 * xb3.z;
+            s33 += a3_6 * xa3.w;  s33 += a3_7 * xb3.w;
+        }
+    }
+    s00 = warp_reduce_sum(s00); s01 = warp_reduce_sum(s01); s02 = warp_reduce_sum(s02); s03 = warp_reduce_sum(s03);
+    s10 = warp_reduce_sum(s10); s11 = warp_reduce_sum(s11); s12 = warp_reduce_sum(s12); s13 = warp_reduce_sum(s13);
+    s20 = warp_reduce_sum(s20); s21 = warp_reduce_sum(s21); s22 = warp_reduce_sum(s22); s23 = warp_reduce_sum(s23);
+    s30 = warp_reduce_sum(s30); s31 = warp_reduce_sum(s31); s32 = warp_reduce_sum(s32); s33 = warp_reduce_sum(s33);
+    if (lane == 0) {
+        Y[0 * M + row0] = s00;  Y[1 * M + row0] = s01;  Y[2 * M + row0] = s02;  Y[3 * M + row0] = s03;
+        if (row1 < M) { Y[0 * M + row1] = s10;  Y[1 * M + row1] = s11;  Y[2 * M + row1] = s12;  Y[3 * M + row1] = s13; }
+        if (row2 < M) { Y[0 * M + row2] = s20;  Y[1 * M + row2] = s21;  Y[2 * M + row2] = s22;  Y[3 * M + row2] = s23; }
+        if (row3 < M) { Y[0 * M + row3] = s30;  Y[1 * M + row3] = s31;  Y[2 * M + row3] = s32;  Y[3 * M + row3] = s33; }
+    }
+}
+
+// M10+ q8_0 BATCHED-4: 4 rows/warp x 4 candidate x in shmem.
+__global__ void k_gemv_q8_0_batch4(const BlockQ8_0 *__restrict__ W,
+                                    const float    *__restrict__ X,
+                                    float          *__restrict__ Y,
+                                    int M, int K) {
+    extern __shared__ float sx[];
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int row0 = (blockIdx.x * blockDim.y + warp) * 4;
+    const int row1 = row0 + 1, row2 = row0 + 2, row3 = row0 + 3;
+    const int nb   = K / 32;
+
+    // Load + __syncthreads first (collective, all warps must participate);
+    // defer the row-out-of-range early-return until after the barrier.
+    {
+        const int total_f4 = 4 * K / 4;
+        const float4 *src  = (const float4 *)X;
+        float4       *dst  = (float4 *)sx;
+        // Per-warp strided load covers every slot in stride-32 chunks.
+        for (int i = lane; i < total_f4; i += 32) {
+            dst[i] = src[i];
+        }
+    }
+    __syncthreads();
+    if (row0 >= M) return;
+
+    const uint32_t *rw0 = (const uint32_t *)((const char *)W + (long)row0 * nb * 34);
+    const uint32_t *rw1 = (const uint32_t *)((const char *)W + (long)row1 * nb * 34);
+    const uint32_t *rw2 = (const uint32_t *)((const char *)W + (long)row2 * nb * 34);
+    const uint32_t *rw3 = (const uint32_t *)((const char *)W + (long)row3 * nb * 34);
+
+    const float4 *sx4_0 = (const float4 *)(sx + 0 * K);
+    const float4 *sx4_1 = (const float4 *)(sx + 1 * K);
+    const float4 *sx4_2 = (const float4 *)(sx + 2 * K);
+    const float4 *sx4_3 = (const float4 *)(sx + 3 * K);
+
+    float s00 = 0.f, s01 = 0.f, s02 = 0.f, s03 = 0.f;
+    float s10 = 0.f, s11 = 0.f, s12 = 0.f, s13 = 0.f;
+    float s20 = 0.f, s21 = 0.f, s22 = 0.f, s23 = 0.f;
+    float s30 = 0.f, s31 = 0.f, s32 = 0.f, s33 = 0.f;
+
+    for (int b = lane; b < nb; b += 32) {
+        const int wsc = (34 * b) >> 2;
+        const int sh  = (34 * b + 2) & 2;
+        const unsigned short d16a = (unsigned short)
+            (((34 * b) & 2) ? (rw0[wsc] >> 16) : (rw0[wsc] & 0xFFFFu));
+        const unsigned short d16b = (unsigned short)
+            (((34 * b) & 2) ? (rw1[wsc] >> 16) : (rw1[wsc] & 0xFFFFu));
+        const unsigned short d16c = (unsigned short)
+            (((34 * b) & 2) ? (rw2[wsc] >> 16) : (rw2[wsc] & 0xFFFFu));
+        const unsigned short d16d = (unsigned short)
+            (((34 * b) & 2) ? (rw3[wsc] >> 16) : (rw3[wsc] & 0xFFFFu));
+        const float da = __half2float(__ushort_as_half(d16a));
+        const float db = __half2float(__ushort_as_half(d16b));
+        const float dc = __half2float(__ushort_as_half(d16c));
+        const float dd = __half2float(__ushort_as_half(d16d));
+        const int a0 = (34 * b + 2) >> 2;
+        /* x float4 offset for block b: 8 float4s per q8_0 block. */
+        const int x_off = b * 8;
+
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const uint32_t la0 = __ldg(rw0 + a0 + k);
+            const uint32_t la1 = __ldg(rw1 + a0 + k);
+            const uint32_t la2 = __ldg(rw2 + a0 + k);
+            const uint32_t la3 = __ldg(rw3 + a0 + k);
+            const uint32_t va0 = sh ? __byte_perm(la0, __ldg(rw0 + a0 + k + 1), 0x5432) : la0;
+            const uint32_t va1 = sh ? __byte_perm(la1, __ldg(rw1 + a0 + k + 1), 0x5432) : la1;
+            const uint32_t va2 = sh ? __byte_perm(la2, __ldg(rw2 + a0 + k + 1), 0x5432) : la2;
+            const uint32_t va3 = sh ? __byte_perm(la3, __ldg(rw3 + a0 + k + 1), 0x5432) : la3;
+
+            const float a0_0 = (float)((int)(va0 << 24) >> 24) * da;
+            const float a0_1 = (float)((int)(va0 << 16) >> 24) * da;
+            const float a0_2 = (float)((int)(va0 <<  8) >> 24) * da;
+            const float a0_3 = (float)((int)(va0      ) >> 24) * da;
+            const float a1_0 = (float)((int)(va1 << 24) >> 24) * db;
+            const float a1_1 = (float)((int)(va1 << 16) >> 24) * db;
+            const float a1_2 = (float)((int)(va1 <<  8) >> 24) * db;
+            const float a1_3 = (float)((int)(va1      ) >> 24) * db;
+            const float a2_0 = (float)((int)(va2 << 24) >> 24) * dc;
+            const float a2_1 = (float)((int)(va2 << 16) >> 24) * dc;
+            const float a2_2 = (float)((int)(va2 <<  8) >> 24) * dc;
+            const float a2_3 = (float)((int)(va2      ) >> 24) * dc;
+            const float a3_0 = (float)((int)(va3 << 24) >> 24) * dd;
+            const float a3_1 = (float)((int)(va3 << 16) >> 24) * dd;
+            const float a3_2 = (float)((int)(va3 <<  8) >> 24) * dd;
+            const float a3_3 = (float)((int)(va3      ) >> 24) * dd;
+
+            const float4 xv0 = sx4_0[x_off + k];
+            const float4 xv1 = sx4_1[x_off + k];
+            const float4 xv2 = sx4_2[x_off + k];
+            const float4 xv3 = sx4_3[x_off + k];
+
+            s00 += a0_0 * xv0.x; s00 += a0_1 * xv0.y; s00 += a0_2 * xv0.z; s00 += a0_3 * xv0.w;
+            s01 += a0_0 * xv1.x; s01 += a0_1 * xv1.y; s01 += a0_2 * xv1.z; s01 += a0_3 * xv1.w;
+            s02 += a0_0 * xv2.x; s02 += a0_1 * xv2.y; s02 += a0_2 * xv2.z; s02 += a0_3 * xv2.w;
+            s03 += a0_0 * xv3.x; s03 += a0_1 * xv3.y; s03 += a0_2 * xv3.z; s03 += a0_3 * xv3.w;
+            s10 += a1_0 * xv0.x; s10 += a1_1 * xv0.y; s10 += a1_2 * xv0.z; s10 += a1_3 * xv0.w;
+            s11 += a1_0 * xv1.x; s11 += a1_1 * xv1.y; s11 += a1_2 * xv1.z; s11 += a1_3 * xv1.w;
+            s12 += a1_0 * xv2.x; s12 += a1_1 * xv2.y; s12 += a1_2 * xv2.z; s12 += a1_3 * xv2.w;
+            s13 += a1_0 * xv3.x; s13 += a1_1 * xv3.y; s13 += a1_2 * xv3.z; s13 += a1_3 * xv3.w;
+            s20 += a2_0 * xv0.x; s20 += a2_1 * xv0.y; s20 += a2_2 * xv0.z; s20 += a2_3 * xv0.w;
+            s21 += a2_0 * xv1.x; s21 += a2_1 * xv1.y; s21 += a2_2 * xv1.z; s21 += a2_3 * xv1.w;
+            s22 += a2_0 * xv2.x; s22 += a2_1 * xv2.y; s22 += a2_2 * xv2.z; s22 += a2_3 * xv2.w;
+            s23 += a2_0 * xv3.x; s23 += a2_1 * xv3.y; s23 += a2_2 * xv3.z; s23 += a2_3 * xv3.w;
+            s30 += a3_0 * xv0.x; s30 += a3_1 * xv0.y; s30 += a3_2 * xv0.z; s30 += a3_3 * xv0.w;
+            s31 += a3_0 * xv1.x; s31 += a3_1 * xv1.y; s31 += a3_2 * xv1.z; s31 += a3_3 * xv1.w;
+            s32 += a3_0 * xv2.x; s32 += a3_1 * xv2.y; s32 += a3_2 * xv2.z; s32 += a3_3 * xv2.w;
+            s33 += a3_0 * xv3.x; s33 += a3_1 * xv3.y; s33 += a3_2 * xv3.z; s33 += a3_3 * xv3.w;
+        }
+    }
+    s00 = warp_reduce_sum(s00); s01 = warp_reduce_sum(s01); s02 = warp_reduce_sum(s02); s03 = warp_reduce_sum(s03);
+    s10 = warp_reduce_sum(s10); s11 = warp_reduce_sum(s11); s12 = warp_reduce_sum(s12); s13 = warp_reduce_sum(s13);
+    s20 = warp_reduce_sum(s20); s21 = warp_reduce_sum(s21); s22 = warp_reduce_sum(s22); s23 = warp_reduce_sum(s23);
+    s30 = warp_reduce_sum(s30); s31 = warp_reduce_sum(s31); s32 = warp_reduce_sum(s32); s33 = warp_reduce_sum(s33);
+    if (lane == 0) {
+        Y[0 * M + row0] = s00;  Y[1 * M + row0] = s01;  Y[2 * M + row0] = s02;  Y[3 * M + row0] = s03;
+        if (row1 < M) { Y[0 * M + row1] = s10;  Y[1 * M + row1] = s11;  Y[2 * M + row1] = s12;  Y[3 * M + row1] = s13; }
+        if (row2 < M) { Y[0 * M + row2] = s20;  Y[1 * M + row2] = s21;  Y[2 * M + row2] = s22;  Y[3 * M + row2] = s23; }
+        if (row3 < M) { Y[0 * M + row3] = s30;  Y[1 * M + row3] = s31;  Y[2 * M + row3] = s32;  Y[3 * M + row3] = s33; }
+    }
+}
+
 // ---------------- M9.5 WMMA tensor-core MMQ path ----------------------- *
 // Tensor-core mma.sync.aligned.m16n16k16.row.col.f16.f16.f32.f32 path
 // for q4_0 GEMV. The N=16 dim of the mma is filled with 16 COPIES of
@@ -857,6 +1200,63 @@ int tt_gemv_q4_0_dispatch(const void *dW, const float *dx, float *dy,
     }
     dim3 g, b; gemv_dims2(M, &g, &b);
     k_gemv_q4_0<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW, dx, dy, M, K);
+    return (int)cudaGetLastError();
+}
+
+/* M10+ Batched-4 GEMV launchers (q4_0 + q8_0). 4 candidate x vectors
+ * are processed in a single launch against the same weight matrix,
+ * producing 4*Y[M] outputs. Inputs:
+ *   dW      - quantized weight matrix (q4_0 or q8_0)
+ *   dX_4xK  - device buffer of 4 candidate x vectors, shape [4, K],
+ *             row-major (X[c*K + k])
+ *   dY_4xM  - device buffer of 4 candidate outputs, shape [4, M],
+ *             row-major (Y[c*M + m])
+ *   M, K    - output rows and inner dim
+ *
+ * Constraints (caller must check; otherwise fall back to 4 sequential
+ * single calls):
+ *   - K % 32 == 0
+ *   - nb = K/32 even (uint32 streaming + __byte_perm merge contract)
+ *   - M multiple of 4 (4 rows per warp)
+ *   - non-NULL dW/dX/dY
+ *
+ * Returns 0 on success, -1 if constraints are violated. Caller pads
+ * M internally to a multiple of 4 before calling if needed.
+ *
+ * Shmem = 4 * K * 4 bytes. For K=896 -> 14 KB (K=4864 -> 76 KB; opt
+ * in to >48KB dynamic shmem on Ampere via cudaFuncSetAttribute).
+ */
+int tt_gemv_q4_0_batch4(const void *dW, const float *dX_4xK, float *dY_4xM,
+                        int M, int K, cudaStream_t stream) {
+    if (!dW || !dX_4xK || !dY_4xM) return -1;
+    const int nb = K / 32;
+    if ((K & 31) != 0 || (nb & 1) != 0 || (M & 3) != 0 || M <= 0) return -1;
+    dim3 g, b; b.x = 32; b.y = 16; b.z = 1;
+    g.x = (M + b.y * 4 - 1) / (b.y * 4); g.y = 1; g.z = 1;
+    int shmem = 4 * K * 4;
+    if (shmem > 48 * 1024) {
+        cudaFuncSetAttribute(k_gemv_q4_0_batch4,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
+    }
+    k_gemv_q4_0_batch4<<<g, b, shmem, stream>>>(
+        (const BlockQ4_0 *)dW, dX_4xK, dY_4xM, M, K);
+    return (int)cudaGetLastError();
+}
+
+int tt_gemv_q8_0_batch4(const void *dW, const float *dX_4xK, float *dY_4xM,
+                        int M, int K, cudaStream_t stream) {
+    if (!dW || !dX_4xK || !dY_4xM) return -1;
+    const int nb = K / 32;
+    if ((K & 31) != 0 || (nb & 1) != 0 || (M & 3) != 0 || M <= 0) return -1;
+    dim3 g, b; b.x = 32; b.y = 16; b.z = 1;
+    g.x = (M + b.y * 4 - 1) / (b.y * 4); g.y = 1; g.z = 1;
+    int shmem = 4 * K * 4;
+    if (shmem > 48 * 1024) {
+        cudaFuncSetAttribute(k_gemv_q8_0_batch4,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
+    }
+    k_gemv_q8_0_batch4<<<g, b, shmem, stream>>>(
+        (const BlockQ8_0 *)dW, dX_4xK, dY_4xM, M, K);
     return (int)cudaGetLastError();
 }
 
