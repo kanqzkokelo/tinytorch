@@ -399,6 +399,107 @@ __global__ void k_gemv_q8_0(const BlockQ8_0 *__restrict__ W,
     }
 }
 
+// ---------------- M9.5 WMMA tensor-core MMQ path ----------------------- *
+// Tensor-core mma.sync.aligned.m16n16k16.row.col.f16.f16.f32.f32 path
+// for q4_0 GEMV. The N=16 dim of the mma is filled with 16 COPIES of
+// the same single-token x (decode is GEMV, N=1), so 15/16 of the
+// tensor-core work is wasted -- this kernel is INTENTIONALLY slower than
+// the scalar V2 above on Ampere consumer (RTX 3050 sm_86). It exists
+// to (a) ship a working tensor-core MMQ path for the parity gate,
+// (b) provide infrastructure for future batched-decode (T>=8 real x's
+// in N) which WILL win. Dispatcher gates it behind TT_USE_WMMA=1 so
+// the production decode path stays on V2 (measured ~150us for
+// 4864x4864 q4_0 GEMV on RTX 3050; WMMA path ~1.7ms there).
+//
+// Block: 1 warp = 32 threads. Per mma: M=16 output rows, K=16 reduction,
+// N=16 (wasted 15/16 for single-token decode). Each tile: cooperatively
+// dequant 16 rows of q4_0 to fp16 in shmem, then mma_sync. After K loop:
+// store 16x16 c_frag to shmem, take N=0 column as the 16 output values.
+//
+// Layout proven by the smoke test in /tmp/wmma_clean: row-major A * row-
+// major B = correct full 16x16 result. col-major B with ldb=16 has been
+// observed to write only 2/16 columns on this driver, so we use row-major
+// B with the B matrix filled as 16 horizontal copies of x (B[k*16 + n] =
+// x_sh[k0 + k] for all n in 0..15).
+//
+// The kernel is unconditionally compiled (the wmma intrinsics are sm_70+
+// only; this file is built with -gencode arch=compute_86,code=sm_86
+// already, so the arch gate is satisfied). The launcher checks at
+// runtime whether to dispatch to it (TT_USE_WMMA=1) or fall back to V2.
+#include <mma.h>
+__global__ void k_gemv_wmma_q4_0(const BlockQ4_0 *__restrict__ W,
+                                  const float *__restrict__ x,
+                                  float *__restrict__ y,
+                                  int M, int K) {
+    using namespace nvcuda;
+    const int row0 = blockIdx.x * 16;
+    if (row0 >= M) return;
+    const int lane = threadIdx.x;
+    const int nb = K / 32;                       // q4_0 blocks per row
+    const int n_tiles = K / 16;                  // K-tiles per warp
+
+    // Shmem: x as fp16 (K elements) + per-tile working space.
+    extern __shared__ __half smem[];
+    __half *sx = smem;                           // K fp16
+
+    // Load x as fp16 cooperatively.
+    for (int i = lane; i < K; i += 32) sx[i] = __float2half(x[i]);
+    __syncwarp();
+
+    // Accumulator: 16x16 fp32. Initialize to zero.
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.f);
+
+    // Per-K-tile working memory in shmem.
+    __shared__ __half sW[16 * 16];               // 16 rows x 16 K fp16
+    __shared__ __half sB[16 * 16];               // 16 K x 16 N fp16
+
+    for (int t = 0; t < n_tiles; t++) {
+        const int k0 = t * 16;
+
+        // Build A tile: 16 rows of W, K=16 elements starting at k0.
+        // Dequant q4_0 to fp16 in row-major 16x16. Each lane handles
+        // 256/32 = 8 elements (i, row = i/16, col = i%16).
+        for (int i = lane; i < 16 * 16; i += 32) {
+            const int row = i / 16;
+            const int col = i % 16;
+            const int kk = k0 + col;             // absolute K index
+            const int blk_idx = kk / 32;         // q4_0 block within row
+            const int in_blk = kk & 31;          // 0..31
+            const BlockQ4_0 *blk = W + (long)(row0 + row) * nb + blk_idx;
+            const float d = __half2float(blk->d);
+            // in_blk < 16 -> low nibble of qs[in_blk]; in_blk >= 16 -> high nibble of qs[in_blk - 16]
+            const int q_byte = blk->qs[in_blk & 15];
+            const int nib = (in_blk < 16) ? (q_byte & 0xF) : ((q_byte >> 4) & 0xF);
+            const float w = ((float)nib - 8.f) * d;
+            sW[i] = __float2half(w);
+        }
+        __syncwarp();
+
+        // Build B tile: 16x16 where each row k = sx[k0 + k], replicated 16x in N.
+        // B[k][n] = x_sh[k0 + k] for all n in 0..15 (so 15/16 of the
+        // tensor-core mma work is wasted on single-token decode; this is
+        // the fundamental cost of doing GEMV on mma which is GEMM-shaped).
+        for (int i = lane; i < 16 * 16; i += 32) {
+            const int k = i / 16;                // 0..15
+            sB[i] = sx[k0 + k];                  // all 16 N cols = same x value
+        }
+        __syncwarp();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+        wmma::load_matrix_sync(a_frag, sW, 16);
+        wmma::load_matrix_sync(b_frag, sB, 16);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    // Store 16x16 accumulator to shmem, take N=0 column as 16 outputs.
+    __shared__ float sC[16 * 16];
+    wmma::store_matrix_sync(sC, c_frag, 16, wmma::mem_row_major);
+    __syncwarp();
+    if (lane < 16) y[row0 + lane] = sC[lane * 16 + 0];
+}
+
 // Embedding lookup: dequantize row `tok` of a q4_0 matrix into dx[0..dim).
 __global__ void k_embed_q4_0(const BlockQ4_0 *__restrict__ W, int tok,
                              float *__restrict__ dx, int dim) {
@@ -428,6 +529,20 @@ static void gemv_dims(int M, dim3 *grid, dim3 *block) {
 static void gemv_dims2(int M, dim3 *grid, dim3 *block) {
     block->x = 32; block->y = 16; block->z = 1;
     grid->x = (M + block->y * 2 - 1) / (block->y * 2); grid->y = 1; grid->z = 1;
+}
+
+/* M9.5: WMMA tensor-core launcher for q4_0 GEMV. Gated behind TT_USE_WMMA=1
+ * (default off: V2 scalar fp16 is faster on Ampere consumer for single-token
+ * decode because m16n16k16 wastes 15/16 of the N dim). See k_gemv_wmma_q4_0
+ * kernel comment for the math. Returns 0 on success, -50 on bad dims. */
+int tt_gemv_wmma_q4_0(const void *dW, const float *dx, float *dy, int M, int K,
+                      cudaStream_t stream) {
+    if (M <= 0 || M > (1 << 22) || K <= 0 || K % 16 != 0) return -50;
+    dim3 g((M + 15) / 16), b(32);
+    int shmem = K * 2;                          // sx as fp16
+    k_gemv_wmma_q4_0<<<g, b, shmem, stream>>>(
+        (const BlockQ4_0 *)dW, dx, dy, M, K);
+    return (int)cudaGetLastError();
 }
 
 /* stream-aware launchers: keeps the whole step on one non-blocking stream */

@@ -920,6 +920,21 @@ int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
 
     switch (dtype) {
         case TTQ_Q4_0: {
+            /* M9.5: optional WMMA tensor-core path. Opt-in via TT_USE_WMMA=1.
+             * V2 (default) is faster on Ampere consumer for single-token
+             * decode because m16n16k16 wastes 15/16 of the N dim on the
+             * GEMV-as-1x1-GEMM shape. WMMA wins only when N>=8 of REAL
+             * x's are available (batched decode / prefill) -- not in
+             * scope for this engine, but the kernel + dispatcher is
+             * shipped for future batched-decode work. The launcher is
+             * in gemv_q4_cuda.cu next to the kernel (k_gemv_wmma_q4_0). */
+            if (getenv("TT_USE_WMMA") && M >= 16 && K % 16 == 0) {
+                extern int tt_gemv_wmma_q4_0(const void *, const float *,
+                                             float *, int, int, cudaStream_t);
+                int wrc = tt_gemv_wmma_q4_0(W, x, y, M, K, stream);
+                if (wrc == 0) return 0;
+                /* fall through to V2 if WMMA returned bad dims */
+            }
             /* delegate to the M6.3b-tuned kernel (same launch contract) */
             extern int tt_gemv_q4_0(const void *, const float *, float *,
                                     int, int, cudaStream_t);
