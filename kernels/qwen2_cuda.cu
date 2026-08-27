@@ -592,6 +592,43 @@ __global__ void k_embed_q4_0_dyn(const BlockQ4_0 *__restrict__ W, const int *__r
     }
 }
 
+/* Dynamic-token embedding for q6_K (cudaGraph replay variant). Body is
+ * structurally identical to k_embed_q6_K in kernels/gemv_typed.cu, only the
+ * source of the token id differs (device memory instead of host register).
+ * Inlined here for the same reason as k_embed_q4_0_dyn: cross-TU device
+ * launches need relocatable code. Math is byte-identical to the eager
+ * host-tok k_embed_q6_K, which mirrors src/dequant_ref.c::dq_q6_K.
+ *
+ * Block layout (Q6_K superblock, 256 elements, 210 bytes):
+ *   blk[  0..127]  ql   (low 4 bits, 2 per byte, 64 bytes per half-block)
+ *   blk[128..191]  qh   (high 2 bits, 32 bytes per half-block)
+ *   blk[192..207]  sc   (int8 scales, 16 bytes)
+ *   blk[208..209]  d    (fp16 superblock scale)
+ * Each output thread writes 32 elements (one sub-block of a superblock).
+ * 8 sub-blocks * 32 = 256 elements per superblock. */
+__global__ void k_embed_q6_K_dyn(const uint8_t *__restrict__ W, const int *__restrict__ d_tok,
+                                 float *__restrict__ dx, int dim) {
+    const int tok = *d_tok;
+    const int u = threadIdx.x + blockIdx.x * blockDim.x;
+    const int nu = (dim / 256) * 8;
+    if (u >= nu) return;
+    const int sb = u >> 3, sub = u & 7;
+    const uint8_t *blk = W + (long)tok * (dim / 256) * 210 + sb * 210;
+    const uint8_t *ql = blk, *qh = blk + 128;
+    const int8_t *sc = (const int8_t *)(blk + 192);
+    const float d = __half2float(*(const __half *)(blk + 208));
+    float *out = dx + (long)sb * 256 + sub * 32;
+#pragma unroll
+    for (int l = 0; l < 32; l++) {
+        const int n = sub * 32 + l;
+        const int c = n >> 7, r = n & 127;
+        const uint8_t qlb = ql[c * 64 + (r & 63)];
+        const int lo = (r < 64) ? (qlb & 0xF) : (qlb >> 4);
+        const int hi = (qh[c * 32 + (r & 31)] >> (2 * (r >> 5))) & 3;
+        out[l] = d * (float)sc[c * 8 + (r >> 4)] * (float)((lo | (hi << 4)) - 32);
+    }
+}
+
 /* Position increment INSIDE the captured region: each replay advances the
  * device position scalar exactly once (host mirror does e->pos++ in lockstep). */
 __global__ void k_pos_inc(int *d_pos) { (*d_pos)++; }
@@ -1938,9 +1975,12 @@ static int sample_eager(Qwen2Engine *e) {
 static int qwen2_engine_graph_capture(Qwen2Engine *e) {
     const TTConfig *c = &e->cfg;
 
-    /* M7: the dynamic-token embed kernel is q4_0-only; other embedding
-     * dtypes run eager (typed embed reads the host token id). */
-    if (e->d_embd.dtype != GGUF_TYPE_Q4_0) return -1;
+    /* M9.5: dynamic-token embed kernel is now provided for q4_0 AND q6_k.
+     * Other dtypes (q8_0, f16, q4_k/q5_k, etc.) still lack an in-graph
+     * variant; fall back to eager for those. Captured graph works for
+     * qwen2.5 (q4_0), llama-3.2 (q6_k despite filename), gemma2 (q6_k). */
+    const int edt = e->d_embd.dtype;
+    if (edt != GGUF_TYPE_Q4_0 && edt != GGUF_TYPE_Q6_K) return -1;
 
     /* dummy valid token before capture begins (plain, uncaptured copy) */
     const int dummy = e->pending_tok >= 0 ? e->pending_tok : 0;
@@ -1953,15 +1993,21 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
      * parity gate) read it right after this returns, while the sampled id
      * from sample_eager is still the current answer. */
     {
-        const int threads = c->dim / 32;
         float *xsave = NULL, *lsave = NULL;
         cudaMalloc(&xsave, c->dim * sizeof(float));
         cudaMalloc(&lsave, c->vocab * sizeof(float));
         cudaMemcpy(xsave, e->d_x, c->dim * sizeof(float), cudaMemcpyDeviceToHost);
         cudaMemcpy(lsave, e->d_logits, c->vocab * sizeof(float), cudaMemcpyDeviceToDevice);
         const int pos_before = e->pos;
-        k_embed_q4_0_dyn<<<(threads + 255) / 256, 256, 0, e->stream>>>(
-            (const BlockQ4_0 *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
+        if (edt == GGUF_TYPE_Q4_0) {
+            const int threads = c->dim / 32;
+            k_embed_q4_0_dyn<<<(threads + 255) / 256, 256, 0, e->stream>>>(
+                (const BlockQ4_0 *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
+        } else { /* GGUF_TYPE_Q6_K */
+            const int nu = (c->dim / 256) * 8;
+            k_embed_q6_K_dyn<<<(nu + 255) / 256, 256, 0, e->stream>>>(
+                (const uint8_t *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
+        }
         k_pos_inc<<<1, 1, 0, e->stream>>>(e->d_pos);
         k_repeat_penalty<<<1, 256, 0, e->stream>>>(e->d_logits, e->d_recent,
                                                    e->d_n_recent, c->vocab, 2.0f);
@@ -1982,10 +2028,23 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
     }
 
     {   /* dynamic-token embedding (device-side id) */
-        const int threads = c->dim / 32;
-        k_embed_q4_0_dyn<<<(threads + 255) / 256, 256, 0, e->stream>>>(
-            (const BlockQ4_0 *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
+        if (edt == GGUF_TYPE_Q4_0) {
+            const int threads = c->dim / 32;
+            k_embed_q4_0_dyn<<<(threads + 255) / 256, 256, 0, e->stream>>>(
+                (const BlockQ4_0 *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
+        } else { /* GGUF_TYPE_Q6_K */
+            const int nu = (c->dim / 256) * 8;
+            k_embed_q6_K_dyn<<<(nu + 255) / 256, 256, 0, e->stream>>>(
+                (const uint8_t *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
+        }
     }
+    /* gemma families: scale embeddings by sqrt(dim) right after the
+     * dynamic embed (matches embed_token() in the eager path; without it
+     * gemma2/graph diverges from gemma2/eager in 1-2 steps). Host branch
+     * is constant per capture, kernel reads no host state. */
+    if (c->tr.embed_sqrt)
+        k_scale<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(
+            e->d_x, sqrtf((float)c->dim), c->dim);
     const int frc = forward_layers(e);          /* all layers at *d_pos */
     k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
         e->d_x, e->d_out_norm, e->d_xn, c->dim, c->rms_eps, c->tr.norm_offset);
