@@ -947,9 +947,9 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         if (e->cfg.tr.qk_norm_rms) {   /* qwen3 trait: gammas required */
             snprintf(name, sizeof(name), "blk.%d.attn_q_norm.weight", l); w->q_norm = upload_f32(m, name);
             snprintf(name, sizeof(name), "blk.%d.attn_k_norm.weight", l); w->k_norm = upload_f32(m, name);
-            if (!w->q_norm || !w->k_norm) {
-                fprintf(stderr, "[qwen2-engine] qk_norm_rms trait set but attn_q/k_norm missing for layer %d\n", l);
-                qwen2_engine_free(e); return NULL;
+            if (!w->q_norm || !w->k_norm) { /* gemma4: no per-layer QK norm gammas; clear trait, skip step */
+                if (l == 0) fprintf(stderr, "[qwen2-engine] qk_norm_rms trait set but attn_q/k_norm missing; disabling (gemma4)\n");
+                w->q_norm = w->k_norm = NULL; e->cfg.tr.qk_norm_rms = 0;
             }
         }
         if (!w->q.ptr || !w->k.ptr || !w->v.ptr || !w->o.ptr || !w->gate.ptr || !w->up.ptr || !w->down.ptr ||
