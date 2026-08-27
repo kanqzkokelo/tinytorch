@@ -19,6 +19,7 @@
 // tt_gemv_typed with a clear error); legacy quants require % 32.
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -263,6 +264,323 @@ __global__ void k_gemv_q6_K(const uint8_t *__restrict__ W,
     if (lane == 0) y[row] = s;
 }
 
+/* ---------------- K-quant V2 (M9.5) ---------------------------------------- *
+ * 2-rows-per-warp vectorized variants of the K-quants above. Same dequant
+ * math (port of dequant_ref.c dq_q{4,5,6}_K), same 32-lane-per-warp shape,
+ * but each warp computes TWO output rows and the two rows share every x
+ * read (halves x re-read pressure for the bandwidth-bound M=4864 hidden
+ * matrices). Inner loop hoists sub-block scale/min/ds/dm once per sub-block
+ * (vs per-element in the scalar version), so each sub-block contributes
+ * `ds*sum(w*x) - dm*sum(x)` -- 1 fma pair instead of 32 (matches the
+ * llama.cpp vec_dot_q4_K_q8_1_impl_vmmq shape without requiring Q8_1
+ * activation quantization). x is read as 4 float4 chunks (32 floats ==
+ * 1 sub-block), so each lane issues 4 float4 loads per sub-block; the two
+ * rows share the loads and only the weight bytes double in flight.
+ *
+ * Contracts (caller must check via tt_gemv_typed gate):
+ *   - K must be a multiple of 256 (sub-block = 32, super-block = 256).
+ *   - M padded to even (caller does it, see tt_gemv_typed).
+ *   - M >= TT_KQUANT_V2_MIN_M (small-M shapes still go to scalar, same
+ *     reasoning as the q4_0/q8_0 V2 gate -- the per-warp setup overhead
+ *     exceeds the saved x re-reads for K/V projections).
+ *   - x 32-float chunks (sub-blocks) are 16-byte aligned: x base is
+ *     16-byte aligned (engine guarantee), and any 32-element offset is
+ *     a multiple of 128 bytes which is 16-byte aligned.
+ *   - qs byte chunks are 4-byte aligned for the uint32 word reads below
+ *     (Q4_K qs[128] @ super-block offset 16, Q5_K ql[128] @48, Q6_K
+ *      ql[128] @0; super-block stride is 144/176/210, so byte offsets
+ *      are 16*N*144, 16*N*176, 16*N*210 -- all multiples of 16, hence
+ *      4-byte aligned when 0 <= 16*N < stride; the 4-byte alignment of
+ *      the qs chunk address = (16 + 16*N*stride) mod 4 = 0 for any
+ *      N >= 0, even for Q6_K's 210 stride).
+ */
+
+/* 2-rows-per-warp V2 for q4_K. Hoists (d*sc, dmin*m) per sub-block and
+ * uses the ds*sum(w*x) - dm*sum(x) form so each sub-block's two scale
+ * multiplies amortize over 32 weight-x MACs. Weight bytes loaded via
+ * __ldg (read-only cache). Mirrors the k_gemv_q4_0 V2 shape (one warp,
+ * two rows, lane-stride) so existing grid/block helpers apply. */
+__global__ void k_gemv_q4_K_v2(const uint8_t *__restrict__ W,
+                               const float *__restrict__ x,
+                               float *__restrict__ y,
+                               int M, int K) {
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 2;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;                    // caller pads M to even
+    const int lane = threadIdx.x;
+    const int nsb = K / 256;                      // super-blocks per row
+    const int nu  = nsb * 8;                      // sub-blocks per row
+    const uint8_t *rw0 = W + (long)row0 * nsb * 144;
+    const uint8_t *rw1 = W + (long)row1 * nsb * 144;
+    float s0 = 0.0f, s1 = 0.0f;
+
+    for (int u = lane; u < nu; u += 32) {
+        const int sb = u >> 3, sub = u & 7;
+        const uint8_t *blk0 = rw0 + sb * 144;
+        const uint8_t *blk1 = rw1 + sb * 144;
+        const float d0  = half_at(blk0);
+        const float dm0 = half_at(blk0 + 2);
+        const float d1  = half_at(blk1);
+        const float dm1 = half_at(blk1 + 2);
+        int sc0, mn0, sc1, mn1;
+        k4_scale_min(sub, blk0 + 4, &sc0, &mn0);
+        k4_scale_min(sub, blk1 + 4, &sc1, &mn1);
+        /* qs[128]: sub-block `sub` at bytes [sub/2*32, +32). Even sub =
+         * low nibble, odd sub = high nibble (dequant_ref.c dq_q4_K). */
+        const uint8_t *q0 = blk0 + 16 + (sub >> 1) * 32;
+        const uint8_t *q1 = blk1 + 16 + (sub >> 1) * 32;
+        const float *xb = x + (long)sb * 256 + sub * 32;
+        const float ds0 = d0 * sc0, dmd0 = dm0 * mn0;
+        const float ds1 = d1 * sc1, dmd1 = dm1 * mn1;
+        const int low = (sub & 1) == 0;
+        const float4 *x4 = (const float4 *)xb;
+        float swx = 0.0f, sx = 0.0f;     /* shared x stats; both rows reuse */
+        /* 2 chunks of 16 bytes (8 nibbles) per sub-block = 32 nibbles.
+         * uint32 (4 bytes) packs 4 nibbles paired with one float4. */
+#pragma unroll
+        for (int q = 0; q < 2; q++) {
+            const uint32_t w0 = __ldg((const uint32_t *)(q0 + q * 16));
+            const uint32_t w1 = __ldg((const uint32_t *)(q1 + q * 16));
+            const float4 xv0 = x4[q * 2 + 0];
+            const float4 xv1 = x4[q * 2 + 1];
+            /* low: byte 0 = bits 0..3, byte 1 = bits 8..11, ...  */
+            /* high: byte 0 = bits 4..7, byte 1 = bits 12..15, ... */
+            int a0, a1, a2, a3, b0, b1, b2, b3;
+            if (low) {
+                a0 = (int)( w0        & 0xFu);
+                a1 = (int)((w0 >>  8) & 0xFu);
+                a2 = (int)((w0 >> 16) & 0xFu);
+                a3 = (int)((w0 >> 24)       );
+                b0 = (int)( w1        & 0xFu);
+                b1 = (int)((w1 >>  8) & 0xFu);
+                b2 = (int)((w1 >> 16) & 0xFu);
+                b3 = (int)((w1 >> 24)       );
+            } else {
+                a0 = (int)((w0 >>  4) & 0xFu);
+                a1 = (int)((w0 >> 12) & 0xFu);
+                a2 = (int)((w0 >> 20) & 0xFu);
+                a3 = (int)( w0 >> 28       );
+                b0 = (int)((w1 >>  4) & 0xFu);
+                b1 = (int)((w1 >> 12) & 0xFu);
+                b2 = (int)((w1 >> 20) & 0xFu);
+                b3 = (int)( w1 >> 28       );
+            }
+            swx += a0 * xv0.x + a1 * xv0.y + a2 * xv0.z + a3 * xv0.w
+                 + b0 * xv1.x + b1 * xv1.y + b2 * xv1.z + b3 * xv1.w;
+            sx  += xv0.x + xv0.y + xv0.z + xv0.w
+                 + xv1.x + xv1.y + xv1.z + xv1.w;
+        }
+        s0 += ds0 * swx - dmd0 * sx;
+        s1 += ds1 * swx - dmd1 * sx;
+    }
+    s0 = warp_reduce_sum(s0);
+    s1 = warp_reduce_sum(s1);
+    if (lane == 0) {
+        y[row0] = s0;
+        if (row1 < M) y[row1] = s1;
+    }
+}
+
+/* 2-rows-per-warp V2 for q5_K. Same shape as q4_K V2, plus the 5th-bit
+ * qh plane. For sub-block `sub`, value l's high bit is `(qh[l] >> sub) & 1`
+ * and adds 16 to the 4-bit value (so the 5-bit integer weight is in
+ * [0, 31]). Each sub-block uses 32 qh bits = 4 uint32 words for q=0..1.
+ * Note the qh bytes for sub-block `sub` are at super-block+16+l (byte l,
+ * bit sub). Reading qh[q*16..q*16+4] as uint32 gives bits for indices
+ * [q*16, q*16+3]; bit positions within each byte are `sub`. */
+__global__ void k_gemv_q5_K_v2(const uint8_t *__restrict__ W,
+                               const float *__restrict__ x,
+                               float *__restrict__ y,
+                               int M, int K) {
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 2;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x;
+    const int nsb = K / 256;
+    const int nu  = nsb * 8;
+    const uint8_t *rw0 = W + (long)row0 * nsb * 176;
+    const uint8_t *rw1 = W + (long)row1 * nsb * 176;
+    float s0 = 0.0f, s1 = 0.0f;
+
+    for (int u = lane; u < nu; u += 32) {
+        const int sb = u >> 3, sub = u & 7;
+        const uint8_t *blk0 = rw0 + sb * 176;
+        const uint8_t *blk1 = rw1 + sb * 176;
+        const float d0  = half_at(blk0);
+        const float dm0 = half_at(blk0 + 2);
+        const float d1  = half_at(blk1);
+        const float dm1 = half_at(blk1 + 2);
+        int sc0, mn0, sc1, mn1;
+        k4_scale_min(sub, blk0 + 4, &sc0, &mn0);
+        k4_scale_min(sub, blk1 + 4, &sc1, &mn1);
+        const uint8_t *qh0 = blk0 + 16;                       /* qh[32] @16  */
+        const uint8_t *qh1 = blk1 + 16;
+        const uint8_t *ql0 = blk0 + 48 + (sub >> 1) * 32;    /* ql[128] @48 */
+        const uint8_t *ql1 = blk1 + 48 + (sub >> 1) * 32;
+        const float *xb = x + (long)sb * 256 + sub * 32;
+        const float ds0 = d0 * sc0, dmd0 = dm0 * mn0;
+        const float ds1 = d1 * sc1, dmd1 = dm1 * mn1;
+        const int low = (sub & 1) == 0;
+        const float4 *x4 = (const float4 *)xb;
+        float swx = 0.0f, sx = 0.0f;
+#pragma unroll
+        for (int q = 0; q < 2; q++) {
+            const uint32_t w0  = __ldg((const uint32_t *)(ql0 + q * 16));
+            const uint32_t w1  = __ldg((const uint32_t *)(ql1 + q * 16));
+            const uint32_t h0  = __ldg((const uint32_t *)(qh0 + q * 16));
+            const uint32_t h1  = __ldg((const uint32_t *)(qh1 + q * 16));
+            const float4 xv0 = x4[q * 2 + 0];
+            const float4 xv1 = x4[q * 2 + 1];
+            /* High bit for value l: (qh[l] >> sub) & 1. For 4 packed bytes
+             * loaded as uint32, bit `sub` of byte l = bit (l*8 + sub) of
+             * the uint32. */
+            int a0, a1, a2, a3, b0, b1, b2, b3;
+            const unsigned s0_ = (unsigned)sub;
+            if (low) {
+                a0 = (int)( w0        & 0xFu) | (int)((h0      ) >> s0_ & 1u) << 4;
+                a1 = (int)((w0 >>  8) & 0xFu) | (int)((h0 >>  8) >> s0_ & 1u) << 4;
+                a2 = (int)((w0 >> 16) & 0xFu) | (int)((h0 >> 16) >> s0_ & 1u) << 4;
+                a3 = (int)((w0 >> 24)       ) | (int)((h0 >> 24) >> s0_ & 1u) << 4;
+                b0 = (int)( w1        & 0xFu) | (int)((h1      ) >> s0_ & 1u) << 4;
+                b1 = (int)((w1 >>  8) & 0xFu) | (int)((h1 >>  8) >> s0_ & 1u) << 4;
+                b2 = (int)((w1 >> 16) & 0xFu) | (int)((h1 >> 16) >> s0_ & 1u) << 4;
+                b3 = (int)((w1 >> 24)       ) | (int)((h1 >> 24) >> s0_ & 1u) << 4;
+            } else {
+                a0 = (int)((w0 >>  4) & 0xFu) | (int)((h0 >>  4) >> s0_ & 1u) << 4;
+                a1 = (int)((w0 >> 12) & 0xFu) | (int)((h0 >> 12) >> s0_ & 1u) << 4;
+                a2 = (int)((w0 >> 20) & 0xFu) | (int)((h0 >> 20) >> s0_ & 1u) << 4;
+                a3 = (int)( w0 >> 28       ) | (int)((h0 >> 28) >> s0_ & 1u) << 4;
+                b0 = (int)((w1 >>  4) & 0xFu) | (int)((h1 >>  4) >> s0_ & 1u) << 4;
+                b1 = (int)((w1 >> 12) & 0xFu) | (int)((h1 >> 12) >> s0_ & 1u) << 4;
+                b2 = (int)((w1 >> 20) & 0xFu) | (int)((h1 >> 20) >> s0_ & 1u) << 4;
+                b3 = (int)( w1 >> 28       ) | (int)((h1 >> 28) >> s0_ & 1u) << 4;
+            }
+            swx += a0 * xv0.x + a1 * xv0.y + a2 * xv0.z + a3 * xv0.w
+                 + b0 * xv1.x + b1 * xv1.y + b2 * xv1.z + b3 * xv1.w;
+            sx  += xv0.x + xv0.y + xv0.z + xv0.w
+                 + xv1.x + xv1.y + xv1.z + xv1.w;
+        }
+        s0 += ds0 * swx - dmd0 * sx;
+        s1 += ds1 * swx - dmd1 * sx;
+    }
+    s0 = warp_reduce_sum(s0);
+    s1 = warp_reduce_sum(s1);
+    if (lane == 0) {
+        y[row0] = s0;
+        if (row1 < M) y[row1] = s1;
+    }
+}
+
+/* 2-rows-per-warp V2 for q6_K. Per-value: v = d * sc[n/16] * ((lo|hi6)-32)
+ * where r = n%128, c = n/128; ql byte c*64+(r&63), qh byte c*32+(r&31) with
+ * 2-bit field shifted 2*(r>>5); scale idx c*8+(r>>4). Within a sub-block
+ * of 32 (sub in [0,7]) values r = sub*32..sub*32+31, all in the same
+ * super-block chunk when sub<4, c=0; sub>=4, c=1. q6_K's scales are int8
+ * (one per 16 values, so 2 per sub-block of 32 -- indices q and q+1 for
+ * chunk q in [0,4) ... wait, re-check: per_value scale is sc[n/16], so
+ * for sub-block of 32 values starting at r0=sub*32 within a chunk of 128,
+ * the 4 sub-chunks of 8 each use scales sc[c*8 + (r0>>4) + 0..3]).
+ *
+ * The (q-32) values are the same for both rows (same x), but the scales
+ * and d differ per row. We compute sum_qx[k] = sum over chunk k of
+ * (q-32)*x for the 8 values using scale sc_k, then accumulate
+ * d * sc_k * sum_qx[k] per row. This keeps the per-element work but
+ * amortizes the q extraction (uint32 + nibble shift + qh look-up) into
+ * 4 chunks per sub-block (8 values each).
+ *
+ * Note: r within a chunk ranges in [0,128); for sub<4 r0 in {0,32,64,96}
+ * and the sub-block is r0..r0+32. Within sub-block the r mod 64 byte
+ * addressing means low (r&63<64) vs high (r&63>=64) nibble selection
+ * alternates at r=r0+64. r0 in {0,32,64,96} -> high nibble starts at
+ * r=r0+64: r0+64 in {64,96,128,160} -- but r is chunk-local, so
+ * r=64 wraps to the next ql byte (c*64+0)? NO: ql is 128 bytes laid
+ * out as c*64+(r&63), so r=64 -> ql[c*64+0], r=65 -> ql[c*64+1], etc.
+ * r in [0,64) reads ql[c*64+0..63] low nibbles; r in [64,128) reads
+ * ql[c*64+0..63] HIGH nibbles. Same byte, opposite nibble. */
+__global__ void k_gemv_q6_K_v2(const uint8_t *__restrict__ W,
+                               const float *__restrict__ x,
+                               float *__restrict__ y,
+                               int M, int K) {
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 2;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x;
+    const int nsb = K / 256;
+    const int nu  = nsb * 8;
+    const uint8_t *rw0 = W + (long)row0 * nsb * 210;
+    const uint8_t *rw1 = W + (long)row1 * nsb * 210;
+    float s0 = 0.0f, s1 = 0.0f;
+
+    for (int u = lane; u < nu; u += 32) {
+        const int sb = u >> 3, sub = u & 7;
+        const uint8_t *blk0 = rw0 + sb * 210;
+        const uint8_t *blk1 = rw1 + sb * 210;
+        const uint8_t *ql0 = blk0,        *qh0 = blk0 + 128;
+        const int8_t  *sc0 = (const int8_t *)(blk0 + 192);
+        const float   d0  = half_at(blk0 + 208);
+        const uint8_t *ql1 = blk1,        *qh1 = blk1 + 128;
+        const int8_t  *sc1 = (const int8_t *)(blk1 + 192);
+        const float   d1  = half_at(blk1 + 208);
+        const float *xb = x + (long)sb * 256 + sub * 32;
+        const int c = sub >> 2;                  /* chunk: 0 or 1 */
+        const int r0 = (sub & 3) << 5;           /* r-base in chunk [0,32,64,96] */
+        const int sc_idx_base = c * 8 + (r0 >> 4);
+        /* For sub-block of 32 values starting at r0 (chunk-local), the 4
+         * 8-value sub-chunks use scales at indices sc_idx_base+0..+3.
+         * r advances as r0+0, r0+8, r0+16, r0+24 -- each sub-chunk
+         * spans r0+q*8 .. r0+(q+1)*8. */
+        const float4 *x4 = (const float4 *)xb;
+        float sum_qx[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+            const int r = r0 + q * 8;
+            /* ql address: ql0[c*64 + (r&63)]. Load 8 bytes covering r..r+7. */
+            const uint64_t ql8 = __ldg((const uint64_t *)(ql0 + c * 64 + (r & 63)));
+            /* qh address: qh0[c*32 + (r&31)] byte; bits 2*(r>>5)..2*(r>>5)+1
+             * of that byte. Load 4 bytes covering r..r+3 (then r+4..r+7
+             * from same +4 offset). */
+            const uint32_t qh_lo = __ldg((const uint32_t *)(qh0 + c * 32 + (r & 31)));
+            const uint32_t qh_hi = __ldg((const uint32_t *)(qh0 + c * 32 + (r & 31) + 4));
+            /* Extract 8 (q-32) values. */
+            const float4 xv0 = x4[q * 2 + 0];
+            const float4 xv1 = x4[q * 2 + 1];
+            const int shift0 = 2 * (r >> 5);
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const int ql_byte = (int)((ql8 >> (j * 8)) & 0xFFu);
+                const int lo = (j < 4 && (r + j) < 64) ? (ql_byte & 0xF) : (ql_byte >> 4);
+                const int qh_byte = (j < 4) ? (int)((qh_lo >> (j * 8)) & 0xFFu)
+                                            : (int)((qh_hi >> ((j - 4) * 8)) & 0xFFu);
+                const int hi = (qh_byte >> shift0) & 3;
+                const int q6 = (lo | (hi << 4)) - 32;
+                const float xv = (j < 4) ? ((j == 0) ? xv0.x : (j == 1) ? xv0.y : (j == 2) ? xv0.z : xv0.w)
+                                         : ((j == 4) ? xv1.x : (j == 5) ? xv1.y : (j == 6) ? xv1.z : xv1.w);
+                sum_qx[q] += (float)q6 * xv;
+            }
+        }
+        /* Apply per-row scales. Both rows' (q-32) values are the same
+         * (same x, same block bytes), only d and sc differ. */
+        const float dsc0_0 = d0 * (float)sc0[sc_idx_base + 0];
+        const float dsc0_1 = d0 * (float)sc0[sc_idx_base + 1];
+        const float dsc0_2 = d0 * (float)sc0[sc_idx_base + 2];
+        const float dsc0_3 = d0 * (float)sc0[sc_idx_base + 3];
+        const float dsc1_0 = d1 * (float)sc1[sc_idx_base + 0];
+        const float dsc1_1 = d1 * (float)sc1[sc_idx_base + 1];
+        const float dsc1_2 = d1 * (float)sc1[sc_idx_base + 2];
+        const float dsc1_3 = d1 * (float)sc1[sc_idx_base + 3];
+        s0 += dsc0_0 * sum_qx[0] + dsc0_1 * sum_qx[1]
+            + dsc0_2 * sum_qx[2] + dsc0_3 * sum_qx[3];
+        s1 += dsc1_0 * sum_qx[0] + dsc1_1 * sum_qx[1]
+            + dsc1_2 * sum_qx[2] + dsc1_3 * sum_qx[3];
+    }
+    s0 = warp_reduce_sum(s0);
+    s1 = warp_reduce_sum(s1);
+    if (lane == 0) {
+        y[row0] = s0;
+        if (row1 < M) y[row1] = s1;
+    }
+}
+
 /* ---------------- f16 / f32 (Tier-1 completeness) -------------------------- */
 
 // M9.5 V2: two rows per warp, float4 x reads. Each lane reads 4 weights
@@ -323,6 +641,77 @@ __global__ void k_gemv_f32(const float *__restrict__ W,
         s += rw[i] * x[i];
     s = warp_reduce_sum(s);
     if (lane == 0) y[row] = s;
+}
+
+/* Scalar F16 fallback (M9.5): only used when K is NOT a multiple of 4 (the
+ * V2 path's 4-half group alignment contract). Same shape as the pre-M9.5
+ * scalar: one warp per row, one half per cycle. */
+__global__ void k_gemv_f16_scalar(const uint8_t *__restrict__ W,
+                                  const float *__restrict__ x, float *__restrict__ y,
+                                  int M, int K) {
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= M) return;
+    const int lane = threadIdx.x;
+    const __half *rw = (const __half *)((const char *)W + (long)row * K * 2);
+    float s = 0.0f;
+    for (int i = lane; i < K; i += 32)
+        s += __half2float(rw[i]) * x[i];
+    s = warp_reduce_sum(s);
+    if (lane == 0) y[row] = s;
+}
+
+/* M9.5 V2 BF16: same shape as k_gemv_f16 V2 but for BF16 weights. The
+ * dequant is a no-op (weights are already bf16), just a bf16->float dot
+ * product. Uses __nv_bfloat162 (2 bf16s packed into a uint32) and the
+ * __bfloat1622float2 conversion intrinsic. Inner loop reads 4 bf16s
+ * (8 bytes = 2 bfloat162) per row per cycle, accumulating 4 fmaf into
+ * s0 and 4 fmaf into s1. The two rows share every float4 x load (halves
+ * x re-read pressure, same win shape as the F16 V2 above).
+ *
+ * Contracts (caller checks via tt_gemv_typed gate):
+ *   - K must be a multiple of 4 (4 bf16s = 8 bytes; float4 x is 16 bytes
+ *     = 4 floats; one float4 of x per 4-bf16 group).
+ *   - M padded to even (caller does it, see tt_gemv_typed).
+ *   - M >= 2 (V2 needs two rows per warp; scalar fallback for M == 1
+ *     is the existing k_gemv_bf16 below).
+ *   - W base is 8-byte aligned; row stride K*2 = 8*(K/4) is a multiple
+ *     of 8 for any K divisible by 4 — engine loads full rows, alignment
+ *     follows from the row base. */
+__global__ void k_gemv_bf16_v2(const uint8_t *__restrict__ W,
+                              const float *__restrict__ x, float *__restrict__ y,
+                              int M, int K) {
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 2;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x;
+    const int K4 = K >> 2;                          // 4-bf16 groups per row
+    const __nv_bfloat16 *rw0 = (const __nv_bfloat16 *)((const char *)W + (long)row0 * K * 2);
+    const __nv_bfloat16 *rw1 = (const __nv_bfloat16 *)((const char *)W + (long)row1 * K * 2);
+    const float4 *x4 = (const float4 *)x;
+    float s0 = 0.0f, s1 = 0.0f;
+    for (int g = lane; g < K4; g += 32) {
+        const float4 xg = x4[g];
+        const __nv_bfloat162 *h0 = (const __nv_bfloat162 *)(rw0 + (g << 2));
+        const __nv_bfloat162 *h1 = (const __nv_bfloat162 *)(rw1 + (g << 2));
+        const float2 w0a = __bfloat1622float2(h0[0]);
+        const float2 w0b = __bfloat1622float2(h0[1]);
+        const float2 w1a = __bfloat1622float2(h1[0]);
+        const float2 w1b = __bfloat1622float2(h1[1]);
+        s0 = fmaf(w0a.x, xg.x, s0);
+        s0 = fmaf(w0a.y, xg.y, s0);
+        s0 = fmaf(w0b.x, xg.z, s0);
+        s0 = fmaf(w0b.y, xg.w, s0);
+        s1 = fmaf(w1a.x, xg.x, s1);
+        s1 = fmaf(w1a.y, xg.y, s1);
+        s1 = fmaf(w1b.x, xg.z, s1);
+        s1 = fmaf(w1b.y, xg.w, s1);
+    }
+    s0 = warp_reduce_sum(s0);
+    s1 = warp_reduce_sum(s1);
+    if (lane == 0) {
+        y[row0] = s0;
+        if (row1 < M) y[row1] = s1;
+    }
 }
 
 /* ---------------- embedding row dequant (typed) ---------------------------- *
@@ -482,6 +871,19 @@ static int gemv_dims(int M, dim3 *grid, dim3 *block) {
     return 0;
 }
 
+/* 2-rows-per-warp V2 grid helper: each warp covers TWO output rows, so the
+ * number of grid blocks is half of gemv_dims (rounded up). Used by the F16
+ * V2 and BF16 V2 dispatchers below; the kernels themselves early-return
+ * when row0 >= M (handles odd M cleanly, and any leftover rows when M is
+ * even-but-not-divisible-by-blockDim.y*2 just go unused -- the math shape
+ * is identical to gemv_q4_cuda.cu's gemv_dims2). */
+static int gemv_dims2(int M, dim3 *grid, dim3 *block) {
+    if (M <= 0 || M > (1 << 22)) return -50;
+    block->x = 32; block->y = 16; block->z = 1;
+    grid->x = (M + block->y * 2 - 1) / (block->y * 2); grid->y = 1; grid->z = 1;
+    return 0;
+}
+
 static int kquant_aligned(int dtype, long K) { return K % 256 == 0; }
 
 /*
@@ -538,7 +940,11 @@ int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
              * gemv_q4_cuda.cu when K/32 (nb) is even — the alignment
              * contract of the uint32-streaming inner loop. Otherwise fall
              * back to the scalar k_gemv_q8_0 above. */
-            if ((K & 31) == 0 && (((K >> 5)) & 1) == 0) {
+            if ((K & 31) == 0 && (((K >> 5)) & 1) == 0
+                && M >= 256 /* TT_GEMV_Q4_0_V2_MIN_M: same small-M gate as
+                              * q4_0 V2 in gemv_q4_cuda.cu; V2 carries 2x
+                              * d/qs/accumulator state and loses to scalar
+                              * for the tiny M_kv shapes. */) {
                 extern int tt_gemv_q8_0(const void *, const float *, float *,
                                         int, int, cudaStream_t);
                 return tt_gemv_q8_0(W, x, y, M, K, stream);
@@ -562,15 +968,49 @@ int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
             else
                 k_gemv_q6_K<<<g, b, 0, stream>>>((const uint8_t *)W, x, y, M, K);
             break;
-        case TTQ_F16:
-            k_gemv_f16<<<g, b, 0, stream>>>((const uint8_t *)W, x, y, M, K);
+        case TTQ_F16: {
+            /* M9.5: V2 (2-rows-per-warp) is the existing k_gemv_f16, but the
+             * prior dispatcher launched it with gemv_dims -- a one-warp-per-
+             * row grid -- so 50% of warps early-returned. Use gemv_dims2
+             * (2 rows per warp) so grid.x*b.y*2 == M. The V2 path requires
+             * K%4 == 0 (4-half group alignment); the scalar fallback
+             * handles K%4 != 0 (rare; all our LLM dims are div-by-4). */
+            if (M >= 2 && (K & 3) == 0) {
+                dim3 g2, b2;
+                if (gemv_dims2(M, &g2, &b2) == 0)
+                    k_gemv_f16<<<g2, b2, 0, stream>>>(
+                        (const uint8_t *)W, x, y, M, K);
+                else
+                    k_gemv_f16<<<g, b, 0, stream>>>(
+                        (const uint8_t *)W, x, y, M, K);
+            } else {
+                k_gemv_f16_scalar<<<g, b, 0, stream>>>(
+                    (const uint8_t *)W, x, y, M, K);
+            }
             break;
+        }
         case TTQ_F32:
             k_gemv_f32<<<g, b, 0, stream>>>((const float *)W, x, y, M, K);
             break;
-        case 30: /* TTQ_BF16 */
-            k_gemv_bf16<<<g, b, 0, stream>>>((const uint16_t *)W, x, y, M, K);
+        case 30: /* TTQ_BF16 */ {
+            /* M9.5: V2 (2-rows-per-warp, __nv_bfloat162). Same V2 contract
+             * as F16 above: K%4 == 0 (4-bf16 group alignment) and M >= 2.
+             * Falls back to the scalar k_gemv_bf16 (1 half-word per cycle)
+             * for the K%4 != 0 case. */
+            if (M >= 2 && (K & 3) == 0) {
+                dim3 g2, b2;
+                if (gemv_dims2(M, &g2, &b2) == 0)
+                    k_gemv_bf16_v2<<<g2, b2, 0, stream>>>(
+                        (const uint8_t *)W, x, y, M, K);
+                else
+                    k_gemv_bf16_v2<<<g, b, 0, stream>>>(
+                        (const uint8_t *)W, x, y, M, K);
+            } else {
+                k_gemv_bf16<<<g, b, 0, stream>>>(
+                    (const uint16_t *)W, x, y, M, K);
+            }
             break;
+        }
         default:
             fprintf(stderr, "[gemv-typed] unsupported dtype %d\n", dtype);
             return -100;
