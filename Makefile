@@ -100,6 +100,18 @@ dump_logits: $(BUILD)/dump_logits
 
 .PHONY: dump_logits
 
+$(BUILD)/bench_prefill: tools/bench_prefill.c src/loader_gguf.c src/dequant_ref.c src/arch_registry.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
+	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
+	  -o $@ \
+	  tools/bench_prefill.c src/loader_gguf.c src/dequant_ref.c src/arch_registry.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
+	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
+
+bench_prefill: $(BUILD)/bench_prefill
+
+.PHONY: bench_prefill
+
 $(BUILD)/profile_step: tools/profile_step.cu src/loader_gguf.c src/arch_registry.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
 	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
