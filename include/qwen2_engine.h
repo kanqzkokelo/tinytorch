@@ -42,6 +42,29 @@ int qwen2_engine_next(Qwen2Engine *e);
 
 int  qwen2_engine_pos(const Qwen2Engine *e);
 
+/* Speculative-decode verify pass: feed N candidate tokens in one batched
+ * call, return N sets of logits (one per candidate position).
+ *
+ *   h_candidate_tokens : host array of N int32 token ids (typically
+ *                        [current, draft_0, draft_1, draft_2]).
+ *   n_candidate        : count in [1, max_ctx-pos]. 2-4 typical.
+ *   out_logits         : pre-allocated DEVICE buffer of size
+ *                        n_candidate * vocab floats. Layout is
+ *                        [candidate_0 logits | candidate_1 logits | ...].
+ *                        Filled row-major contiguous; no D2H copy.
+ *
+ * Semantics: identical to N sequential qwen2_engine_next() calls would
+ * produce for their per-token logits — but no sampling/argmax/D2H sync
+ * happens inside. KV cache slots [pos, pos+n) are populated; host pos
+ * advances by n. To reject all candidates, the caller must restore pos
+ * and overwrite the KV cache (Task 3 / orchestrator responsibility).
+ *
+ * Returns 0 on success, negative on error. */
+int qwen2_engine_verify_speculative(Qwen2Engine *e,
+                                    const int *h_candidate_tokens,
+                                    int n_candidate,
+                                    float *out_logits);
+
 /* Debug/profiling hooks.
  * qwen2_debug_replay_step performs exactly the graph-replay body of
  * qwen2_engine_next: H2D next_tok -> graph launch -> D2H sample -> sync,
@@ -70,6 +93,14 @@ int qwen2_debug_copy_x(Qwen2Engine *e, float *host, int n);
 int qwen2_debug_copy_kv(Qwen2Engine*, int layer, float*, long);
 int qwen2_debug_copy_xn(Qwen2Engine*, float*, int);
 int qwen2_debug_copy_logits(Qwen2Engine *e, float *host, int n);
+
+/* Single-token forward WITHOUT sampling/D2H: embed(tok) -> forward_layers
+ * (writes K/V to slot pos, advances pos by 1) -> rmsnorm -> lm_head ->
+ * softcap.  Result copied to host_logits (size >= vocab).  Used by the
+ * spec-verify test to produce a golden set of per-token logits for
+ * bit-exact comparison with qwen2_engine_verify_speculative.  */
+int qwen2_engine_step_logits(Qwen2Engine *e, int tok, float *host_logits);
+
 void qwen2_engine_free(Qwen2Engine *e);
 
 #ifdef __cplusplus

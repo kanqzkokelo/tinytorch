@@ -147,6 +147,21 @@ test_gemv_typed: $(BUILD)/test_gemv_typed
 
 .PHONY: test_gemv_typed
 
+# Speculative-decode verify test: compares batched verify(N) logits against
+# N sequential single-token forwards (bit-exact on qwen2.5-0.5b-q4_0).
+$(BUILD)/test_spec_verify: tests/test_spec_verify.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
+	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
+	  -o $@ \
+	  tests/test_spec_verify.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c \
+	  kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
+	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
+
+test_spec_verify: $(BUILD)/test_spec_verify
+
+.PHONY: test_spec_verify
+
 # CI: cheap CPU-only sanity (no GPU needed) -- same checks as GitHub CI.
 ci:
 	./scripts/ci_local.sh

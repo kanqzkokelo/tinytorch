@@ -1944,6 +1944,92 @@ int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
     return 0;
 }
 
+/* Speculative-decode "logits-only" tail: same rmsnorm -> lm-head -> softcap
+ * as sample_eager(), but no sampling transforms, no argmax, no D2H sync.
+ * Result lives in e->d_logits on the device (vocab floats, f32).
+ * Used by qwen2_engine_verify_speculative() after each candidate-token
+ * advance.  No-op with respect to KV cache / pos. */
+static int compute_logits_into_d_logits(Qwen2Engine *e) {
+    const TTConfig *c = &e->cfg;
+    if (tt_profiling()) tt_prof_begin(TT_P_RMSNORM, e->stream);
+    k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
+        e->d_x, e->d_out_norm, e->d_xn, c->dim, c->rms_eps, c->tr.norm_offset);
+    if (tt_profiling()) tt_prof_end(TT_P_RMSNORM, e->stream);
+
+    if (tt_profiling()) tt_prof_begin(TT_P_LOGITS, e->stream);
+    const int rc = tt_logits_dispatch(e->d_out_w.ptr, e->d_out_w.dtype, e->d_xn,
+                                      e->d_logits, c->vocab, c->dim, e->stream);
+    if (tt_profiling()) tt_prof_end(TT_P_LOGITS, e->stream);
+    if (rc) return rc;
+
+    /* M7 trait: final-logit tanh softcap (gemma2). Identical kernel as
+     * the eager path; if the trait is absent this branch is dead. */
+    if (c->tr.softcap_value > 0.0f)
+        k_softcap<<<(c->vocab + 255) / 256, 256, 0, e->stream>>>(
+            e->d_logits, c->vocab, c->tr.softcap_value);
+    return 0;
+}
+
+/* Speculative-decode VERIFY pass: feed N candidate tokens through the
+ * layers in order, returning the per-position logits to a device buffer.
+ *
+ * Reference semantics: out_logits[i] must equal the logits that a
+ * qwen2_engine_next() call would have produced right after advancing
+ * with h_candidate_tokens[i], starting from the engine state at entry
+ * (with the prior N-1 candidates already fed).  Bit-exact with the
+ * single-token eager path.
+ *
+ * Implementation note (correctness-first, perf-follow-up):
+ *   The eager engines' per-layer kernels are batch_size=1 GEMVs. The
+ *   cleanest batched verify kernel (parallel Q/K/V/FFN over N positions,
+ *   grouped Q@K^T attention with N-tile) is a non-trivial rewrite and
+ *   outside this task's scope. Instead we drive N sequential advance()
+ *   calls — each writes its K/V to the correct cache slot (advance()
+ *   increments d_pos for the next slot) and runs the same forward
+ *   layers body the graph path uses. After each advance we run the
+ *   logits-only tail (compute_logits_into_d_logits) and D2D-copy
+ *   d_logits -> out_logits + i*vocab.  The orchestrator (Task 3) saves
+ *   the engine state before calling and restores it on rejection.
+ */
+int qwen2_engine_verify_speculative(Qwen2Engine *e,
+                                    const int *h_candidate_tokens,
+                                    int n_candidate,
+                                    float *out_logits) {
+    if (!e || !h_candidate_tokens || !out_logits) return -1;
+    if (n_candidate <= 0) return -2;
+    const TTConfig *c = &e->cfg;
+    if (e->pos + n_candidate > c->max_ctx) return -3;       /* ctx overflow */
+    if (n_candidate > 16) return -4;                        /* sanity cap    */
+
+    /* Mirror prefill()'s graph-replay flush: a sampled-but-unfed pending
+     * token must be advanced first so the KV cache matches the eager
+     * state machine. */
+    if (e->graph_ready && e->pending_tok >= 0) {
+        if (advance(e, e->pending_tok)) return -5;
+        e->pending_tok = -1;
+    }
+    /* advance() relies on *e->d_pos for the cache-slot write index. After
+     * the (optional) flush, host and device pos agree; the first advance()
+     * below will write to slot e->pos, the next to e->pos+1, etc. */
+    cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
+
+    const long vocab_f = (long)c->vocab;
+    for (int i = 0; i < n_candidate; i++) {
+        if (advance(e, h_candidate_tokens[i])) return -10 - i;
+        if (compute_logits_into_d_logits(e))   return -20 - i;
+        /* D2D copy of d_logits -> out_logits + i*vocab. Async — no host
+         * sync per token. The trailing cudaStreamSynchronize below makes
+         * the whole batch visible. */
+        cudaMemcpyAsync(out_logits + (long)i * vocab_f,
+                        e->d_logits,
+                        vocab_f * sizeof(float),
+                        cudaMemcpyDeviceToDevice,
+                        e->stream);
+    }
+    cudaStreamSynchronize(e->stream);
+    return 0;
+}
+
 /* Eager sampling tail shared by all paths: final rmsnorm -> logits ->
  * greedy argmax -> D2H sync. Returns token id, or negative on error.
  * d_logits stays valid afterwards (dump_logits relies on this). */
@@ -2220,4 +2306,29 @@ int qwen2_debug_copy_logits(Qwen2Engine *e, float *host, int n) {
     const int ncpy = n < e->cfg.vocab ? n : e->cfg.vocab;
     cudaMemcpy(host, e->d_logits, sizeof(float) * ncpy, cudaMemcpyDeviceToHost);
     return ncpy;
+}
+
+/* Public single-token "step + logits" used by tests and the spec-verify
+ * golden path. Eager-only: it does NOT participate in the graph-replay
+ * path and avoids the sampled-tok/D2H sync of qwen2_engine_next(). The
+ * spec-verify golden computes the same logits a sequential eager next()
+ * would produce, but without consuming a sampled token id. */
+int qwen2_engine_step_logits(Qwen2Engine *e, int tok, float *host_logits) {
+    if (!e || !host_logits) return -1;
+    if (e->pos >= e->cfg.max_ctx - 1) return -2;
+    /* If the graph path is ready and there's a sampled-but-unfed token
+     * (left over from a prior qwen2_engine_next call), drain it first so
+     * the KV cache matches the eager state machine. The spec-verify
+     * test constructs engines in a fresh state (no graph capture yet)
+     * so this branch is normally dead in the test. */
+    if (e->graph_ready && e->pending_tok >= 0) {
+        if (advance(e, e->pending_tok)) return -3;
+        e->pending_tok = -1;
+    }
+    if (advance(e, tok)) return -4;
+    if (compute_logits_into_d_logits(e)) return -5;
+    const int ncpy = e->cfg.vocab;
+    cudaMemcpy(host_logits, e->d_logits, sizeof(float) * ncpy,
+               cudaMemcpyDeviceToHost);
+    return 0;
 }
