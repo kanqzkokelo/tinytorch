@@ -34,6 +34,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <time.h>
 #include <cuda_runtime.h>
 #include "loader_gguf.h"
 #include "qwen2_engine.h"
@@ -155,6 +156,8 @@ int main(int argc, char **argv) {
     CUDA_OK(cudaMalloc(&d_logits, sizeof(float) * cfg.vocab * MAX_CANDIDATES));
 
     /* ---- Decode loop ---- */
+    struct timespec t0, t1, tp0;
+    clock_gettime(CLOCK_MONOTONIC, &tp0);
     long total_accepted  = 0;
     long total_attempted = 0;
     long total_emitted   = 0;       /* total tokens put into history (incl. fallback) */
@@ -166,6 +169,9 @@ int main(int argc, char **argv) {
     char turn_text[8192];
     size_t tl = 0;
     turn_text[0] = '\0';
+
+    /* Start decode-only window after prefill + history buffer setup. */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
 
     while (total_emitted < n_predict && qwen2_engine_pos(eng) < MAX_CTX - 1) {
         /* a) Draft from history */
@@ -264,16 +270,25 @@ int main(int argc, char **argv) {
         if (qwen2_engine_pos(eng) >= MAX_CTX - 1) { end_reason = 2; break; }
     }
     cudaDeviceSynchronize();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
     fputc('\n', stdout);
     fflush(stdout);
 
+    const double dec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+    const double tot = (t1.tv_sec - tp0.tv_sec) + (t1.tv_nsec - tp0.tv_nsec) * 1e-9;
     const long denom = total_attempted + fallback_steps;
     const double rate = denom > 0 ? 100.0 * (double)total_accepted / (double)denom : 0.0;
     fprintf(stderr,
             "\n[USE] emitted=%ld verify_steps=%ld fallback_steps=%ld "
-            "accepted=%ld attempted=%ld rate=%.1f%% end=%d\n",
+            "accepted=%ld attempted=%ld rate=%.1f%% end=%d | "
+            "decode %.1f tok/s | incl prefill %.1f tok/s\n",
             total_emitted, verify_steps, fallback_steps,
-            total_accepted, total_attempted, rate, end_reason);
+            total_accepted, total_attempted, rate, end_reason,
+            total_emitted / dec, total_emitted / tot);
+    /* STATS line: mirrors run_llm_gpu format so bench scripts can parse
+     * tok/s from `tokens / (decode_us/1e6)` uniformly. */
+    printf("STATS tokens=%ld prefill=%d decode_us=%.0f\n",
+           total_emitted, n_prompt, dec * 1e6);
 
     cudaFree(d_logits);
     free(h_logits);
