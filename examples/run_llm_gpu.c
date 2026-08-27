@@ -84,15 +84,7 @@ int main(int argc, char **argv) {
             tl += (size_t)out_len;
             turn_text[tl] = '\0';
         }
-        const char *cut = NULL;
-        static const char *markers[] = {"<|im_end|>", "<|endoftext|>", NULL};
-        for (int mi = 0; markers[mi]; mi++)
-            if ((cut = strstr(turn_text, markers[mi]))) break;
-        if (cut) {
-            const size_t keep = (size_t)(cut - turn_text);
-            if (keep > tl - (size_t)out_len)
-                async_printer_push(ap, turn_text + (tl - (size_t)out_len),
-                                   (int)(keep - (tl - (size_t)out_len)));
+        if (id == tok->eos_id) {
             break;
         }
         async_printer_push(ap, txt, out_len);
