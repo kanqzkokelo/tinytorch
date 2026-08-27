@@ -76,6 +76,21 @@ $(BUILD)/chat_llm_gpu: examples/chat_llm_gpu.c src/loader_gguf.c src/arch_regist
 
 chat_llm_gpu: $(BUILD)/chat_llm_gpu
 
+# Universal Speculative Engine orchestrator: N-gram drafter (host) +
+# batched verify_speculative() (CUDA). Source list mirrors run_llm_gpu
+# plus src/ngram_lookup.c.
+$(BUILD)/spec_llm_gpu: examples/spec_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/tokenizer_bpe.c src/async_printer.c src/ngram_lookup.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
+	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
+	  -o $@ \
+	  examples/spec_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/tokenizer_bpe.c src/async_printer.c src/ngram_lookup.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
+	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
+
+spec_llm_gpu: $(BUILD)/spec_llm_gpu
+
+.PHONY: spec_llm_gpu
+
 # Oracle logits tool against the vendored llama.cpp build (parity fixtures).
 $(BUILD)/oracle_logits: tools/oracle_logits.c | $(BUILD)
 	gcc -O2 -Wno-deprecated-declarations \
