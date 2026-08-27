@@ -196,9 +196,15 @@ check("gemma single+system golden",
       f"<start_of_turn>user\n{SYS}\n\n{U1}<end_of_turn>\n"
       f"<start_of_turn>model\n")
 
-check("gemma4 identical to gemma golden",
+
+# gemma-4 uses different turn tokens (<|turn>, <turn|>) than gemma-2/3
+# (<start_of_turn>, <end_of_turn>). gemma-4 also folds the system into
+# the first user turn, like gemma-2/3.
+check("gemma4 single+system golden",
       fmt(TT_CHAT_GEMMA4, [("system", SYS), ("user", U1)])[0],
-      g_conv_sys[0])
+      f"<|turn>user\n{SYS}\n\n{U1}<turn|>\n"
+      f"<|turn>model\n")
+
 
 check("gemma multiturn 3 exchanges golden",
       fmt(TT_CHAT_GEMMA,
@@ -301,7 +307,7 @@ else:
     print("ok   unknown arch -> -1")
 
 stops = {TT_CHAT_QWEN2: "<|im_end|>", TT_CHAT_QWEN3: "<|im_end|>",
-         TT_CHAT_GEMMA: "<end_of_turn>", TT_CHAT_GEMMA4: "<end_of_turn>",
+         TT_CHAT_GEMMA: "<end_of_turn>", TT_CHAT_GEMMA4: "<turn|>",
          TT_CHAT_LLAMA3: "<|eot_id|>"}
 for fam, s in stops.items():
     got = LIB.tt_chat_stop_string(fam)

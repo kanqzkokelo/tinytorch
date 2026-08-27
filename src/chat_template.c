@@ -132,8 +132,8 @@ const char *tt_chat_stop_string(tt_chat_family fam) {
     switch (fam) {
     case TT_CHAT_QWEN2:
     case TT_CHAT_QWEN3:   return "<|im_end|>";
-    case TT_CHAT_GEMMA:
-    case TT_CHAT_GEMMA4:  return "<end_of_turn>";
+    case TT_CHAT_GEMMA:  return "<end_of_turn>";
+    case TT_CHAT_GEMMA4: return "<turn|>";
     case TT_CHAT_LLAMA3:  return "<|eot_id|>";
     default:              return NULL;
     }
@@ -178,12 +178,17 @@ static void fmt_qwen(abuf *b, const tt_msg *msgs, int n,
 }
 
 static void fmt_gemma(abuf *b, const tt_msg *msgs, int n,
-                      const tt_chat_opts *o) {
+                      const tt_chat_opts *o, int is_gemma4) {
     /* gemma's SP-mode tokenizer auto-prepends bos_id=2 in bpe_encode;
      * emitting the literal "<bos>" string here would be mis-tokenized
      * (BPE splits "<bos>" into '<', 'bos', '>'), garbling the prompt prefix.
      * Always skip for gemma regardless of opts->add_bos_text. */
     (void)o;
+    /* gemma-2/3 use "<start_of_turn>"/"<end_of_turn>"; gemma-4 uses
+     * "<|turn>"/"<turn|>" (verified from gemma-4's actual added_tokens
+     * via the tokenizer-special-tokens test). Match the vocab. */
+    const char *turn_open  = is_gemma4 ? "<|turn>"  : "<start_of_turn>";
+    const char *turn_close = is_gemma4 ? "<turn|>"  : "<end_of_turn>";
 
     /* HF gemma template folds a leading system message into the first
      * user turn's prefix ({system}\n\n{user}); roles must alternate. */
@@ -198,7 +203,7 @@ static void fmt_gemma(abuf *b, const tt_msg *msgs, int n,
     for (int i = start; i < n; i++) {
         const char *role = strcmp(safe(msgs[i].role), "assistant") == 0
                                ? "model" : safe(msgs[i].role);
-        ab_puts(b, "<start_of_turn>");
+        ab_puts(b, turn_open);
         ab_puts(b, role);
         ab_puts(b, "\n");
         if (i == start && i > 0) ab_puts(b, sys_prefix); /* fold system */
@@ -206,10 +211,12 @@ static void fmt_gemma(abuf *b, const tt_msg *msgs, int n,
         const char *t;
         size_t tl = trim_span(s, strlen(s), &t);
         ab_putn(b, t, tl);
-        ab_puts(b, "<end_of_turn>\n");
+        ab_puts(b, turn_close);
+        ab_puts(b, "\n");
     }
     if (o->add_generation_prompt)
-        ab_puts(b, "<start_of_turn>model\n");
+        ab_puts(b, turn_open);
+        ab_puts(b, "model\n");
 }
 
 static void fmt_llama3(abuf *b, const tt_msg *msgs, int n,
@@ -264,8 +271,8 @@ int tt_chat_format_ex(tt_chat_family fam, const tt_msg *msgs, int n,
     switch (fam) {
     case TT_CHAT_QWEN2: fmt_qwen(&b, msgs, n, opts, 0); break;
     case TT_CHAT_QWEN3: fmt_qwen(&b, msgs, n, opts, 1); break;
-    case TT_CHAT_GEMMA:
-    case TT_CHAT_GEMMA4: fmt_gemma(&b, msgs, n, opts); break;
+    case TT_CHAT_GEMMA:  fmt_gemma(&b, msgs, n, opts, 0); break;
+    case TT_CHAT_GEMMA4: fmt_gemma(&b, msgs, n, opts, 1); break;
     case TT_CHAT_LLAMA3: fmt_llama3(&b, msgs, n, opts); break;
     default: return -1;
     }
