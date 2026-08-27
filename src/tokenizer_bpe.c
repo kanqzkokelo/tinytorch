@@ -139,6 +139,17 @@ enum {
  * to codepoints starting at U+0100 (e.g. 0x20 space -> U+0120 'Ġ').
  * GGUF token strings for Qwen-style models live in THIS domain, so encode
  * must map text into it and decode must map back out. */
+/* Special-token table entry: verbatim "<...>" / "<|...|>" / "<|...>" / "<...|>"
+ * span that the encode path must emit as a SINGLE token id instead of
+ * splitting through BPE. The whole-table mirror of llama-vocab.cpp's
+ * `special_tokens` map (a parallel control-token string→id store lifted out
+ * of the regular vocab so the BPE / SP paths know to short-circuit it). */
+typedef struct {
+    const char *str;   /* points into base.tokens[id]; not owned           */
+    int id;
+    int n;             /* strlen(str) cached for fast compares              */
+} tt_special;
+
 typedef struct {
     BPETokenizer base;
     HashMap tok2id;      /* token bytes -> id */
@@ -150,6 +161,14 @@ typedef struct {
     int add_bos;         /* resolved add-BOS convention */
     int kv_add_bos_seen; /* explicit add_bos KV present (overrides defaults) */
     int max_piece;       /* longest vocab piece in bytes */
+    /* Longest-match special-token table: populated at init time by scanning
+     * the vocab for entries that look like control tokens (contain '<' and
+     * '>', no SP/byte-encoding artifacts), sorted by descending length so the
+     * encode scan picks the longest span first. Owned strings live in
+     * base.tokens[i]; we only mirror pointers. */
+    tt_special *specials;
+    int n_specials;
+    int specials_cap;
     unsigned short byte2cp[256];
     signed int cp2byte[32768];       /* -1 if unused */
     char *dec_buf; size_t dec_cap;   /* decode scratch */
@@ -196,6 +215,103 @@ static int utf8_dec(const char *s, int len, unsigned int *cp) {
         v=(v<<6)|(ci&0x3F);
     }
     *cp=v; return n;
+}
+
+/* ---------------- special-token table (verbatim "<...>" spans) -----------
+ * Build a flat list of vocab entries that look like control tokens. The
+ * encode path scans input text for the longest matching entry starting at
+ * each position and emits its id verbatim (skipping BPE / SP splitting).
+ *
+ * Heuristic: a vocab string is a "control token" if it
+ *   - contains '<' and '>' (covers <bos>, <eos>, <start_of_turn>, <|im_start|>,
+ *     <|turn|>, <turn|>, <|tool|>, <tool|>, <|think|>, <|"|>, ...),
+ *   - is short (<= 64 bytes — long control spans are not a thing in any
+ *     current model; cap keeps the per-call longest-match scan O(64) worst
+ *     case),
+ *   - contains NO 0xE2 0x96 0x81 ('▁' SP marker), NO <0xNN> byte-fallback
+ *     marker, and NO >64 ASCII chars (so we don't accidentally sweep
+ *     user-text strings like "<3 hearts" into the table).
+ *
+ * "<0xNN>" byte-fallback strings DO match '<...>' and contain '<' and '>'.
+ * They are valid vocab entries the encode path emits for unknown bytes, so
+ * they must stay reachable as a fallback — but they should NOT be treated as
+ * user-emittable special tokens (the BPE/SP path already produces them at
+ * the right time). Filter them by the leading "<0x" / "<0X" prefix.
+ *
+ * Longest-match-first ordering is required: e.g. "<|tool_response|>" must
+ * be preferred over "<|tool|>" when both prefixes match. We sort the
+ * finished table descending by length, then resolve ties by insertion
+ * order (stable, lower id wins) so behavior is deterministic. */
+static int looks_like_control_token(const char *s, int n) {
+    if (n <= 0 || n > 64) return 0;
+    int has_lt = 0, has_gt = 0;
+    for (int i = 0; i < n; i++) {
+        const unsigned char c = (unsigned char)s[i];
+        if (c == '<') has_lt = 1;
+        else if (c == '>') has_gt = 1;
+        /* reject SP '▁' (0xE2 0x96 0x81) and BPE 'Ġ' (0xC4 0xA0) */
+        if (c == 0xE2 || c == 0xC4) return 0;
+    }
+    if (!has_lt || !has_gt) return 0;
+    /* reject "<0xNN>" / "<0xNNN>" byte-fallback markers (3+ hex digits) */
+    if (n >= 6 && s[0] == '<' && s[1] == '0' &&
+        (s[2] == 'x' || s[2] == 'X') && s[n - 1] == '>') {
+        for (int i = 3; i < n - 1; i++) {
+            const char ch = s[i];
+            if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')))
+                return 1;
+        }
+        return 0;
+    }
+    return 1;
+}
+
+static void specials_push(Tok *t, const char *s, int n, int id) {
+    if (t->n_specials == t->specials_cap) {
+        t->specials_cap = t->specials_cap ? t->specials_cap * 2 : 16;
+        t->specials = (tt_special *)realloc(t->specials,
+                                            sizeof(tt_special) * (size_t)t->specials_cap);
+    }
+    t->specials[t->n_specials].str = s;
+    t->specials[t->n_specials].id = id;
+    t->specials[t->n_specials].n = n;
+    t->n_specials++;
+}
+
+static int specials_cmp_len(const void *a, const void *b) {
+    const tt_special *x = (const tt_special *)a, *y = (const tt_special *)b;
+    if (y->n != x->n) return y->n - x->n;   /* descending by length */
+    return x->id - y->id;                    /* stable: lower id first */
+}
+
+static void specials_build(Tok *t) {
+    for (int i = 0; i < t->base.vocab_size; i++) {
+        const char *s = t->base.tokens[i];
+        const int n = t->base.token_lens[i];
+        if (s && looks_like_control_token(s, n))
+            specials_push(t, s, n, i);
+    }
+    /* longest-first so the encode scan can short-circuit on the first match */
+    qsort(t->specials, (size_t)t->n_specials, sizeof(tt_special), specials_cmp_len);
+}
+
+/* Longest-match lookup at text[pos..pos+maxlen). Returns the special id
+ * whose string prefix-matches the input, or -1. Uses linear scan over the
+ * length-sorted table — for <1000 entries the inner loop stays well under
+ * 1us. If multiple specials share a length (rare; e.g. "<bos>" vs "<eos>"),
+ * memcmp breaks the tie deterministically. */
+static int specials_match(const Tok *t, const char *text, int len, int pos) {
+    int best_id = -1, best_n = -1;
+    for (int i = 0; i < t->n_specials; i++) {
+        const tt_special *s = &t->specials[i];
+        if (s->n > len - pos) continue;
+        if (s->n <= best_n) continue;          /* can't beat current best */
+        if (memcmp(text + pos, s->str, (size_t)s->n) == 0) {
+            best_id = s->id;
+            best_n = s->n;
+        }
+    }
+    return best_id;
 }
 
 BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
@@ -325,9 +441,10 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
     t->ignore_merges = (t->pre_type == PRE_LLAMA3);
     if (!t->kv_add_bos_seen)
         t->add_bos = t->sp_mode ? 1 : t->pre_add_bos;
-    printf("[BPE] loaded: vocab=%d merges=%llu bos=%d eos=%d add_bos=%d\n",
+    specials_build(t);
+    printf("[BPE] loaded: vocab=%d merges=%llu bos=%d eos=%d add_bos=%d specials=%d\n",
            t->base.vocab_size, (unsigned long long)n_merges,
-           t->base.bos_id, t->base.eos_id, t->add_bos);
+           t->base.bos_id, t->base.eos_id, t->add_bos, t->n_specials);
     return &t->base;
 }
 
@@ -595,28 +712,6 @@ static int pretok_split(const Tok *t, const uint32_t *cp, int n, int *ends, int 
 
 /* ---------------- BPE encode helpers ---------------- */
 
-/* Verbatim "<|name|>" special-token match against the vocab table. These
- * tokens never appear in merge ranks, so they must be matched before regex
- * splitting (mirrors llama.cpp tokenizer_st_partition ordering). Returns id
- * and length, or -1. */
-static int match_special(Tok *t, const char *text, int len, int pos, int *out_slen) {
-    *out_slen = 0;
-    if (!(pos + 2 < len && text[pos] == '<' && text[pos + 1] == '|')) return -1;
-    for (const char *q = text + pos + 2; q + 1 < text + len; q++) {
-        if (q[0] == '|' && q[1] == '>') {
-            const int l = (int)(q - (text + pos)) + 2;
-            if (l < 128) {
-                char buf[128];
-                memcpy(buf, text + pos, (size_t)l);
-                const int id = hm_get(&t->tok2id, buf, l);
-                if (id >= 0) { *out_slen = l; return id; }
-            }
-            return -1;
-        }
-    }
-    return -1;
-}
-
 /* Encode one non-special segment: decode codepoints, split with the family
  * pre-tokenizer, then run rank-based BPE merges inside each piece.
  * Workspace buffers are caller-provided and sized to the full text. */
@@ -717,6 +812,55 @@ static int encode_bpe_segment(Tok *t, const char *s, int slen,
     return n_out;
 }
 
+/* Run the SP greedy longest-piece path on a NON-special span of the raw
+ * input. The span is mapped to the SP byte domain (space -> '▁', one
+ * virtual '▁' prefix when `with_dummy_prefix` is set — first span only,
+ * matching llama.cpp's tokenize_add ordering). Returns the number of
+ * output tokens emitted; bounded by `cap`. */
+static int encode_sp_segment(Tok *t, const char *s, int slen, int with_dummy_prefix,
+                             int *out, int cap) {
+    if (t->max_piece <= 0 || cap <= 0) return 0;
+    char *mapped = (char *)malloc((size_t)slen * 3 + 4);
+    if (!mapped) return 0;
+    int mlen = 0;
+    if (with_dummy_prefix) {
+        mapped[mlen++] = (char)0xE2;
+        mapped[mlen++] = (char)0x96;
+        mapped[mlen++] = (char)0x81;
+    }
+    for (int i = 0; i < slen; i++) {
+        if (s[i] == ' ') {
+            mapped[mlen++] = (char)0xE2;
+            mapped[mlen++] = (char)0x96;
+            mapped[mlen++] = (char)0x81;
+        } else {
+            mapped[mlen++] = s[i];
+        }
+    }
+    int sp = 0, n_out = 0;
+    while (sp < mlen && n_out < cap) {
+        int rem = mlen - sp;
+        int L = rem < t->max_piece ? rem : t->max_piece;
+        int best = -1;
+        for (; L >= 1; L--) {
+            best = hm_get(&t->tok2id, mapped + sp, L);
+            if (best >= 0) break;
+        }
+        if (best < 0) {
+            char fb[8];
+            const int fl = snprintf(fb, sizeof(fb), "<0x%02X>",
+                                    (unsigned char)mapped[sp]);
+            best = hm_get(&t->tok2id, fb, fl);
+            L = 1;
+        }
+        if (best < 0) { sp++; continue; }
+        out[n_out++] = best;
+        sp += L;
+    }
+    free(mapped);
+    return n_out;
+}
+
 int bpe_encode(const BPETokenizer *tok_, const char *text, int *out_tokens, int max_tokens) {
     Tok *t = (Tok *)tok_;
     if (!tok_ || !t->base.tokens || !text || !out_tokens || max_tokens <= 0) return 0;
@@ -725,91 +869,78 @@ int bpe_encode(const BPETokenizer *tok_, const char *text, int *out_tokens, int 
     int pos = 0;
 
     /* BPE-mode families (llama3 etc.) declare add_bos in GGUF metadata;
-     * honor it exactly like the SP path so prompts match family convention. */
+     * honor it exactly like the SP path so prompts match family convention.
+     * The SP path auto-prepends BOS inside its segment loop, so we only
+     * do the explicit prepend for BPE mode here. */
     if (!t->sp_mode && t->add_bos && t->base.bos_id >= 0 && max_tokens > 0)
         out_tokens[n_out++] = t->base.bos_id;
 
-    if (t->sp_mode) {
-        /* SentencePiece (llama/gemma families): greedy longest-piece match.
-         * APPROXIMATION of true unigram Viterbi — fine for interactive chat,
-         * may split words differently than llama-tokenize on rare inputs.
-         * Spaces become '▁'(U+2581) first, matching how pieces are stored. */
-        if (t->max_piece <= 0) return 0;
-        char *mapped = (char *)malloc((size_t)len * 3 + 4);
-        if (!mapped) return 0;
-        int mlen = 0;
-        /* add_dummy_prefix convention: virtual '▁' at text start */
-        mapped[mlen++] = (char)0xE2;
-        mapped[mlen++] = (char)0x96;
-        mapped[mlen++] = (char)0x81;
-        for (int i = 0; i < len; i++) {
-            if (text[i] == ' ') {
-                mapped[mlen++] = (char)0xE2;
-                mapped[mlen++] = (char)0x96;
-                mapped[mlen++] = (char)0x81;
-            } else {
-                mapped[mlen++] = text[i];
-            }
+    /* Workspace sized to the full text (BPE path only; freed at exit). */
+    uint32_t *cps = NULL;
+    int *bofs = NULL, *ends = NULL;
+    char *mapped = NULL;
+    int *beg = NULL, *sln = NULL;
+    if (!t->sp_mode) {
+        cps    = (uint32_t *)malloc(((size_t)len + 1) * sizeof(uint32_t));
+        bofs   = (int *)malloc(((size_t)len + 1) * sizeof(int));
+        ends   = (int *)malloc(((size_t)len + 1) * sizeof(int));
+        mapped = (char *)malloc((size_t)len * 4 + 16);
+        beg    = (int *)malloc(((size_t)len * 4 + 4) * sizeof(int));
+        sln    = (int *)malloc(((size_t)len * 4 + 4) * sizeof(int));
+        if (!cps || !bofs || !ends || !mapped || !beg || !sln) {
+            free(cps); free(bofs); free(ends); free(mapped); free(beg); free(sln);
+            return n_out;
         }
-        while (pos < mlen && n_out < max_tokens) {
-            int rem = mlen - pos;
-            int L = rem < t->max_piece ? rem : t->max_piece;
-            int best = -1;
-            for (; L >= 1; L--) {
-                best = hm_get(&t->tok2id, mapped + pos, L);
-                if (best >= 0) break;
-            }
-            if (best < 0) {
-                /* unknown byte -> <0xNN> fallback */
-                char fb[8];
-                const int fl = snprintf(fb, sizeof(fb), "<0x%02X>",
-                                        (unsigned char)mapped[pos]);
-                best = hm_get(&t->tok2id, fb, fl);
-                L = 1;
-            }
-            if (best < 0) { pos++; continue; }   /* no fallback token: skip byte */
-            /* SP convention: BOS (<s>) leads every sequence when defined */
-            if (n_out == 0 && t->base.bos_id >= 0)
-                out_tokens[n_out++] = t->base.bos_id;
-            out_tokens[n_out++] = best;
-            pos += L;
-        }
-        free(mapped);
-        return n_out;
-    }
-
-    /* workspace sized to the full text (freed at exit) */
-    uint32_t *cps   = (uint32_t *)malloc(((size_t)len + 1) * sizeof(uint32_t));
-    int *bofs       = (int *)malloc(((size_t)len + 1) * sizeof(int));
-    int *ends       = (int *)malloc(((size_t)len + 1) * sizeof(int));
-    char *mapped    = (char *)malloc((size_t)len * 4 + 16);
-    int *beg        = (int *)malloc(((size_t)len * 4 + 4) * sizeof(int));
-    int *sln        = (int *)malloc(((size_t)len * 4 + 4) * sizeof(int));
-    if (!cps || !bofs || !ends || !mapped || !beg || !sln) {
-        free(cps); free(bofs); free(ends); free(mapped); free(beg); free(sln);
-        return n_out;
     }
 
     while (pos < len && n_out < max_tokens) {
-        /* verbatim special <|name|> tokens first */
-        int sp_len = 0;
-        const int sp_id = match_special(t, text, len, pos, &sp_len);
+        /* Longest-match verbatim special-token span (e.g. <|turn|>, <|im_start|>,
+         * <start_of_turn>, <bos>). Built at init from the vocab so the same
+         * id the model was trained on is emitted as a single token instead of
+         * being split into '<', '|', 'turn', '|', '>' byte-fallback pieces. */
+        const int sp_id = specials_match(t, text, len, pos);
         if (sp_id >= 0) {
+            /* resolve the matched specials entry's string length (cheap
+             * linear scan over a small table) */
+            int sl = 0;
+            for (int i = 0; i < t->n_specials; i++)
+                if (t->specials[i].id == sp_id) { sl = t->specials[i].n; break; }
+            /* SP convention: emit a leading BOS only if the first token
+             * isn't already a control token. The first-segment SP loop
+             * below used to do this; we hoist it out so a literal "<|turn|>"
+             * at position 0 doesn't double-BOS. */
+            if (n_out == 0 && t->sp_mode && t->base.bos_id >= 0
+                && sp_id != t->base.bos_id)
+                out_tokens[n_out++] = t->base.bos_id;
             out_tokens[n_out++] = sp_id;
-            pos += sp_len;
+            pos += sl;
             continue;
         }
-        /* segment ends at the next resolvable special token start */
+
+        /* Find the next '<...' special-token start so we can process the
+         * non-special span in one chunk. If none, run to end of input. */
         int seg_end = len;
-        for (int q = pos + 1; q + 1 < len; q++) {
-            if (text[q] == '<' && text[q + 1] == '|') {
-                int l2 = 0;
-                if (match_special(t, text, len, q, &l2) >= 0) { seg_end = q; break; }
+        for (int q = pos; q < len; q++) {
+            if (text[q] == '<' && specials_match(t, text, len, q) >= 0) {
+                seg_end = q; break;
             }
         }
-        n_out += encode_bpe_segment(t, text + pos, seg_end - pos,
-                                    cps, bofs, ends, mapped, beg, sln,
-                                    out_tokens + n_out, max_tokens - n_out);
+
+        if (t->sp_mode) {
+            /* SP path: greedy longest-piece on the raw span with '▁' mapping.
+             * Only the first span gets add_dummy_prefix '▁' (mirrors
+             * llama.cpp behavior: the virtual prefix is at sequence start).
+             * The first-span BOS is also emitted here for the same reason. */
+            const int is_first = (pos == 0);
+            if (is_first && n_out == 0 && t->base.bos_id >= 0)
+                out_tokens[n_out++] = t->base.bos_id;
+            n_out += encode_sp_segment(t, text + pos, seg_end - pos, is_first,
+                                       out_tokens + n_out, max_tokens - n_out);
+        } else {
+            n_out += encode_bpe_segment(t, text + pos, seg_end - pos,
+                                        cps, bofs, ends, mapped, beg, sln,
+                                        out_tokens + n_out, max_tokens - n_out);
+        }
         pos = seg_end;
     }
 
@@ -826,6 +957,7 @@ void bpe_tokenizer_free(BPETokenizer *tok_) {
     }
     free(tok_->token_lens);
     free(tok_->scores);
+    free(t->specials);
     hm_free(&t->pair_rank);
     hm_free(&t->tok2id);
     free(t);
