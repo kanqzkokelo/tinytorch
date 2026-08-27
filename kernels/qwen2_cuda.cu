@@ -629,6 +629,27 @@ __global__ void k_embed_q6_K_dyn(const uint8_t *__restrict__ W, const int *__res
     }
 }
 
+/* M9.6: q8_0 + f16 dyn-embed for cudaGraph replay. */
+__global__ void k_embed_q8_0_dyn(const uint8_t *W, const int *d_tok, float *dx, int dim) {
+    const int tok = *d_tok, b = threadIdx.x + blockIdx.x * blockDim.x, nb = dim / 32;
+    if (b >= nb) return;
+    const float d = __half2float(*(const __half *)(W + (long)tok * nb * 34 + b * 34));
+    const int8_t *qs = (const int8_t *)(W + (long)tok * nb * 34 + b * 34 + 2);
+    float *out = dx + b * 32;
+    for (int j = 0; j < 32; j++) out[j] = (float)qs[j] * d;
+}
+__global__ void k_embed_f16_dyn(const uint8_t *W, const int *d_tok, float *dx, int dim) {
+    const int tok = *d_tok, i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= dim) return;
+    dx[i] = __half2float(((const __half *)((const char *)W + (long)tok * dim * 2))[i]);
+}
+#define LAUNCH_EMBED_DYN(edt, p, tok, dx, dim) do { \
+    if      ((edt) == GGUF_TYPE_Q4_0) { int _t=(dim)/32; k_embed_q4_0_dyn<<<(_t+255)/256,256,0,e->stream>>>((const BlockQ4_0 *)(p),(tok),(dx),(dim)); } \
+    else if ((edt) == GGUF_TYPE_Q8_0) { int _t=(dim)/32; k_embed_q8_0_dyn<<<(_t+255)/256,256,0,e->stream>>>((const uint8_t *)(p),(tok),(dx),(dim)); } \
+    else if ((edt) == GGUF_TYPE_F16)  { k_embed_f16_dyn<<<((dim)+255)/256,256,0,e->stream>>>((const uint8_t *)(p),(tok),(dx),(dim)); } \
+    else { int _nu=((dim)/256)*8; k_embed_q6_K_dyn<<<(_nu+255)/256,256,0,e->stream>>>((const uint8_t *)(p),(tok),(dx),(dim)); } \
+} while (0)
+
 /* Position increment INSIDE the captured region: each replay advances the
  * device position scalar exactly once (host mirror does e->pos++ in lockstep). */
 __global__ void k_pos_inc(int *d_pos) { (*d_pos)++; }
@@ -712,6 +733,24 @@ struct LayerW {
     /* M7 task 2: weights are type-blind {ptr, GGML type} pairs; the GEMV
      * dispatcher picks the kernel from `dtype`. */
     TTensor q, k, v, o, gate, up, down;
+    /* M9.5 fused QKV / gateup. Allocated at load time when q/k/v (or
+     * gate/up) share dtype: q/k/v bytes are copied back-to-back into one
+     * device buffer so the per-layer dispatch launches ONE gemv of M
+     * rows instead of 2 or 3. The original TTensor ptrs stay valid for
+     * the existing kernel paths (k_add bias, qk_norm, scatter) which
+     * only read/write the per-tensor float output regions, but the
+     * decode-stage gemv calls now go through qkv_ptr / gateup_ptr.
+     * The dispatch layer aliases d_q / d_k_stage / d_v_stage / d_g / d_u
+     * into a single d_qkv_stage staging buffer so the existing post-gemv
+     * kernels see contiguous per-tensor data at the right offsets. */
+    void *qkv_ptr;                    /* fused QKV weights (NULL = no fusion) */
+    int   qkv_dtype;                  /* shared dtype (q.dtype == k.dtype == v.dtype) */
+    int   qkv_M;                      /* qout + 2*kvdim (= H*HD + 2*KV*HD) per layer */
+    int   qkv_size_bytes;             /* byte length of qkv_ptr allocation */
+    void *gateup_ptr;                 /* fused gate+up weights (NULL = no fusion) */
+    int   gateup_dtype;               /* shared dtype */
+    int   gateup_M;                   /* 2*FF_l per layer */
+    int   gateup_size_bytes;          /* byte length of gateup_ptr allocation */
     float *attn_norm, *ffn_norm;      /* device f32 gammas */
     float *post_attn_norm, *post_ffn_norm; /* gemma2 sandwich norms (optional) */
     TTensor inp_gate, pl_proj;        /* gemma4 MatFormer per-layer block */
@@ -732,6 +771,11 @@ struct Qwen2Engine {
     float *d_out_norm;
     /* activations */
     float *d_x, *d_xn, *d_q, *d_att, *d_h, *d_logits;
+    /* M9.5 unified staging: per-layer Q/K/V + gate/up output floats aliased
+     * into a single allocation. Layout: [Q | K | V | G | U] floats, per-layer
+     * offsets are recomputed in forward_layers() so the worst-case
+     * (gemma4 full layers w/ hd=512) still fits in the allocation. */
+    float *d_qkv_stage;
     /* split-SwiGLU staging for non-q4_0 gate/up dtypes (fused q4_0 path
      * keeps using d_h only) */
     float *d_g, *d_u;
@@ -1015,11 +1059,16 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
                 "hd0=%d hd4=%d\n", max_heads, max_kv, max_ffn,
                 e->pl_hd[0], e->pl_hd[4]);
     }
-    cudaMalloc(&e->d_q,  max_qout * sizeof(float));
     cudaMalloc(&e->d_att, max_qout * sizeof(float));
     cudaMalloc(&e->d_h,  max_ffn * sizeof(float));
-    cudaMalloc(&e->d_g,  max_ffn * sizeof(float));   /* split-SwiGLU staging */
-    cudaMalloc(&e->d_u,  max_ffn * sizeof(float));
+    /* M9.5 unified QKV+gateup staging: per-layer offsets into one big
+     * allocation. d_q / d_k_stage / d_v_stage / d_g / d_u are NOT
+     * individually allocated; forward_layers() sets them as offsets
+     * inside d_qkv_stage before each layer runs. */
+    const long kvdim_alloc = (long)max_kv * cfg->head_dim;   /* per-layer max */
+    const long qkv_stage_n = (long)max_qout + 2 * kvdim_alloc + 2 * max_ffn;
+    cudaMalloc(&e->d_qkv_stage, qkv_stage_n * sizeof(float));
+    e->d_q = e->d_k_stage = e->d_v_stage = e->d_g = e->d_u = NULL;  /* set per-layer */
     /* gemma4 MatFormer per-layer embeddings */
     e->has_pl_embd = 0;
     e->pl_dim = 0;
@@ -1104,18 +1153,11 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     cudaMemset(e->d_kc, 0, cache_per * cfg->n_layers * sizeof(float));
     cudaMemset(e->d_vc, 0, cache_per * cfg->n_layers * sizeof(float));
     cudaMemset(e->d_xn, 0, D * sizeof(float));
-    cudaMemset(e->d_q, 0, max_qout * sizeof(float));
     cudaMemset(e->d_att, 0, max_qout * sizeof(float));
     cudaMemset(e->d_h, 0, F * sizeof(float));
-    cudaMemset(e->d_g, 0, F * sizeof(float));
-    cudaMemset(e->d_u, 0, F * sizeof(float));
+    cudaMemset(e->d_qkv_stage, 0, qkv_stage_n * sizeof(float));
     cudaMemset(e->d_logits, 0, (long)e->cfg.vocab * sizeof(float));
     cudaMemset(e->d_x, 0, D * sizeof(float));
-    const long kvdim_alloc = (long)max_kv * cfg->head_dim;   /* per-layer max */
-    cudaMalloc(&e->d_k_stage, kvdim_alloc * sizeof(float));
-    cudaMalloc(&e->d_v_stage, kvdim_alloc * sizeof(float));
-    cudaMemset(e->d_k_stage, 0, kvdim_alloc * sizeof(float));
-    cudaMemset(e->d_v_stage, 0, kvdim_alloc * sizeof(float));
     cudaMalloc(&e->d_pos, sizeof(int));
     cudaMemsetAsync(e->d_pos, 0, sizeof(int), e->stream);   /* pos starts at 0 on device */
     const int nb = 256;
@@ -1975,12 +2017,10 @@ static int sample_eager(Qwen2Engine *e) {
 static int qwen2_engine_graph_capture(Qwen2Engine *e) {
     const TTConfig *c = &e->cfg;
 
-    /* M9.5: dynamic-token embed kernel is now provided for q4_0 AND q6_k.
-     * Other dtypes (q8_0, f16, q4_k/q5_k, etc.) still lack an in-graph
-     * variant; fall back to eager for those. Captured graph works for
-     * qwen2.5 (q4_0), llama-3.2 (q6_k despite filename), gemma2 (q6_k). */
+    /* M9.6: +q8_0 +f16 → all 4 bench models graph_captured. */
     const int edt = e->d_embd.dtype;
-    if (edt != GGUF_TYPE_Q4_0 && edt != GGUF_TYPE_Q6_K) return -1;
+    if (edt != GGUF_TYPE_Q4_0 && edt != GGUF_TYPE_Q6_K &&
+        edt != GGUF_TYPE_Q8_0 && edt != GGUF_TYPE_F16) return -1;
 
     /* dummy valid token before capture begins (plain, uncaptured copy) */
     const int dummy = e->pending_tok >= 0 ? e->pending_tok : 0;
@@ -1999,15 +2039,7 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
         cudaMemcpy(xsave, e->d_x, c->dim * sizeof(float), cudaMemcpyDeviceToHost);
         cudaMemcpy(lsave, e->d_logits, c->vocab * sizeof(float), cudaMemcpyDeviceToDevice);
         const int pos_before = e->pos;
-        if (edt == GGUF_TYPE_Q4_0) {
-            const int threads = c->dim / 32;
-            k_embed_q4_0_dyn<<<(threads + 255) / 256, 256, 0, e->stream>>>(
-                (const BlockQ4_0 *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
-        } else { /* GGUF_TYPE_Q6_K */
-            const int nu = (c->dim / 256) * 8;
-            k_embed_q6_K_dyn<<<(nu + 255) / 256, 256, 0, e->stream>>>(
-                (const uint8_t *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
-        }
+        LAUNCH_EMBED_DYN(edt, e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
         k_pos_inc<<<1, 1, 0, e->stream>>>(e->d_pos);
         k_repeat_penalty<<<1, 256, 0, e->stream>>>(e->d_logits, e->d_recent,
                                                    e->d_n_recent, c->vocab, 2.0f);
@@ -2027,17 +2059,7 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
         return -1;
     }
 
-    {   /* dynamic-token embedding (device-side id) */
-        if (edt == GGUF_TYPE_Q4_0) {
-            const int threads = c->dim / 32;
-            k_embed_q4_0_dyn<<<(threads + 255) / 256, 256, 0, e->stream>>>(
-                (const BlockQ4_0 *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
-        } else { /* GGUF_TYPE_Q6_K */
-            const int nu = (c->dim / 256) * 8;
-            k_embed_q6_K_dyn<<<(nu + 255) / 256, 256, 0, e->stream>>>(
-                (const uint8_t *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
-        }
-    }
+    LAUNCH_EMBED_DYN(edt, e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
     /* gemma families: scale embeddings by sqrt(dim) right after the
      * dynamic embed (matches embed_token() in the eager path; without it
      * gemma2/graph diverges from gemma2/eager in 1-2 steps). Host branch
