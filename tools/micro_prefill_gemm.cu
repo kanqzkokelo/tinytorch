@@ -10,7 +10,7 @@
 #include "../kernels/gemv_q4_cuda.cu"
 
 /*
- * 2D Tiled Q4_0 Batched GEMM Kernel for Prompt Prefill (Conflict-Free Shmem)
+ * 2D Tiled Q4_0 Batched GEMM Kernel for Prompt Prefill
  * Matrix math: Y = X * W^T
  *   X: [N, K] float (row-major activations)
  *   W: [M, K] BlockQ4_0 (row-major quantized weights)
@@ -20,9 +20,9 @@
  * Threads per CTA: dim3 block(16, 16) = 256 threads
  * Register tiling: 2 tokens (N) x 4 rows (M) per thread => 8 accumulators per thread
  * Shared memory:
- *   __shared__ float sX[32][33] (padding +1 to eliminate 32-bank conflicts)
- *   __shared__ float sW_d[65]   (padding +1)
- *   __shared__ uint32_t sW_v[64][5] (padding +1 to eliminate bank conflicts)
+ *   __shared__ float sX[32][33]      (padding +1 to eliminate 32-bank conflicts)
+ *   __shared__ float sW_d[65]        (padding +1)
+ *   __shared__ uint32_t sW_v[64][5]  (padding +1 to eliminate 32-bank conflicts)
  */
 __global__ __launch_bounds__(256, 4)
 void k_gemm_q4_0_prefill(
@@ -38,7 +38,7 @@ void k_gemm_q4_0_prefill(
     const int m_base = blockIdx.x * 64 + tx * 4;
     const int n_base = blockIdx.y * 32 + ty * 2;
 
-    const int nb = K / 32; // blocks per row
+    const int nb = K / 32; // q4_0 blocks per row
 
     __shared__ float sX[32][33];
     __shared__ float sW_d[65];
@@ -59,7 +59,7 @@ void k_gemm_q4_0_prefill(
     const int n_global = blockIdx.y * 32 + n_load;
 
     for (int k_tile = 0; k_tile < nb; k_tile++) {
-        // 1. Cooperative load X tile into sX
+        // 1. Cooperative load X tile into sX (bank-conflict free: sX[32][33])
         const int k_global = k_tile * 32 + k_vec_load * 4;
         float4 x_vec;
         if (n_global < N && (k_global + 3) < K) {
@@ -182,7 +182,7 @@ void k_gemm_q4_0_prefill(
             for (int im = 0; im < 4; im++) {
                 int m_g = m_base + im;
                 if (m_g < M) {
-                    dY[n_g * M + m_g] = acc[in][im];
+                    dY[(long)n_g * M + m_g] = acc[in][im];
                 }
             }
         }
