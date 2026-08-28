@@ -111,6 +111,7 @@ int qwen2_engine_step_logits(Qwen2Engine *e, int tok, float *host_logits);
 int tt_gemm_q4_0_prefill(const void *dW, const float *dX_NxK, float *dY_NxM, int M, int K, int N, cudaStream_t s);
 int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out);
 
+void qwen2_engine_reset(Qwen2Engine *e);
 void qwen2_engine_free(Qwen2Engine *e);
 
 #ifdef __cplusplus

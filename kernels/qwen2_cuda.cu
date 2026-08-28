@@ -1924,6 +1924,12 @@ static int advance(Qwen2Engine *e, int tok) {
     return 0;
 }
 
+void qwen2_engine_reset(Qwen2Engine *e) {
+    if (!e) return;
+    e->pos = 0;
+    cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
+}
+
 int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out) {
     if (!e || !toks || n <= 0) return -1;
     const TTConfig *c = &e->cfg;
@@ -1944,6 +1950,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
 
     float *d_X = NULL, *d_Xn = NULL, *d_Q = NULL, *d_K = NULL, *d_V = NULL;
     float *d_Att = NULL, *d_H = NULL, *d_G = NULL, *d_U = NULL;
+    int *d_pos_batch = NULL;
 
     if (cudaMalloc(&d_X, (size_t)n * dim * sizeof(float)) != cudaSuccess) return -3;
     if (cudaMalloc(&d_Xn, (size_t)n * dim * sizeof(float)) != cudaSuccess) return -4;
@@ -1965,6 +1972,16 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
     if (cudaMalloc(&d_H, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) return -9;
     if (cudaMalloc(&d_G, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) return -10;
     if (cudaMalloc(&d_U, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) return -11;
+    if (cudaMalloc(&d_pos_batch, (size_t)n * sizeof(int)) != cudaSuccess) return -12;
+
+    int *h_pos_batch = (int *)malloc((size_t)n * sizeof(int));
+    if (!h_pos_batch) return -13;
+    const int pos0 = e->pos;
+    for (int i = 0; i < n; i++) {
+        h_pos_batch[i] = pos0 + i;
+    }
+    cudaMemcpy(d_pos_batch, h_pos_batch, (size_t)n * sizeof(int), cudaMemcpyHostToDevice);
+    free(h_pos_batch);
 
     for (int i = 0; i < n; i++) {
         tt_embed_typed(e->d_embd.ptr, e->d_embd.dtype, toks[i],
@@ -1974,8 +1991,6 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
                 d_X + (long)i * dim, sqrtf((float)dim), dim);
         }
     }
-
-    const int pos0 = e->pos;
 
     for (int l = 0; l < c->n_layers; l++) {
         LayerW *w = &e->L[l];
@@ -2053,34 +2068,33 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         dim3 g_k((HDl / 2 + 63) / 64, KV_l, 1);
 
         for (int i = 0; i < n; i++) {
-            int pos_i = pos0 + i;
-            cudaMemcpy(e->d_pos, &pos_i, sizeof(int), cudaMemcpyHostToDevice);
+            const int *d_pos_i = d_pos_batch + i;
 
             static int no_rope = -1;
             if (no_rope < 0) no_rope = getenv("TT_NO_ROPE") ? 1 : 0;
             if (!no_rope) {
                 if (ff_l)
-                    k_rope_ff<<<g_q, b_rope, 0, e->stream>>>(d_Q + (long)i * attn_qout, H_l, HDl, e->d_pos, base_l, ff_l);
+                    k_rope_ff<<<g_q, b_rope, 0, e->stream>>>(d_Q + (long)i * attn_qout, H_l, HDl, d_pos_i, base_l, ff_l);
                 else
-                    rope_fn<<<g_q, b_rope, 0, e->stream>>>(d_Q + (long)i * attn_qout, H_l, HDl, e->d_pos, base_l);
+                    rope_fn<<<g_q, b_rope, 0, e->stream>>>(d_Q + (long)i * attn_qout, H_l, HDl, d_pos_i, base_l);
 
                 if (!kv_shared) {
                     if (ff_l)
-                        k_rope_ff<<<g_k, b_rope, 0, e->stream>>>(d_K + (long)i * kvdim_l, KV_l, HDl, e->d_pos, base_l, ff_l);
+                        k_rope_ff<<<g_k, b_rope, 0, e->stream>>>(d_K + (long)i * kvdim_l, KV_l, HDl, d_pos_i, base_l, ff_l);
                     else
-                        rope_fn<<<g_k, b_rope, 0, e->stream>>>(d_K + (long)i * kvdim_l, KV_l, HDl, e->d_pos, base_l);
+                        rope_fn<<<g_k, b_rope, 0, e->stream>>>(d_K + (long)i * kvdim_l, KV_l, HDl, d_pos_i, base_l);
                 }
             }
 
             if (!kv_shared) {
                 k_kv_scatter<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(
-                    d_K + (long)i * kvdim_l, d_V + (long)i * kvdim_l, Kl_f, Vl_f, e->d_pos,
+                    d_K + (long)i * kvdim_l, d_V + (long)i * kvdim_l, Kl_f, Vl_f, d_pos_i,
                     KV_l, HDl, c->max_ctx);
             }
 
             k_flash_gqa<<<H_l, 32, 0, e->stream>>>(
                 d_Q + (long)i * attn_qout, Kl_f, Vl_f, d_Att + (long)i * attn_qout,
-                e->d_pos, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l);
+                d_pos_i, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l);
         }
 
         /* 4. O projection */
@@ -2155,7 +2169,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
     cudaStreamSynchronize(e->stream);
 
     cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V);
-    cudaFree(d_Att); cudaFree(d_H); cudaFree(d_G); cudaFree(d_U);
+    cudaFree(d_Att); cudaFree(d_H); cudaFree(d_G); cudaFree(d_U); cudaFree(d_pos_batch);
 
     return 0;
 }
