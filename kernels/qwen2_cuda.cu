@@ -2186,6 +2186,13 @@ int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
     }
     /* resync device position scalar before any forward work (sync: see advance()) */
     cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
+    if (n >= 32 && !e->has_pl_embd && e->cfg.tr.softcap_value == 0.0f) {
+        int rc = prefill_batched_gemm(e, toks, n, NULL);
+        if (rc == 0) {
+            cudaStreamSynchronize(e->stream);
+            return 0;
+        }
+    }
     for (int i = 0; i < n; i++) {
         int rc = advance(e, toks[i]);
         if (rc) return rc;
