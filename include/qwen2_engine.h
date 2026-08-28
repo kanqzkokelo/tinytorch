@@ -8,6 +8,11 @@
 extern "C" {
 #endif
 
+#ifndef CUDA_STREAM_T_DEFINED
+#define CUDA_STREAM_T_DEFINED
+typedef struct CUstream_st *cudaStream_t;
+#endif
+
 /* Model geometry + M7 architecture traits — every field derived from
  * GGUF metadata, never hardcoded. The trait block selects kernel variants
  * at fixed variation points inside the forward pass (rope style, activation,
@@ -100,6 +105,10 @@ int qwen2_debug_copy_logits(Qwen2Engine *e, float *host, int n);
  * spec-verify test to produce a golden set of per-token logits for
  * bit-exact comparison with qwen2_engine_verify_speculative.  */
 int qwen2_engine_step_logits(Qwen2Engine *e, int tok, float *host_logits);
+
+// Batched 2D prefill GEMM: Y [N, M] = X [N, K] * W^T [M, K]
+// W is Q4_0 quantized. Evaluates N prompt tokens in parallel for N >= 32.
+int tt_gemm_q4_0_prefill(const void *dW, const float *dX_NxK, float *dY_NxM, int M, int K, int N, cudaStream_t s);
 
 void qwen2_engine_free(Qwen2Engine *e);
 

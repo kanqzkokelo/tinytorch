@@ -192,6 +192,19 @@ test_batch4_gemv: $(BUILD)/test_batch4_gemv
 
 .PHONY: test_batch4_gemv
 
+# Batched Q4_0 Prefill GEMM multi-boundary correctness test.
+$(BUILD)/test_prefill_gemm: tests/test_prefill_gemm.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu | $(BUILD)
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	  -I$(CUDA_INC) -Iinclude -Xcompiler -fPIC -Xcompiler -fopenmp \
+	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
+	  -o $@ \
+	  tests/test_prefill_gemm.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu \
+	  -L$(HOME)/mmcuda/lib -lcudart -lpthread -lm
+
+test_prefill_gemm: $(BUILD)/test_prefill_gemm
+
+.PHONY: test_prefill_gemm
+
 # CI: cheap CPU-only sanity (no GPU needed) -- same checks as GitHub CI.
 ci:
 	./scripts/ci_local.sh
