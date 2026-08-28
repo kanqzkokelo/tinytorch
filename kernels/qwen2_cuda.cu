@@ -1702,13 +1702,18 @@ static int forward_layers(Qwen2Engine *e) {
     const TTConfig *c = &e->cfg;
     const int HD = c->head_dim;
     long cache_layer = c->n_kv_heads * (long)c->max_ctx * HD;   /* stride matches alloc */
+    long cache_layer_q8 = c->n_kv_heads * (long)c->max_ctx * (HD / 32);
     if (e->pl_hd[0] > 0) {
         long mx = 0;
+        long mx_q8 = 0;
         for (int l = 0; l < c->n_layers; l++) {
             const long w2 = (long)e->pl_kv[l] * e->pl_hd[l];
             if (w2 > mx) mx = w2;
+            const long w2_q8 = (long)e->pl_kv[l] * (e->pl_hd[l] / 32);
+            if (w2_q8 > mx_q8) mx_q8 = w2_q8;
         }
         cache_layer = mx * c->max_ctx;
+        cache_layer_q8 = mx_q8 * c->max_ctx;
     }
     dim3 g, b;
 
@@ -1718,6 +1723,8 @@ static int forward_layers(Qwen2Engine *e) {
         LayerW *w = &e->L[l];
         float *Kl_f = e->d_kc + l * cache_layer;
         float *Vl_f = e->d_vc + l * cache_layer;
+        BlockQ8_0 *Kl_q8 = e->d_kc_q8 ? (e->d_kc_q8 + (long)l * cache_layer_q8) : NULL;
+        BlockQ8_0 *Vl_q8 = e->d_vc_q8 ? (e->d_vc_q8 + (long)l * cache_layer_q8) : NULL;
         /* gemma4 KV sharing: shared layers (pl_src[l] >= 0) read the source
          * layer's cache slab instead of computing/scattering their own K/V.
          * llama-model.cpp:2502 semantics. */
@@ -1725,6 +1732,10 @@ static int forward_layers(Qwen2Engine *e) {
         if (kv_shared) {
             Kl_f = e->d_kc + (long)e->pl_src[l] * cache_layer;
             Vl_f = e->d_vc + (long)e->pl_src[l] * cache_layer;
+            if (e->d_kc_q8) {
+                Kl_q8 = e->d_kc_q8 + (long)e->pl_src[l] * cache_layer_q8;
+                Vl_q8 = e->d_vc_q8 + (long)e->pl_src[l] * cache_layer_q8;
+            }
         }
         if (trace) fprintf(stderr, "[FWD] L%d enter\n", l);
 
@@ -1832,9 +1843,16 @@ static int forward_layers(Qwen2Engine *e) {
          * source layer's already-populated slab. */
         if (!kv_shared) {
         if (tt_profiling()) tt_prof_begin(TT_P_SCATTER, e->stream);
-        k_kv_scatter<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(
-            e->d_k_stage, e->d_v_stage, Kl_f, Vl_f, e->d_pos,
-            KV_l, HDl, c->max_ctx);
+        if (e->use_q8_kvcache) {
+            const int num_blocks = kvdim_l / 32;
+            k_kv_scatter_q8_0<<<(num_blocks + 255) / 256, 256, 0, e->stream>>>(
+                e->d_k_stage, e->d_v_stage, Kl_q8, Vl_q8, e->d_pos,
+                KV_l, HDl, c->max_ctx);
+        } else {
+            k_kv_scatter<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(
+                e->d_k_stage, e->d_v_stage, Kl_f, Vl_f, e->d_pos,
+                KV_l, HDl, c->max_ctx);
+        }
         if (tt_profiling()) tt_prof_end(TT_P_SCATTER, e->stream);
         }
 
@@ -1853,29 +1871,54 @@ static int forward_layers(Qwen2Engine *e) {
         {
             const int ctx_l = e->pos;            /* host mirror of *d_pos */
             const float scale_l = c->tr.attn_scale_one ? 1.0f
-                              : 1.0f / sqrtf((float)HD);   /* match prior kernel arg */
+                              : 1.0f / sqrtf((float)HDl);   /* match prior kernel arg */
             const int swa_l = e->has_pl_embd ? e->pl_swa[l] : c->tr.swa_size;
-            if (ctx_l > 128) {
-                int S = ctx_l / 256;
-                if (S < 2) S = 2;
-                if (S > 16) S = 16;
-                if (S > e->d_split_S_max) S = e->d_split_S_max;
-                dim3 grid_split(H_l, S);
-                k_flash_gqa_splitk<<<grid_split, 32, 0, e->stream>>>(
-                    e->d_q, Kl_f, Vl_f,
-                    e->d_split_pacc, e->d_split_pm, e->d_split_pl,
-                    e->d_pos,
-                    H_l, KV_l, HDl,
-                    scale_l, swa_l, S);
-                k_flash_gqa_combine<<<H_l, 32, 0, e->stream>>>(
-                    e->d_split_pacc, e->d_split_pm, e->d_split_pl,
-                    e->d_att, H_l, HDl, S);
+            if (e->use_q8_kvcache) {
+                if (ctx_l > 128) {
+                    int S = ctx_l / 256;
+                    if (S < 2) S = 2;
+                    if (S > 16) S = 16;
+                    if (S > e->d_split_S_max) S = e->d_split_S_max;
+                    dim3 grid_split(H_l, S);
+                    k_flash_gqa_q8_0_splitk<<<grid_split, 32, 0, e->stream>>>(
+                        e->d_q, Kl_q8, Vl_q8,
+                        e->d_split_pacc, e->d_split_pm, e->d_split_pl,
+                        e->d_pos,
+                        H_l, KV_l, HDl,
+                        scale_l, swa_l, S);
+                    k_flash_gqa_combine<<<H_l, 32, 0, e->stream>>>(
+                        e->d_split_pacc, e->d_split_pm, e->d_split_pl,
+                        e->d_att, H_l, HDl, S);
+                } else {
+                    k_flash_gqa_q8_0<<<H_l, 32, 0, e->stream>>>(
+                        e->d_q, Kl_q8, Vl_q8, e->d_att,
+                        e->d_pos,
+                        H_l, KV_l, HDl, c->max_ctx,
+                        scale_l, swa_l);
+                }
             } else {
-                k_flash_gqa<<<H_l, 32, 0, e->stream>>>(
-                    e->d_q, Kl_f, Vl_f, e->d_att,
-                    e->d_pos,
-                    H_l, KV_l, HDl, c->max_ctx,
-                    scale_l, swa_l);
+                if (ctx_l > 128) {
+                    int S = ctx_l / 256;
+                    if (S < 2) S = 2;
+                    if (S > 16) S = 16;
+                    if (S > e->d_split_S_max) S = e->d_split_S_max;
+                    dim3 grid_split(H_l, S);
+                    k_flash_gqa_splitk<<<grid_split, 32, 0, e->stream>>>(
+                        e->d_q, Kl_f, Vl_f,
+                        e->d_split_pacc, e->d_split_pm, e->d_split_pl,
+                        e->d_pos,
+                        H_l, KV_l, HDl,
+                        scale_l, swa_l, S);
+                    k_flash_gqa_combine<<<H_l, 32, 0, e->stream>>>(
+                        e->d_split_pacc, e->d_split_pm, e->d_split_pl,
+                        e->d_att, H_l, HDl, S);
+                } else {
+                    k_flash_gqa<<<H_l, 32, 0, e->stream>>>(
+                        e->d_q, Kl_f, Vl_f, e->d_att,
+                        e->d_pos,
+                        H_l, KV_l, HDl, c->max_ctx,
+                        scale_l, swa_l);
+                }
             }
         }
         if (tt_profiling()) tt_prof_end(TT_P_FLASH, e->stream);
@@ -2333,13 +2376,18 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
     const int hidden_dim = c->hidden_dim;
     const int HD = c->head_dim;
     long cache_layer = c->n_kv_heads * (long)c->max_ctx * HD;
+    long cache_layer_q8 = c->n_kv_heads * (long)c->max_ctx * (HD / 32);
     if (e->pl_hd[0] > 0) {
         long mx = 0;
+        long mx_q8 = 0;
         for (int l = 0; l < c->n_layers; l++) {
             const long w2 = (long)e->pl_kv[l] * e->pl_hd[l];
             if (w2 > mx) mx = w2;
+            const long w2_q8 = (long)e->pl_kv[l] * (e->pl_hd[l] / 32);
+            if (w2_q8 > mx_q8) mx_q8 = w2_q8;
         }
         cache_layer = mx * c->max_ctx;
+        cache_layer_q8 = mx_q8 * c->max_ctx;
     }
 
     float *d_X = NULL, *d_Xn = NULL, *d_Q = NULL, *d_K = NULL, *d_V = NULL;
@@ -2390,10 +2438,16 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         LayerW *w = &e->L[l];
         float *Kl_f = e->d_kc + (long)l * cache_layer;
         float *Vl_f = e->d_vc + (long)l * cache_layer;
+        BlockQ8_0 *Kl_q8 = e->d_kc_q8 ? (e->d_kc_q8 + (long)l * cache_layer_q8) : NULL;
+        BlockQ8_0 *Vl_q8 = e->d_vc_q8 ? (e->d_vc_q8 + (long)l * cache_layer_q8) : NULL;
         const int kv_shared = e->has_pl_embd && e->pl_src[l] >= 0;
         if (kv_shared) {
             Kl_f = e->d_kc + (long)e->pl_src[l] * cache_layer;
             Vl_f = e->d_vc + (long)e->pl_src[l] * cache_layer;
+            if (e->d_kc_q8) {
+                Kl_q8 = e->d_kc_q8 + (long)e->pl_src[l] * cache_layer_q8;
+                Vl_q8 = e->d_vc_q8 + (long)e->pl_src[l] * cache_layer_q8;
+            }
         }
 
         const int H_l = e->pl_heads[l] > 0 ? e->pl_heads[l] : c->n_heads;
@@ -2481,14 +2535,27 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
             }
 
             if (!kv_shared) {
-                k_kv_scatter<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(
-                    d_K + (long)i * kvdim_l, d_V + (long)i * kvdim_l, Kl_f, Vl_f, d_pos_i,
-                    KV_l, HDl, c->max_ctx);
+                if (e->use_q8_kvcache) {
+                    const int num_blocks = kvdim_l / 32;
+                    k_kv_scatter_q8_0<<<(num_blocks + 255) / 256, 256, 0, e->stream>>>(
+                        d_K + (long)i * kvdim_l, d_V + (long)i * kvdim_l, Kl_q8, Vl_q8, d_pos_i,
+                        KV_l, HDl, c->max_ctx);
+                } else {
+                    k_kv_scatter<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(
+                        d_K + (long)i * kvdim_l, d_V + (long)i * kvdim_l, Kl_f, Vl_f, d_pos_i,
+                        KV_l, HDl, c->max_ctx);
+                }
             }
 
-            k_flash_gqa<<<H_l, 32, 0, e->stream>>>(
-                d_Q + (long)i * attn_qout, Kl_f, Vl_f, d_Att + (long)i * attn_qout,
-                d_pos_i, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l);
+            if (e->use_q8_kvcache) {
+                k_flash_gqa_q8_0<<<H_l, 32, 0, e->stream>>>(
+                    d_Q + (long)i * attn_qout, Kl_q8, Vl_q8, d_Att + (long)i * attn_qout,
+                    d_pos_i, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l);
+            } else {
+                k_flash_gqa<<<H_l, 32, 0, e->stream>>>(
+                    d_Q + (long)i * attn_qout, Kl_f, Vl_f, d_Att + (long)i * attn_qout,
+                    d_pos_i, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l);
+            }
         }
 
         /* 4. O projection */
@@ -2920,12 +2987,17 @@ int qwen2_engine_pos(const Qwen2Engine *e) { return e ? e->pos : -1; }
 extern "C" void qwen2_engine_enable_q8_kvcache(Qwen2Engine *e, int enable) {
     if (!e) return;
     if (enable && (!e->d_kc_q8 || !e->d_vc_q8)) {
-        int max_kv = e->cfg.n_kv_heads;
-        for (int l = 0; l < e->cfg.n_layers; l++) {
-            int kv = e->pl_kv[l] > 0 ? e->pl_kv[l] : e->cfg.n_kv_heads;
-            if (kv > max_kv) max_kv = kv;
+        long cache_per_blocks = (long)e->cfg.n_kv_heads * e->cfg.max_ctx * (e->cfg.head_dim / 32);
+        if (e->pl_hd[0] > 0) {
+            long mx_q8 = 0;
+            for (int l = 0; l < e->cfg.n_layers; l++) {
+                int kv = e->pl_kv[l] > 0 ? e->pl_kv[l] : e->cfg.n_kv_heads;
+                int hd = e->pl_hd[l] > 0 ? e->pl_hd[l] : e->cfg.head_dim;
+                long w2_q8 = (long)kv * (hd / 32);
+                if (w2_q8 > mx_q8) mx_q8 = w2_q8;
+            }
+            cache_per_blocks = mx_q8 * e->cfg.max_ctx;
         }
-        const long cache_per_blocks = (long)max_kv * e->cfg.max_ctx * (e->cfg.head_dim / 32);
         if (!e->d_kc_q8) {
             cudaMalloc(&e->d_kc_q8, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ8_0));
             cudaMemset(e->d_kc_q8, 0, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ8_0));
@@ -2934,6 +3006,7 @@ extern "C" void qwen2_engine_enable_q8_kvcache(Qwen2Engine *e, int enable) {
             cudaMalloc(&e->d_vc_q8, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ8_0));
             cudaMemset(e->d_vc_q8, 0, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ8_0));
         }
+        fprintf(stderr, "[qwen2-engine] Q8_0 KV cache ENABLED (4x DRAM traffic reduction)\n");
     }
     e->use_q8_kvcache = enable;
 }
