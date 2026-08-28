@@ -7,6 +7,7 @@
 // with x[2i], which is NOT the GGML layout and produced wrong dot products).
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <math.h>
@@ -1249,6 +1250,137 @@ void k_gemm_q4_0_prefill(
     }
 }
 
+/*
+ * Tensor Core WMMA Batched Q4_0 Prefill GEMM Kernel
+ * Matrix math: Y = X * W^T
+ *   X: [N, K] float (row-major activations)
+ *   W: [M, K] BlockQ4_0 (row-major quantized weights)
+ *   Y: [N, M] float (row-major output)
+ *
+ * Tile layout: BLOCK_M = 128, BLOCK_N = 32, BLOCK_K = 32
+ * CTA layout: 256 threads (8 warps: 2 warps in N, 4 warps in M)
+ *   warp_n = warp_id / 4 (0..1, each warp computes 16 tokens)
+ *   warp_m = warp_id % 4 (0..3, each warp computes 32 output rows = 2 WMMA tiles)
+ * WMMA fragment sizes: 16x16x16 (matrix_a FP16, matrix_b FP16, accumulator FP32)
+ */
+__global__ __launch_bounds__(256)
+void k_gemm_wmma_q4_0_prefill(
+    const void *__restrict__ dW,
+    const float *__restrict__ dX,
+    float *__restrict__ dY,
+    int M, int K, int N)
+{
+    using namespace nvcuda;
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane = tid % 32;
+
+    const int warp_n = warp_id / 4; // 0..1
+    const int warp_m = warp_id % 4; // 0..3
+
+    const int cta_m_base = blockIdx.x * 128;
+    const int cta_n_base = blockIdx.y * 32;
+
+    const int my_m_base = cta_m_base + warp_m * 32;
+    const int my_n_base = cta_n_base + warp_n * 16;
+
+    __align__(16) __shared__ half s_X[32][32];
+    __align__(16) __shared__ half s_W[128][32];
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag0;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag1;
+    wmma::fill_fragment(c_frag0, 0.0f);
+    wmma::fill_fragment(c_frag1, 0.0f);
+
+    const int nb = K / 32;
+    const int n_k_tiles = K / 32;
+
+    for (int k_tile = 0; k_tile < n_k_tiles; k_tile++) {
+        const int k_base = k_tile * 32;
+
+        // 1. Cooperative load X [32 x 32] = 1024 floats into s_X (Row-Major layout).
+        // 256 threads load 4 floats each.
+        #pragma unroll
+        for (int i = tid; i < 1024; i += 256) {
+            int r = i / 32;
+            int c = i % 32;
+            int g_n = cta_n_base + r;
+            int g_k = k_base + c;
+            s_X[r][c] = (g_n < N && g_k < K) ? __float2half(dX[g_n * K + g_k]) : __float2half(0.0f);
+        }
+
+        // 2. Cooperative load W [128 x 32] = 128 Q4_0 blocks into s_W (Column-Major layout: s_W[m][k]).
+        // 256 threads: 2 threads per row (128 rows). Each thread loads 16 elements.
+        int r_w = tid / 2;    // m row 0..127
+        int sub_k = tid % 2;  // sub_k 0..1 (16 elements: sub_k*16 .. sub_k*16+15)
+        int g_m = cta_m_base + r_w;
+        int blk_idx = k_tile;
+
+        if (g_m < M && k_base < K) {
+            const BlockQ4_0 *blk = (const BlockQ4_0 *)dW + (long)g_m * nb + blk_idx;
+            half d = blk->d;
+            int c_start = sub_k * 16;
+            int is_high = sub_k;
+
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                int q_byte = blk->qs[j];
+                int nib = is_high ? ((q_byte >> 4) & 0xF) : (q_byte & 0xF);
+                s_W[r_w][c_start + j] = __hmul(__int2half_rn(nib - 8), d);
+            }
+        } else {
+            int c_start = sub_k * 16;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                s_W[r_w][c_start + j] = __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+
+        // Accumulate over 2 sub-tiles along K (16 elements each)
+        #pragma unroll
+        for (int k_sub = 0; k_sub < 2; k_sub++) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag0;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag1;
+
+            wmma::load_matrix_sync(a_frag, (half*)&s_X[warp_n * 16][k_sub * 16], 32);
+            wmma::load_matrix_sync(b_frag0, (half*)&s_W[warp_m * 32][k_sub * 16], 32);
+            wmma::load_matrix_sync(b_frag1, (half*)&s_W[warp_m * 32 + 16][k_sub * 16], 32);
+
+            wmma::mma_sync(c_frag0, a_frag, b_frag0, c_frag0);
+            wmma::mma_sync(c_frag1, a_frag, b_frag1, c_frag1);
+        }
+        __syncthreads();
+    }
+
+    // Store output accumulators to DRAM Y [N x M]
+    if (my_n_base + 15 < N) {
+        if (my_m_base + 15 < M) {
+            wmma::store_matrix_sync(dY + my_n_base * M + my_m_base, c_frag0, M, wmma::mem_row_major);
+        }
+        if (my_m_base + 31 < M) {
+            wmma::store_matrix_sync(dY + my_n_base * M + my_m_base + 16, c_frag1, M, wmma::mem_row_major);
+        }
+    } else {
+        __align__(16) __shared__ float s_C[32][128];
+        wmma::store_matrix_sync((float*)&s_C[warp_n * 16][warp_m * 32], c_frag0, 128, wmma::mem_row_major);
+        wmma::store_matrix_sync((float*)&s_C[warp_n * 16][warp_m * 32 + 16], c_frag1, 128, wmma::mem_row_major);
+        __syncthreads();
+        #pragma unroll
+        for (int i = lane; i < 256; i += 32) {
+            int r = i / 16;
+            int c = i % 16;
+            int g_n = my_n_base + r;
+            int g_m = my_m_base + c;
+            if (g_n < N && g_m < M) {
+                dY[g_n * M + g_m] = s_C[warp_n * 16 + r][warp_m * 32 + c];
+            }
+        }
+    }
+}
+
 // ---------------- host launchers ----------------
 extern "C" {
 
@@ -1502,6 +1634,15 @@ int tt_gemm_q4_0_prefill(const void *dW, const float *dX_NxK, float *dY_NxM,
     dim3 grid((M + 63) / 64, (N + 31) / 32);
     dim3 block(16, 16);
     k_gemm_q4_0_prefill<<<grid, block, 0, stream>>>(dW, dX_NxK, dY_NxM, M, K, N);
+    return (int)cudaGetLastError();
+}
+
+int tt_gemm_wmma_q4_0_prefill(const void *dW, const float *dX_NxK, float *dY_NxM,
+                              int M, int K, int N, cudaStream_t stream)
+{
+    dim3 grid((M + 127) / 128, (N + 31) / 32);
+    dim3 block(256);
+    k_gemm_wmma_q4_0_prefill<<<grid, block, 0, stream>>>(dW, dX_NxK, dY_NxM, M, K, N);
     return (int)cudaGetLastError();
 }
 

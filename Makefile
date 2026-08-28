@@ -205,6 +205,19 @@ test_prefill_gemm: $(BUILD)/test_prefill_gemm
 
 .PHONY: test_prefill_gemm
 
+# Tensor Core WMMA Q4_0 Prefill GEMM multi-boundary correctness test.
+$(BUILD)/test_wmma_prefill_gemm: tests/test_wmma_prefill_gemm.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu | $(BUILD)
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	  -I$(CUDA_INC) -Iinclude -Xcompiler -fPIC -Xcompiler -fopenmp \
+	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
+	  -o $@ \
+	  tests/test_wmma_prefill_gemm.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu \
+	  -L$(HOME)/mmcuda/lib -lcudart -lpthread -lm
+
+test_wmma_prefill_gemm: $(BUILD)/test_wmma_prefill_gemm
+
+.PHONY: test_wmma_prefill_gemm
+
 # Layer-0 Parity Diagnostic Test: compares batched prefill GEMM against sequential advance for N=32.
 $(BUILD)/test_prefill_layer_parity: tests/test_prefill_layer_parity.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
 	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
