@@ -45,6 +45,14 @@ int tt_swiglu_q4_0(const void *dGate, const void *dUp, const float *dx,
                    float *dh, int M, int K, cudaStream_t stream);
 int tt_logits_q4_0(const void *dW, const float *dx, float *dlogits,
                    int vocab, int K, cudaStream_t stream);
+/* Fused QKV (Q+K+V in one launch) and fused FFN (Gate+Up+SwiGLU in one
+ * launch) — see include/qwen2_engine.h. Bit-exact with the per-projection
+ * V2/V4 paths. */
+int tt_gemv_q4_0_qkv_fused(const void *W_q, const void *W_k, const void *W_v,
+                           const float *X, float *Y_q, float *Y_k, float *Y_v,
+                           int M_q, int M_k, int M_v, int K, cudaStream_t s);
+int tt_gemv_q4_0_ffn_fused(const void *W_gate, const void *W_up,
+                           const float *X, float *H, int M, int K, cudaStream_t s);
 /* M7 task 2: typed dispatch (kernels/gemv_typed.cu) */
 int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
                   int M, int K, cudaStream_t stream);
@@ -1363,12 +1371,35 @@ static int forward_layers(Qwen2Engine *e) {
         const int HDl = e->pl_hd[l] > 0 ? e->pl_hd[l] : HD;
         const int attn_qout = H_l * HDl;
         const int kvdim_l = KV_l * HDl;
-        int qrc = tt_gemv_layer_dispatch(w->q.ptr, w->q.dtype, e->d_xn, e->d_q,
-                      attn_qout, c->dim, e->stream);
-        if (qrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] q gemv rc=%d\n", qrc);
-        if (!kv_shared) {
-            int krc = tt_gemv_layer_dispatch(w->k.ptr, w->k.dtype, e->d_xn, e->d_k_stage, kvdim_l, c->dim, e->stream);
-            if (krc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] k gemv rc=%d\n", krc);
+        /* Fused QKV path: single launch for Q + K + V when all three are
+         * q4_0, dims are multiples of 4, and K%32==0 (same contract as
+         * the per-projection V4 launcher). Skipped for shared-KV layers
+         * (gemma4 MatFormer), where V is inherited from a source layer. */
+        const int nb_qkv = c->dim / 32;
+        const int qkv_eligible =
+            !kv_shared
+            && w->q.dtype == GGUF_TYPE_Q4_0
+            && w->k.dtype == GGUF_TYPE_Q4_0
+            && w->v.dtype == GGUF_TYPE_Q4_0
+            && (c->dim & 31) == 0
+            && (nb_qkv & 1) == 0
+            && (attn_qout & 3) == 0
+            && (kvdim_l & 3) == 0;
+        int qrc = 0, krc = 0, vrc = 0;
+        if (qkv_eligible) {
+            qrc = tt_gemv_q4_0_qkv_fused(
+                w->q.ptr, w->k.ptr, w->v.ptr,
+                e->d_xn, e->d_q, e->d_k_stage, e->d_v_stage,
+                attn_qout, kvdim_l, kvdim_l, c->dim, e->stream);
+            if (qrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] qkv fused rc=%d\n", qrc);
+        } else {
+            qrc = tt_gemv_layer_dispatch(w->q.ptr, w->q.dtype, e->d_xn, e->d_q,
+                          attn_qout, c->dim, e->stream);
+            if (qrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] q gemv rc=%d\n", qrc);
+            if (!kv_shared) {
+                krc = tt_gemv_layer_dispatch(w->k.ptr, w->k.dtype, e->d_xn, e->d_k_stage, kvdim_l, c->dim, e->stream);
+                if (krc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] k gemv rc=%d\n", krc);
+            }
         }
         /* QKV biases present in some GGUF conversions of Qwen2 (applied by
          * llama.cpp whenever the tensors exist). Optional by design. */
@@ -1421,10 +1452,16 @@ static int forward_layers(Qwen2Engine *e) {
             }
         }
 
-        /* v projection + bias (QKV group) */
+        /* v bias + (optional) V RMSNorm. V projection is issued by the
+         * fused QKV launch at the top of stage 2 (when eligible); only the
+         * bias add and the gemma4 V norm remain here. */
         if (!kv_shared) {
-        int vrc = tt_gemv_layer_dispatch(w->v.ptr, w->v.dtype, e->d_xn, e->d_v_stage, kvdim_l, c->dim, e->stream);
-        if (vrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] v gemv rc=%d\n", vrc);
+        if (qkv_eligible) {
+            if (qrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] v via qkv-fused rc=%d\n", qrc);
+        } else {
+            vrc = tt_gemv_layer_dispatch(w->v.ptr, w->v.dtype, e->d_xn, e->d_v_stage, kvdim_l, c->dim, e->stream);
+            if (vrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] v gemv rc=%d\n", vrc);
+        }
         if (w->v_bias)
             k_add<<<(kvdim + 255) / 256, 256, 0, e->stream>>>(e->d_v_stage, w->v_bias, kvdim);
         /* gemma4: plain per-head RMSNorm on V (no gamma) — ones-gamma trick */
@@ -1526,7 +1563,26 @@ static int forward_layers(Qwen2Engine *e) {
          * Then down projection + residual. */
         if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
         const int act_gelu = (c->tr.act == ACT_GELU) ? 1 : 0;
-        if (w->gate.dtype == GGUF_TYPE_Q4_0 && w->up.dtype == GGUF_TYPE_Q4_0
+        /* Fused FFN path (4-rows/warp Gate+Up+SwiGLU, single launch).
+         * Eligible when: q4_0 weights, SiLU (qwen2/llama/qwen3 — gemma GeGLU
+         * not implemented in the new kernel), K%32==0, nb even, M%4==0.
+         * Falls through to the 2-rows/warp tt_ffn_q4_0 (or typed path) for
+         * the unhandled cases. Bit-exact vs the 2-rows/warp path. */
+        const int nb_ffn = c->dim / 32;
+        const int ffn_eligible =
+            !act_gelu
+            && !e->has_pl_embd
+            && w->gate.dtype == GGUF_TYPE_Q4_0
+            && w->up.dtype == GGUF_TYPE_Q4_0
+            && (c->dim & 31) == 0
+            && (nb_ffn & 1) == 0
+            && (FF_l & 3) == 0;
+        if (ffn_eligible) {
+            int ffrc = tt_gemv_q4_0_ffn_fused(
+                w->gate.ptr, w->up.ptr, e->d_xn, e->d_h,
+                FF_l, c->dim, e->stream);
+            if (ffrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] ffn fused rc=%d\n", ffrc);
+        } else if (w->gate.dtype == GGUF_TYPE_Q4_0 && w->up.dtype == GGUF_TYPE_Q4_0
             && !e->has_pl_embd) {   /* gemma4: force typed path until fused-GELU is validated */
             tt_ffn_q4_0(w->gate.ptr, w->up.ptr, e->d_xn, e->d_h,
                         FF_l, c->dim, act_gelu, e->stream);
