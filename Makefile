@@ -205,6 +205,19 @@ test_logits_q8_v4: $(BUILD)/test_logits_q8_v4
 
 .PHONY: test_logits_q8_v4
 
+# Q8_0 KV Cache Scatter and Flash Attention correctness test.
+$(BUILD)/test_q8_kvcache: tests/test_q8_kvcache.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
+	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
+	  -o $@ \
+	  tests/test_q8_kvcache.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
+	  -L$(HOME)/mmcuda/lib -lcudart -lpthread -lm
+
+test_q8_kvcache: $(BUILD)/test_q8_kvcache
+
+.PHONY: test_q8_kvcache
+
 # Batched Q4_0 Prefill GEMM multi-boundary correctness test.
 $(BUILD)/test_prefill_gemm: tests/test_prefill_gemm.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu | $(BUILD)
 	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \

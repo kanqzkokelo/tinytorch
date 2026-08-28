@@ -111,6 +111,17 @@ int qwen2_engine_step_logits(Qwen2Engine *e, int tok, float *host_logits);
 int tt_logits_q8_0_v4(const void *dW, const float *dx, float *dlogits, int vocab, int K, cudaStream_t s);
 int tt_logits_q8_0(const void *dW, const float *dx, float *dlogits, int vocab, int K, cudaStream_t s);
 
+// Fused QKV: 1 launch for Q + K + V projections sharing input X.
+// Caller must ensure K%32==0, nb=K/32 even, M_q/M_k/M_v multiples of 4.
+int tt_gemv_q4_0_qkv_fused(const void *W_q, const void *W_k, const void *W_v,
+                           const float *X, float *Y_q, float *Y_k, float *Y_v,
+                           int M_q, int M_k, int M_v, int K, cudaStream_t s);
+
+// Fused FFN: 1 launch for Gate + Up + SwiGLU (SiLU). qwen2/llama only.
+// Caller must ensure K%32==0, nb=K/32 even, M multiple of 4.
+int tt_gemv_q4_0_ffn_fused(const void *W_gate, const void *W_up,
+                           const float *X, float *H, int M, int K, cudaStream_t s);
+
 // Batched 2D prefill GEMM: Y [N, M] = X [N, K] * W^T [M, K]
 // W is Q4_0 quantized. Evaluates N prompt tokens in parallel for N >= 32.
 int tt_gemm_q4_0_prefill(const void *dW, const float *dX_NxK, float *dY_NxM, int M, int K, int N, cudaStream_t s);
@@ -122,6 +133,23 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
 
 void qwen2_engine_reset(Qwen2Engine *e);
 void qwen2_engine_free(Qwen2Engine *e);
+
+/* Q8_0 KV Cache APIs */
+void qwen2_engine_enable_q8_kvcache(Qwen2Engine *e, int enable);
+int tt_kv_scatter(const float *kst, const float *vst, float *Kc, float *Vc,
+                  const int *d_pos, int n_kv_heads, int head_dim, int max_ctx, cudaStream_t stream);
+int tt_flash_gqa(const float *q, const float *Kc, const float *Vc, float *out,
+                 const int *d_pos, int n_heads, int n_kv_heads, int head_dim,
+                 int max_ctx, float scale, int window, cudaStream_t stream);
+int tt_kv_scatter_q8_0(const float *kst, const float *vst, void *Kc_q8, void *Vc_q8,
+                       const int *d_pos, int n_kv_heads, int head_dim, int max_ctx, cudaStream_t stream);
+int tt_flash_gqa_q8_0(const float *q, const void *Kc_q8, const void *Vc_q8, float *out,
+                      const int *d_pos, int n_heads, int n_kv_heads, int head_dim,
+                      int max_ctx, float scale, int window, cudaStream_t stream);
+int tt_flash_gqa_q8_0_splitk(const float *q, const void *Kc_q8, const void *Vc_q8,
+                             float *p_acc, float *p_m, float *p_l, float *out,
+                             const int *d_pos, int n_heads, int n_kv_heads, int head_dim,
+                             float scale, int window, int S, cudaStream_t stream);
 
 #ifdef __cplusplus
 }
