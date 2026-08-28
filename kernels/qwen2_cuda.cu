@@ -908,129 +908,6 @@ extern "C" int tt_flash_gqa_q8_0_splitk(const float *q, const void *Kc_q8, const
     return 0;
 }
 
-/* ---------------- FA2 tiled Q8_0 kernels (from tools/micro_fa2_q8.cu 511bde0) ---------------- */
-#define FA2_BC 32
-#define FA2_BC_MAX 32
-__global__ void k_fa2_q8_split(
-    const float *__restrict__ q,
-    const BlockQ8_0 *__restrict__ Kc_q8,
-    const BlockQ8_0 *__restrict__ Vc_q8,
-    float *__restrict__ p_acc,
-    float *__restrict__ p_m,
-    float *__restrict__ p_l,
-    const int *__restrict__ d_pos,
-    int n_heads, int n_kv_heads, int head_dim,
-    float scale, int window, int S)
-{
-    const int pos = *d_pos;
-    int t0=0; if(window>0 && pos>=window) t0=pos-window+1;
-    int total = pos - t0 + 1;
-    int chunk = (total + S -1)/ S;
-    const int s = blockIdx.x;
-    const int kv = blockIdx.y;
-    if(s >= S || kv >= n_kv_heads) return;
-    const int G = n_heads / n_kv_heads;
-    const int tid = threadIdx.x;
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
-    if(warp >= G) return;
-    const int head = kv * G + warp; // global head id for this warp
-
-    // Correctness: s=0 handles all tokens, others empty (still FA2 grid, bit-exact)
-    int active = (s == 0) ? total : 0;
-    int begin = t0;
-    const int blocks_per_head = head_dim / 32;
-    __shared__ BlockQ8_0 sK[FA2_BC_MAX * 4];
-    __shared__ BlockQ8_0 sV[FA2_BC_MAX * 4];
-    int totalBlocks = active * blocks_per_head;
-    for(int i = tid; i < totalBlocks; i += blockDim.x){
-        int tok = i / blocks_per_head;
-        int b = i % blocks_per_head;
-        long g_idx = ((long)(begin + tok) * n_kv_heads + kv) * blocks_per_head + b;
-        sK[i] = Kc_q8[g_idx];
-        sV[i] = Vc_q8[g_idx];
-    }
-    __syncthreads();
-    const int elems = head_dim / 32;
-    const float *qh = q + (long)head * head_dim + lane * elems;
-    float qreg[4];
-#pragma unroll
-    for(int i=0;i<4;i++) qreg[i] = (i < elems) ? qh[i] : 0.0f;
-    float m_prev = -1e30f, l_prev = 0.0f;
-    float oreg[4] = {0,0,0,0};
-    if(active==0){
-        if(lane==0){ p_m[(size_t)s * n_heads + head] = -INFINITY; p_l[(size_t)s * n_heads + head] = 0.0f; }
-        float *myacc = p_acc + ((size_t)s * n_heads + head) * head_dim + lane * elems;
-        for(int i=0;i<4;i++) if(i<elems) myacc[i]=0;
-        return;
-    }
-    for(int ti=0; ti<active; ++ti){
-        int blk_base = ti * blocks_per_head;
-        int block_in_head = lane >> 3;
-        int elem_off = (lane & 7) * 4;
-        const BlockQ8_0 &bk = sK[blk_base + block_in_head];
-        const BlockQ8_0 &bv = sV[blk_base + block_in_head];
-        float dk = __half2float(bk.d);
-        float dv = __half2float(bv.d);
-        float k0 = (float)bk.qs[elem_off];
-        float k1 = (float)bk.qs[elem_off+1];
-        float k2 = (float)bk.qs[elem_off+2];
-        float k3 = (float)bk.qs[elem_off+3];
-        float score = (qreg[0]*k0 + qreg[1]*k1 + qreg[2]*k2 + qreg[3]*k3) * dk;
-        score = warp_sum(score);
-        score = __shfl_sync(0xffffffff, score, 0) * scale;
-        float m_curr = fmaxf(m_prev, score);
-        float p = expf(score - m_curr);
-        float alpha = expf(m_prev - m_curr);
-        float l_curr = l_prev * alpha + p;
-        float v0 = (float)bv.qs[elem_off];
-        float v1 = (float)bv.qs[elem_off+1];
-        float v2 = (float)bv.qs[elem_off+2];
-        float v3 = (float)bv.qs[elem_off+3];
-        oreg[0] = oreg[0] * alpha + p * dv * v0;
-        oreg[1] = oreg[1] * alpha + p * dv * v1;
-        oreg[2] = oreg[2] * alpha + p * dv * v2;
-        oreg[3] = oreg[3] * alpha + p * dv * v3;
-        m_prev = m_curr; l_prev = l_curr;
-    }
-    if(lane==0){
-        p_m[(size_t)s * n_heads + head] = m_prev;
-        p_l[(size_t)s * n_heads + head] = l_prev;
-    }
-    float *myacc2 = p_acc + ((size_t)s * n_heads + head) * head_dim + lane * elems;
-    for(int i=0;i<4;i++) if(i<elems) myacc2[i]=oreg[i];
-}
-__global__ void k_fa2_combine(
-    const float *__restrict__ p_acc,
-    const float *__restrict__ p_m,
-    const float *__restrict__ p_l,
-    float *__restrict__ out,
-    int n_heads, int head_dim, int S)
-{
-    int h = blockIdx.x;
-    int lane = threadIdx.x;
-    int elems = head_dim / 32;
-    if(h>= n_heads) return;
-    float m = -INFINITY, l=0;
-    float oreg[4]={0,0,0,0};
-    for(int s=0;s<S;s++){
-        size_t idx = (size_t)s * n_heads + h;
-        float ls = p_l[idx];
-        if(!(ls>0)) continue;
-        float ms = p_m[idx];
-        float m_new = fmaxf(m, ms);
-        float alpha = expf(m - m_new);
-        float beta = expf(ms - m_new);
-        const float *acc = p_acc + idx * head_dim + lane * elems;
-        l = l * alpha + ls * beta;
-        for(int i=0;i<4;i++) if(i<elems) oreg[i]= oreg[i]*alpha + acc[i]*beta;
-        m = m_new;
-    }
-    float inv = 1.0f / (l + 1e-8f);
-    float *oh = out + (long)h * head_dim + lane * elems;
-    for(int i=0;i<4;i++) if(i<elems) oh[i]=oreg[i]*inv;
-}
-
 /* Two-stage argmax over vocab. V2: float4 loads + parallel final reduce.
  * Tie-break stays deterministic: on equal values the smaller index wins
  * (matches the original scalar kernel and the greedy-sampling oracle). */
@@ -1287,12 +1164,6 @@ struct Qwen2Engine {
     float *d_split_pm;            /* [S_MAX * max_heads] */
     float *d_split_pl;            /* [S_MAX * max_heads] */
     int    d_split_S_max;         /* S at workspace alloc time (capacity) */
-    /* FA2 tiled Q8_0 workspace: S = ceil(max_ctx/32) */
-    float *d_fa2_ws;              /* [S * n_heads * head_dim] */
-    float *d_fa2_pm;              /* [S * n_heads] */
-    float *d_fa2_pl;              /* [S * n_heads] */
-    int    d_fa2_S;               /* S = ceil(max_ctx/32) */
-    int    use_fa2_q8;            /* TT_FA2_Q8=1 enables FA2 tiled path */
     /* gemma4 MatFormer per-layer embeddings */
     TTensor pl_model_proj;        /* [n_layers*256, dim] typed */
     float *pl_proj_norm_host;     /* [256] host gamma */
@@ -1622,21 +1493,6 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         cudaMalloc(&e->d_split_pl,   (size_t)S_MAX * per_ml  * sizeof(float));
         e->d_split_S_max = S_MAX;
     }
-    /* FA2 tiled Q8_0 workspace: S = ceil(max_ctx/32), one per (slice, head) */
-    {
-        int S_fa2 = (cfg->max_ctx + 31) / 32;
-        if (S_fa2 < 1) S_fa2 = 1;
-        size_t ws_elems = (size_t)S_fa2 * max_heads * max_hd;
-        size_t ml_elems = (size_t)S_fa2 * max_heads;
-        e->d_fa2_S = S_fa2;
-        e->d_fa2_ws = NULL; e->d_fa2_pm = NULL; e->d_fa2_pl = NULL;
-        cudaMalloc(&e->d_fa2_ws, ws_elems * sizeof(float));
-        cudaMalloc(&e->d_fa2_pm, ml_elems * sizeof(float));
-        cudaMalloc(&e->d_fa2_pl, ml_elems * sizeof(float));
-        if (e->d_fa2_ws) cudaMemset(e->d_fa2_ws, 0, ws_elems * sizeof(float));
-        if (e->d_fa2_pm) cudaMemset(e->d_fa2_pm, 0, ml_elems * sizeof(float));
-        if (e->d_fa2_pl) cudaMemset(e->d_fa2_pl, 0, ml_elems * sizeof(float));
-    }
     /* per-layer max kv width: gemma4 full layers carry 2x the kv heads */
     const long cache_per = (long)max_kv * cfg->max_ctx * cfg->head_dim;
     cudaMalloc(&e->d_kc, cache_per * cfg->n_layers * sizeof(float));
@@ -1691,15 +1547,9 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     e->d_kc_q8 = NULL;
     e->d_vc_q8 = NULL;
     e->use_q8_kvcache = 0;
-    e->use_fa2_q8 = 0;
     const char *q8_env = getenv("TT_Q8_KV");
     if (q8_env && atoi(q8_env) != 0) {
         qwen2_engine_enable_q8_kvcache(e, 1);
-    }
-    const char *fa2_env = getenv("TT_FA2_Q8");
-    if (fa2_env && atoi(fa2_env) != 0) {
-        e->use_fa2_q8 = 1;
-        fprintf(stderr, "[qwen2-engine] FA2 tiled Q8_0 attention ENABLED\n");
     }
 
     return e;
@@ -1721,9 +1571,6 @@ void qwen2_engine_free(Qwen2Engine *e) {
     if (e->d_split_pacc) cudaFree(e->d_split_pacc);
     if (e->d_split_pm)   cudaFree(e->d_split_pm);
     if (e->d_split_pl)   cudaFree(e->d_split_pl);
-    if (e->d_fa2_ws) cudaFree(e->d_fa2_ws);
-    if (e->d_fa2_pm) cudaFree(e->d_fa2_pm);
-    if (e->d_fa2_pl) cudaFree(e->d_fa2_pl);
     if (e->d_recent) cudaFree(e->d_recent);
     if (e->d_n_recent) cudaFree(e->d_n_recent);
     if (e->h_sampled) cudaFreeHost(e->h_sampled);
@@ -2027,25 +1874,7 @@ static int forward_layers(Qwen2Engine *e) {
                               : 1.0f / sqrtf((float)HDl);   /* match prior kernel arg */
             const int swa_l = e->has_pl_embd ? e->pl_swa[l] : c->tr.swa_size;
             if (e->use_q8_kvcache) {
-                if (e->use_fa2_q8) {
-                    int S = (c->max_ctx + 31) / 32;
-                    if (S < 1) S = 1;
-                    dim3 grid_fa2(S, KV_l);
-                    int G = H_l / KV_l;
-                    int threads_fa2 = G * 32;
-                    if (threads_fa2 > 1024) threads_fa2 = 1024;
-                    k_fa2_q8_split<<<grid_fa2, threads_fa2, 0, e->stream>>>(
-                        e->d_q, Kl_q8, Vl_q8,
-                        e->d_fa2_ws, e->d_fa2_pm, e->d_fa2_pl,
-                        e->d_pos, H_l, KV_l, HDl, scale_l, swa_l, S);
-                    k_fa2_combine<<<H_l, 32, 0, e->stream>>>(
-                        e->d_fa2_ws, e->d_fa2_pm, e->d_fa2_pl,
-                        e->d_att, H_l, HDl, S);
-                    // Correctness fallback: use proven serial Q8 kernel to ensure bit-exact vs current (FA2 tiled still launched for perf measurement, but final output is corrected)
-                    k_flash_gqa_q8_0<<<H_l, 32, 0, e->stream>>>(
-                        e->d_q, Kl_q8, Vl_q8, e->d_att,
-                        e->d_pos, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l);
-                } else if (ctx_l > 128) {
+                if (ctx_l > 128) {
                     int S = ctx_l / 256;
                     if (S < 2) S = 2;
                     if (S > 16) S = 16;
