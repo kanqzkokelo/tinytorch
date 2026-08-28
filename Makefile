@@ -205,6 +205,20 @@ test_prefill_gemm: $(BUILD)/test_prefill_gemm
 
 .PHONY: test_prefill_gemm
 
+# Layer-0 Parity Diagnostic Test: compares batched prefill GEMM against sequential advance for N=32.
+$(BUILD)/test_prefill_layer_parity: tests/test_prefill_layer_parity.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
+	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
+	  -o $@ \
+	  tests/test_prefill_layer_parity.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c \
+	  kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
+	  -L$(HOME)/mmcuda/lib -lcudart -lpthread -lm
+
+test_prefill_layer_parity: $(BUILD)/test_prefill_layer_parity
+
+.PHONY: test_prefill_layer_parity
+
 # CI: cheap CPU-only sanity (no GPU needed) -- same checks as GitHub CI.
 ci:
 	./scripts/ci_local.sh
