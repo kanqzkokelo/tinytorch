@@ -1935,6 +1935,9 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
     const TTConfig *c = &e->cfg;
     if (e->pos + n > c->max_ctx) return -2;
 
+    int (*prefill_gemm_fn)(const void *, const float *, float *, int, int, int, cudaStream_t) =
+        (n >= 64) ? tt_gemm_wmma_q4_0_prefill : tt_gemm_q4_0_prefill;
+
     const int dim = c->dim;
     const int hidden_dim = c->hidden_dim;
     const int HD = c->head_dim;
@@ -2017,10 +2020,10 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
 
         /* 2. Batched QKV GEMM */
         if (w->q.dtype == TTQ_Q4_0) {
-            tt_gemm_q4_0_prefill(w->q.ptr, d_Xn, d_Q, attn_qout, dim, n, e->stream);
+            prefill_gemm_fn(w->q.ptr, d_Xn, d_Q, attn_qout, dim, n, e->stream);
             if (!kv_shared) {
-                tt_gemm_q4_0_prefill(w->k.ptr, d_Xn, d_K, kvdim_l, dim, n, e->stream);
-                tt_gemm_q4_0_prefill(w->v.ptr, d_Xn, d_V, kvdim_l, dim, n, e->stream);
+                prefill_gemm_fn(w->k.ptr, d_Xn, d_K, kvdim_l, dim, n, e->stream);
+                prefill_gemm_fn(w->v.ptr, d_Xn, d_V, kvdim_l, dim, n, e->stream);
             }
         } else {
             for (int i = 0; i < n; i++) {
@@ -2099,7 +2102,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
 
         /* 4. O projection */
         if (w->o.dtype == TTQ_Q4_0) {
-            tt_gemm_q4_0_prefill(w->o.ptr, d_Att, d_Xn, dim, attn_qout, n, e->stream);
+            prefill_gemm_fn(w->o.ptr, d_Att, d_Xn, dim, attn_qout, n, e->stream);
         } else {
             for (int i = 0; i < n; i++) {
                 tt_gemv_layer_dispatch(w->o.ptr, w->o.dtype, d_Att + (long)i * attn_qout, d_Xn + (long)i * dim, dim, attn_qout, e->stream);
@@ -2125,8 +2128,8 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         /* 6. Gate & Up GEMM projections */
         const int act_gelu = (c->tr.act == ACT_GELU) ? 1 : 0;
         if (w->gate.dtype == TTQ_Q4_0) {
-            tt_gemm_q4_0_prefill(w->gate.ptr, d_Xn, d_G, FF_l, dim, n, e->stream);
-            tt_gemm_q4_0_prefill(w->up.ptr, d_Xn, d_U, FF_l, dim, n, e->stream);
+            prefill_gemm_fn(w->gate.ptr, d_Xn, d_G, FF_l, dim, n, e->stream);
+            prefill_gemm_fn(w->up.ptr, d_Xn, d_U, FF_l, dim, n, e->stream);
         } else {
             for (int i = 0; i < n; i++) {
                 tt_gemv_layer_dispatch(w->gate.ptr, w->gate.dtype, d_Xn + (long)i * dim, d_G + (long)i * FF_l, FF_l, dim, e->stream);
@@ -2139,7 +2142,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
 
         /* 8. Down projection GEMM */
         if (w->down.dtype == TTQ_Q4_0) {
-            tt_gemm_q4_0_prefill(w->down.ptr, d_H, d_Xn, dim, FF_l, n, e->stream);
+            prefill_gemm_fn(w->down.ptr, d_H, d_Xn, dim, FF_l, n, e->stream);
         } else {
             for (int i = 0; i < n; i++) {
                 tt_gemv_layer_dispatch(w->down.ptr, w->down.dtype, d_H + (long)i * FF_l, d_Xn + (long)i * dim, dim, FF_l, e->stream);

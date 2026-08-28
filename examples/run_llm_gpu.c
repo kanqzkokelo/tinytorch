@@ -252,9 +252,10 @@ int main(int argc, char **argv) {
 
     const double dec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
     const double tot = (t1.tv_sec - tp0.tv_sec) + (t1.tv_nsec - tp0.tv_nsec) * 1e-9;
-    printf("\"\n[gen: %d tokens | decode %.1f tok/s | incl prefill %.1f tok/s | %s]\n",
-           gen_count, gen_count / dec, gen_count / tot, temp > 0.0f ? "sampled" : "greedy");
-    printf("STATS tokens=%d prefill=%d decode_us=%.0f\n", gen_count, n_prompt, dec * 1e6);
+    const double prefill_sec = (t0.tv_sec - tp0.tv_sec) + (t0.tv_nsec - tp0.tv_nsec) * 1e-9;
+    printf("\"\n[gen: %d tokens | decode %.1f tok/s | prefill %.1f tok/s | incl prefill %.1f tok/s | %s]\n",
+           gen_count, gen_count / dec, n_prompt / prefill_sec, gen_count / tot, temp > 0.0f ? "sampled" : "greedy");
+    printf("STATS tokens=%d prefill=%d decode_us=%.0f prefill_us=%.0f prefill_tok_s=%.1f\n", gen_count, n_prompt, dec * 1e6, prefill_sec * 1e6, n_prompt / prefill_sec);
 
     free(logits);
     qwen2_engine_free(eng);
