@@ -106,6 +106,11 @@ int qwen2_debug_copy_logits(Qwen2Engine *e, float *host, int n);
  * bit-exact comparison with qwen2_engine_verify_speculative.  */
 int qwen2_engine_step_logits(Qwen2Engine *e, int tok, float *host_logits);
 
+// 4-rows-per-warp Q8_0 LM head: logits [vocab] = X [K] * W^T [vocab, K]
+// W is Q8_0 quantized. Evaluates 4 vocab rows per warp in parallel.
+int tt_logits_q8_0_v4(const void *dW, const float *dx, float *dlogits, int vocab, int K, cudaStream_t s);
+int tt_logits_q8_0(const void *dW, const float *dx, float *dlogits, int vocab, int K, cudaStream_t s);
+
 // Batched 2D prefill GEMM: Y [N, M] = X [N, K] * W^T [M, K]
 // W is Q4_0 quantized. Evaluates N prompt tokens in parallel for N >= 32.
 int tt_gemm_q4_0_prefill(const void *dW, const float *dX_NxK, float *dY_NxM, int M, int K, int N, cudaStream_t s);

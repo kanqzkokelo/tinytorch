@@ -552,6 +552,89 @@ __global__ void k_logits_q8_0(const BlockQ8_0 *__restrict__ W,
     if (lane == 0) logits[v] = sum;
 }
 
+// V4: 4 rows per warp for Q8_0 LM head (pre-loads x vector into registers)
+__global__ void k_logits_q8_0_v4(const BlockQ8_0 *__restrict__ W,
+                                 const float *__restrict__ x,
+                                 float *__restrict__ logits,
+                                 int vocab, int K) {
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 4;
+    if (row0 >= vocab) return;
+    const int row1 = row0 + 1;
+    const int row2 = row0 + 2;
+    const int row3 = row0 + 3;
+
+    const int lane = threadIdx.x;
+    const int nb = K / 32;
+    const uint32_t *rw0 = (const uint32_t *)((const char *)W + (long)row0 * nb * 34);
+    const uint32_t *rw1 = (const uint32_t *)((const char *)W + (long)row1 * nb * 34);
+    const uint32_t *rw2 = (const uint32_t *)((const char *)W + (long)row2 * nb * 34);
+    const uint32_t *rw3 = (const uint32_t *)((const char *)W + (long)row3 * nb * 34);
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+
+    for (int b = lane; b < nb; b += 32) {
+        const int wsc = (34 * b) >> 2;                 // word holding blk.d
+        const int sh  = (34 * b + 2) & 2;              // 2 => misaligned merge
+        const unsigned short d16a = (unsigned short)(((34 * b) & 2) ? (rw0[wsc] >> 16) : (rw0[wsc] & 0xFFFFu));
+        const unsigned short d16b = (unsigned short)(((34 * b) & 2) ? (rw1[wsc] >> 16) : (rw1[wsc] & 0xFFFFu));
+        const unsigned short d16c = (unsigned short)(((34 * b) & 2) ? (rw2[wsc] >> 16) : (rw2[wsc] & 0xFFFFu));
+        const unsigned short d16d = (unsigned short)(((34 * b) & 2) ? (rw3[wsc] >> 16) : (rw3[wsc] & 0xFFFFu));
+        const float da = __half2float(__ushort_as_half(d16a));
+        const float db = __half2float(__ushort_as_half(d16b));
+        const float dc = __half2float(__ushort_as_half(d16c));
+        const float dd = __half2float(__ushort_as_half(d16d));
+        const int a0 = (34 * b + 2) >> 2;              // first qs word
+        const float4 *x4 = (const float4 *)(x + b * 32);
+
+        float4 xv[8];
+#pragma unroll
+        for (int k = 0; k < 8; k++) xv[k] = x4[k];
+
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const uint32_t la = rw0[a0 + k];
+            const uint32_t lb = rw1[a0 + k];
+            const uint32_t lc = rw2[a0 + k];
+            const uint32_t ld = rw3[a0 + k];
+            const uint32_t va = sh ? __byte_perm(la, rw0[a0 + k + 1], 0x5432) : la;
+            const uint32_t vb = sh ? __byte_perm(lb, rw1[a0 + k + 1], 0x5432) : lb;
+            const uint32_t vc = sh ? __byte_perm(lc, rw2[a0 + k + 1], 0x5432) : lc;
+            const uint32_t vd = sh ? __byte_perm(ld, rw3[a0 + k + 1], 0x5432) : ld;
+            const float4 xk = xv[k];
+
+            s0 += ((float)((int)(va << 24) >> 24)) * da * xk.x;
+            s0 += ((float)((int)(va << 16) >> 24)) * da * xk.y;
+            s0 += ((float)((int)(va <<  8) >> 24)) * da * xk.z;
+            s0 += ((float)((int)(va       ) >> 24)) * da * xk.w;
+
+            s1 += ((float)((int)(vb << 24) >> 24)) * db * xk.x;
+            s1 += ((float)((int)(vb << 16) >> 24)) * db * xk.y;
+            s1 += ((float)((int)(vb <<  8) >> 24)) * db * xk.z;
+            s1 += ((float)((int)(vb       ) >> 24)) * db * xk.w;
+
+            s2 += ((float)((int)(vc << 24) >> 24)) * dc * xk.x;
+            s2 += ((float)((int)(vc << 16) >> 24)) * dc * xk.y;
+            s2 += ((float)((int)(vc <<  8) >> 24)) * dc * xk.z;
+            s2 += ((float)((int)(vc       ) >> 24)) * dc * xk.w;
+
+            s3 += ((float)((int)(vd << 24) >> 24)) * dd * xk.x;
+            s3 += ((float)((int)(vd << 16) >> 24)) * dd * xk.y;
+            s3 += ((float)((int)(vd <<  8) >> 24)) * dd * xk.z;
+            s3 += ((float)((int)(vd       ) >> 24)) * dd * xk.w;
+        }
+    }
+    s0 = warp_reduce_sum(s0);
+    s1 = warp_reduce_sum(s1);
+    s2 = warp_reduce_sum(s2);
+    s3 = warp_reduce_sum(s3);
+
+    if (lane == 0) {
+        logits[row0] = s0;
+        if (row1 < vocab) logits[row1] = s1;
+        if (row2 < vocab) logits[row2] = s2;
+        if (row3 < vocab) logits[row3] = s3;
+    }
+}
+
 // V2 layer GEMV over q8_0 weights (closes the qwen3-0.6b-q8_0 0.25x gap
 // to llama.cpp CUDA). Same shape as k_gemv_q4_0: two rows per warp, each
 // lane strides the K/32 q8_0 blocks, each block loads 8 uint32 words of
@@ -1475,6 +1558,27 @@ int tt_logits_q4_0_v4(const void *dW, const float *dx, float *dlogits,
     return (int)cudaGetLastError();
 }
 
+int tt_logits_q8_0(const void *dW, const float *dx, float *dlogits,
+                   int vocab, int K, cudaStream_t stream) {
+    if (!dW || !dx || !dlogits) return -1;
+    dim3 b(32, 1);
+    dim3 g((vocab + b.y - 1) / b.y, 1, 1);
+    k_logits_q8_0<<<g, b, 0, stream>>>((const BlockQ8_0 *)dW, dx, dlogits, vocab, K);
+    return (int)cudaGetLastError();
+}
+
+// 4-rows-per-warp Q8_0 LM head: logits [vocab] = X [K] * W^T [vocab, K]
+// W is Q8_0 quantized. Evaluates 4 vocab rows per warp in parallel.
+int tt_logits_q8_0_v4(const void *dW, const float *dx, float *dlogits,
+                      int vocab, int K, cudaStream_t stream) {
+    if (!dW || !dx || !dlogits) return -1;
+    dim3 b4(32, 1);
+    dim3 g4((vocab + b4.y * 4 - 1) / (b4.y * 4), 1, 1);
+    k_logits_q8_0_v4<<<g4, b4, 0, stream>>>(
+        (const BlockQ8_0 *)dW, dx, dlogits, vocab, K);
+    return (int)cudaGetLastError();
+}
+
 /* M9.5+ V4 launcher: 4-rows-per-warp q4_0 layer GEMV. Caller (dispatcher)
  * must have verified (K%32==0) and (M%4==0). Same nb-even contract. */
 int tt_gemv_q4_0_v4(const void *dW, const float *dx, float *dy,
@@ -1590,6 +1694,9 @@ int tt_logits_dispatch(const void *dW, int dtype, const float *dx,
     }
     dim3 g, b; gemv_dims(vocab, &g, &b);
     if (dtype == 8) {
+        if ((vocab & 3) == 0 && (K & 31) == 0) {
+            return tt_logits_q8_0_v4(dW, dx, dlogits, vocab, K, stream);
+        }
         /* M6.3b: one warp per block for the head (y sweep 16->8->4->2->1
          * monotone win). Grid MUST be recomputed for the smaller block or
          * rows >= grid.x*b.y never get written (stale logits -> degenerate
@@ -1597,10 +1704,8 @@ int tt_logits_dispatch(const void *dW, int dtype, const float *dx,
          * zeroed every token id >= vocab/16. */
         b.y = 1;
         g.x = (vocab + b.y - 1) / b.y;
-    }
-    if (dtype == 8)
         k_logits_q8_0<<<g, b, 0, stream>>>((const BlockQ8_0 *)dW, dx, dlogits, vocab, K);
-    else {
+    } else {
         /* M9.5+: route q4_0 to V4 (4 rows/warp) when eligible, else V2,
          * else scalar. V4 wins 1.7x on the LM head shape and 1.5-1.6x
          * on FFN shapes vs V2 in the microbench (bit-exact).

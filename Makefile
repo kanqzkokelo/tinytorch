@@ -192,6 +192,19 @@ test_batch4_gemv: $(BUILD)/test_batch4_gemv
 
 .PHONY: test_batch4_gemv
 
+# Q8_0 V4 LM Head Launcher bit-exact correctness test.
+$(BUILD)/test_logits_q8_v4: tests/test_logits_q8_v4.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu | $(BUILD)
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	  -I$(CUDA_INC) -Iinclude -Xcompiler -fPIC \
+	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
+	  -o $@ \
+	  tests/test_logits_q8_v4.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu \
+	  -L$(HOME)/mmcuda/lib -lcudart -lpthread -lm
+
+test_logits_q8_v4: $(BUILD)/test_logits_q8_v4
+
+.PHONY: test_logits_q8_v4
+
 # Batched Q4_0 Prefill GEMM multi-boundary correctness test.
 $(BUILD)/test_prefill_gemm: tests/test_prefill_gemm.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu | $(BUILD)
 	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
