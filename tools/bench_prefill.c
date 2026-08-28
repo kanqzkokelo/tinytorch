@@ -65,6 +65,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n; i++) toks[i] = 10 + (i % 100);
         double best_ms = 1e9;
         for (int r = 0; r < repeats; r++) {
+            qwen2_engine_reset(e);
             const double t0 = now_ms();
             int rc = qwen2_engine_prefill(e, toks, n);
             const double t1 = now_ms();
