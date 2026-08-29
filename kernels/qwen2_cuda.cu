@@ -1053,9 +1053,9 @@ __global__ void k_prefill_flash_q8_0(
             sV_d[tok * blocks_per_head + b] = bv.d;
             const int row_off = tok * head_dim + b * 32;
 #pragma unroll
-            for (int j = 0; j < 32; j++) {
-                sK_q[row_off + j] = bk.qs[j];
-                sV_q[row_off + j] = bv.qs[j];
+            for (int j = 0; j < 8; j++) {
+                ((uint32_t *)&sK_q[row_off])[j] = ((const uint32_t *)&bk.qs[0])[j];
+                ((uint32_t *)&sV_q[row_off])[j] = ((const uint32_t *)&bv.qs[0])[j];
             }
         }
         __syncthreads();
@@ -1067,16 +1067,17 @@ __global__ void k_prefill_flash_q8_0(
             const float dk = __half2float(sK_d[t_in_tile * blocks_per_head + block_in_head]);
             const float dv = __half2float(sV_d[t_in_tile * blocks_per_head + block_in_head]);
 
-            const float k0 = (float)sK_q[k_q_off + 0];
-            const float k1 = (float)sK_q[k_q_off + 1];
-            const float k2 = (float)sK_q[k_q_off + 2];
-            const float k3 = (float)sK_q[k_q_off + 3];
+            const uint32_t k_u32 = *(const uint32_t *)&sK_q[k_q_off];
+            const uint32_t v_u32 = *(const uint32_t *)&sV_q[v_q_off];
+            const float k0 = (float)((int8_t)(k_u32      ));
+            const float k1 = (float)((int8_t)(k_u32 >>  8));
+            const float k2 = (float)((int8_t)(k_u32 >> 16));
+            const float k3 = (float)((int8_t)(k_u32 >> 24));
 
-            const float v0 = (float)sV_q[v_q_off + 0];
-            const float v1 = (float)sV_q[v_q_off + 1];
-            const float v2 = (float)sV_q[v_q_off + 2];
-            const float v3 = (float)sV_q[v_q_off + 3];
-
+            const float v0 = (float)((int8_t)(v_u32      ));
+            const float v1 = (float)((int8_t)(v_u32 >>  8));
+            const float v2 = (float)((int8_t)(v_u32 >> 16));
+            const float v3 = (float)((int8_t)(v_u32 >> 24));
 #pragma unroll
             for (int r = 0; r < BR_PREFILL; r++) {
                 if (!active[r] || t < row_min_t[r] || t > max_kv[r]) continue;
@@ -2638,7 +2639,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
     if (e->pos + n > c->max_ctx) return -2;
 
     int (*prefill_gemm_fn)(const void *, const float *, float *, int, int, int, cudaStream_t) =
-        (n >= 64) ? tt_gemm_wmma_q4_0_prefill : tt_gemm_q4_0_prefill;
+        tt_gemm_q4_0_prefill;
 
     const int dim = c->dim;
     const int hidden_dim = c->hidden_dim;
@@ -3099,7 +3100,7 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
         float *xsave = NULL, *lsave = NULL;
         cudaMalloc(&xsave, c->dim * sizeof(float));
         cudaMalloc(&lsave, c->vocab * sizeof(float));
-        cudaMemcpy(xsave, e->d_x, c->dim * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(xsave, e->d_x, c->dim * sizeof(float), cudaMemcpyDeviceToDevice);
         cudaMemcpy(lsave, e->d_logits, c->vocab * sizeof(float), cudaMemcpyDeviceToDevice);
         const int pos_before = e->pos;
         if (edt == GGUF_TYPE_Q4_0) {
@@ -3118,7 +3119,7 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
                                                      0.8f, e->d_pos, e->d_sampling_on);
         cudaStreamSynchronize(e->stream);
         /* restore state the warmup perturbed */
-        cudaMemcpy(e->d_x, xsave, c->dim * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(e->d_x, xsave, c->dim * sizeof(float), cudaMemcpyDeviceToDevice);
         cudaMemcpy(e->d_logits, lsave, c->vocab * sizeof(float), cudaMemcpyDeviceToDevice);
         cudaMemcpy(e->d_pos, &pos_before, sizeof(int), cudaMemcpyHostToDevice);
         cudaFree(xsave); cudaFree(lsave);

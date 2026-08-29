@@ -89,6 +89,11 @@ static int test_n(Qwen2Engine *e_seq, Qwen2Engine *e_bat, const TTConfig *cfg, i
     }
 
     printf("N=%d Summary: global max_abs_diff = %.4e\n", N, global_max_abs);
+    int next_seq = qwen2_engine_next(e_seq);
+    int next_bat = qwen2_engine_next(e_bat);
+    printf("Next sampled token: seq=%d bat=%d (match=%s)\n", next_seq, next_bat, (next_seq == next_bat) ? "YES" : "NO");
+    if (next_seq != next_bat) failures++;
+
 
     if (failures > 0) {
         printf("FAIL (N=%d): Divergence detected at position %d (%d/%d positions failed)\n",

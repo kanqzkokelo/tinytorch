@@ -11,6 +11,7 @@
 #include "qwen2_engine.h"
 #include "tokenizer_bpe.h"
 #include "async_printer.h"
+#include "chat_template.h"
 
 typedef struct {
     int id;
@@ -165,12 +166,23 @@ int main(int argc, char **argv) {
     if (!eng) { fprintf(stderr, "engine init failed\n"); return 1; }
 
     char formatted[262144];
-    if (!getenv("TT_RAW_PROMPT"))
-        snprintf(formatted, sizeof(formatted),
-                 "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", prompt);
-    else
+    if (!getenv("TT_RAW_PROMPT")) {
+        tt_chat_family fam = tt_chat_family_from_arch(model->architecture);
+        if (fam < 0) fam = TT_CHAT_QWEN2;
+        tt_msg msgs[1] = {
+            { "user", prompt }
+        };
+        tt_chat_opts opts = tt_chat_opts_default();
+        if (fam == TT_CHAT_GEMMA || fam == TT_CHAT_GEMMA4) {
+            opts.add_bos_text = 0;
+        }
+        int need = tt_chat_format_ex(fam, msgs, 1, &opts, formatted, sizeof(formatted));
+        if (need < 0 || (size_t)need >= sizeof(formatted)) {
+            snprintf(formatted, sizeof(formatted), "%s", prompt);
+        }
+    } else {
         snprintf(formatted, sizeof(formatted), "%s", prompt);
-
+    }
     int prompt_tokens[16384];
     int n_prompt;
     if (tok) {

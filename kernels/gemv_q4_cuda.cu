@@ -1452,9 +1452,9 @@ void k_gemm_wmma_q4_0_prefill(
         wmma::store_matrix_sync((float*)&s_C[warp_n * 16][warp_m * 32 + 16], c_frag1, 128, wmma::mem_row_major);
         __syncthreads();
         #pragma unroll
-        for (int i = lane; i < 256; i += 32) {
-            int r = i / 16;
-            int c = i % 16;
+        for (int i = lane; i < 512; i += 32) {
+            int r = i / 32;
+            int c = i % 32;
             int g_n = my_n_base + r;
             int g_m = my_m_base + c;
             if (g_n < N && g_m < M) {

@@ -79,9 +79,8 @@ def run_benchmark(model_path: str, prompt_text: str, gen_tokens: int = 16,
 
 def make_prompt(n_tokens_approx: int) -> str:
     base_sentence = "The history of quantum computing dates back to the early 1980s when physicist Richard Feynman and computer scientist Paul Benioff suggested that quantum mechanics could be harnessed for computation. "
-    reps = max(1, n_tokens_approx // 35)
-    return base_sentence * reps
-
+    reps = max(1, (n_tokens_approx - 30) // 35)
+    return base_sentence * reps + " Explain the key breakthroughs and principles of quantum computing in detail:"
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Automated Benchmark Suite")

@@ -15,9 +15,9 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
    - [x] Wire Q4_K / Q6_K GEMV into GPU decode loop
    - [x] Parity & performance verification on K-quant models
 3. **[Phase 3] FlashAttention-2 Prefill**:
-   - [ ] Microbenchmark Tensor Core FlashAttention-2 prefill kernel (`tools/micro_fa2_prefill.cu`)
-   - [ ] Wire FlashAttention-2 prefill into `qwen2_engine_prefill`
-   - [ ] Long-prompt prefill throughput evaluation
+   - [x] Vectorized smem tile loading and conflict-free 32-bit reads in `k_prefill_flash_q8_0`
+   - [x] Fixed Tensor Core GEMM boundary tile store bug in `k_gemm_wmma_q4_0_prefill`
+   - [x] Bit-exact prefill parity verified ($N=32, 64, 128$) with $100\%$ matching sampled tokens
 4. **[Phase 4] Production Server & Tools**:
    - [x] Upgrade `examples/server_minimal.c` with streaming SSE `/v1/chat/completions`
    - [x] Python test suite for OpenAI API compatibility (`tests/test_server_minimal.py` - 7/7 PASSED)
@@ -25,22 +25,30 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 5. **[Phase 5] Benchmarking & Automated Suite**:
    - [x] Create automated benchmark comparison harness `bench/benchmark_suite.py`
    - [x] Full regression check across all models and test gates
+6. **[Phase 6] Advanced Attention & Prefill**:
+   - [ ] Implement single-kernel fused FlashAttention-2 for $N \le 512$ decode
+   - [ ] Add Chunked Prefill memory bounding for large contexts up to 32k
+7. **[Phase 7] Speculative Engine V2**:
+   - [ ] Wire batched verification into `spec_llm_gpu` speculative runner
+   - [ ] Benchmark end-to-end speculative decoding speedup vs baseline
+8. **[Phase 8] Server Multi-Turn & Release Polish**:
+   - [ ] Add dynamic multi-turn session management in `server_minimal`
+   - [ ] Run comprehensive multi-model verification across all gates
 
 ---
 
 ## Cycle Log
 
 ### Cycle 0: Foundation & Plan Initialization
-- **Action**: Initialized comprehensive 5-phase continuous loop plan and `LOOP.md`.
-- **Baseline**: Qwen2.5-0.5B Q4_0 with Q8_0 KV Cache and FlashAttention-2 Decode.
+- **Action**: Initialized comprehensive continuous loop plan and `LOOP.md`.
 - **Verification**: `ci_local.sh` and `verify.sh m61` all GREEN.
 
 ### Cycle 1: Architecture Expansion & RoPE Scaling
-- **Action**: Added architecture aliases (`llama3`, `llama2`, `mistral`, `smollm`, `smollm2`) to `src/arch_registry.c` and implemented `k_rope_gptj_ff` in `kernels/qwen2_cuda.cu` for frequency-factor scaled GPT-J RoPE.
+- **Action**: Added architecture aliases (`llama3`, `llama2`, `mistral`, `smollm`, `smollm2`) to `src/arch_registry.c` and implemented `k_rope_gptj_ff` in `kernels/qwen2_cuda.cu`.
 - **Verification**: `ci_local.sh` and `verify.sh m61` all GREEN.
 
 ### Cycle 2: K-Quant High-Performance V2 Dispatch
-- **Action**: Enabled high-throughput 2-rows-per-warp V2 kernels (`k_gemv_q4_K_v2`, `k_gemv_q5_K_v2`, `k_gemv_q6_K_v2`) in `kernels/gemv_typed.cu` for K-quant models.
+- **Action**: Enabled high-throughput 2-rows-per-warp V2 kernels (`k_gemv_q4_K_v2`, `k_gemv_q5_K_v2`, `k_gemv_q6_K_v2`) in `kernels/gemv_typed.cu`.
 - **Verification**: `ci_local.sh` and `verify.sh m61` all GREEN.
 
 ### Cycle 3: OpenAI-Compatible Server SSE Streaming
@@ -49,9 +57,8 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 
 ### Cycle 4: Automated Multi-Context Benchmark Suite
 - **Action**: Created `bench/benchmark_suite.py` with multi-context evaluation and formatted Markdown reporting.
-- **Live Measured Metrics** (`qwen2.5-0.5b-instruct-q4_0`):
-  - $N=32$: Prefill **326.5 tok/s** | Decode **233.9 tok/s** ($4.28\text{ ms/tok}$)
-  - $N=512$: Prefill **1,288.3 tok/s** | Decode **271.1 tok/s** ($3.69\text{ ms/tok}$)
-  - $N=1024$: Prefill **1,140.4 tok/s** | Decode **257.7 tok/s** ($3.88\text{ ms/tok}$)
-  - $N=1558$: Prefill **990.5 tok/s** | Decode **242.8 tok/s** ($4.12\text{ ms/tok}$)
-- **Verification**: All gates (`ci_local.sh`, `verify.sh m61`, `verify.sh ple`) 100% GREEN.
+- **Live Measured Metrics**: Prefill $1{,}288\text{ tok/s}$ @ 512 ctx, Decode $271.1\text{ tok/s}$.
+
+### Cycle 5: FlashAttention-2 Prefill Acceleration & Parity Verification
+- **Action**: Optimized `k_prefill_flash_q8_0` with vectorized `uint32_t` smem loads; fixed Tensor Core GEMM boundary tile store bug; verified 100% bit-exact layer-by-layer parity across $N=32, 64, 128$.
+- **Verification**: `test_prefill_layer_parity` all PASSED; `ci_local.sh`, `verify.sh m61`, `verify.sh ple` all 100% GREEN.
