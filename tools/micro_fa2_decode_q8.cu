@@ -254,13 +254,12 @@ __global__ void k_fa2_q8_split(
             sV_d[tok * 4 + b] = bv.d;
             int row_off = tok * 128 + b * 32;
 #pragma unroll
-            for (int j = 0; j < 32; j++) {
-                sK_q[row_off + j] = bk.qs[j];
-                sV_q[row_off + j] = bv.qs[j];
+            for (int j = 0; j < 8; j++) {
+                ((uint32_t *)&sK_q[row_off])[j] = ((const uint32_t *)&bk.qs[0])[j];
+                ((uint32_t *)&sV_q[row_off])[j] = ((const uint32_t *)&bv.qs[0])[j];
             }
         }
         __syncthreads();
-
         // Process tokens in smem tile
         for (int t_idx = 0; t_idx < bc_active; t_idx++) {
             const float dk = __half2float(sK_d[t_idx * 4 + block_in_head]);
@@ -459,9 +458,12 @@ int main() {
             d_pos, n_heads, n_kv_heads, head_dim, scale, window, S);
         k_fa2_combine<<<n_heads, 32>>>(
             d_pacc, d_pm, d_pl, d_out_fa2, n_heads, head_dim, S);
-
+        cudaError_t err1 = cudaGetLastError();
         cudaDeviceSynchronize();
-
+        cudaError_t err2 = cudaGetLastError();
+        if (err1 != cudaSuccess || err2 != cudaSuccess) {
+            printf("CUDA ERROR at N=%d: %s / %s\n", N, cudaGetErrorString(err1), cudaGetErrorString(err2));
+        }
         cudaMemcpy(h_out_serial, d_out_serial, out_bytes, cudaMemcpyDeviceToHost);
         cudaMemcpy(h_out_fa2, d_out_fa2, out_bytes, cudaMemcpyDeviceToHost);
 

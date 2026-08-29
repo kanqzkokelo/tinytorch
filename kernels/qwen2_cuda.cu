@@ -812,9 +812,9 @@ __global__ void k_fa2_q8_split(
             sV_d[tok * blocks_per_head + b] = bv.d;
             int row_off = tok * head_dim + b * 32;
 #pragma unroll
-            for (int j = 0; j < 32; j++) {
-                sK_q[row_off + j] = bk.qs[j];
-                sV_q[row_off + j] = bv.qs[j];
+            for (int j = 0; j < 8; j++) {
+                ((uint32_t *)&sK_q[row_off])[j] = ((const uint32_t *)&bk.qs[0])[j];
+                ((uint32_t *)&sV_q[row_off])[j] = ((const uint32_t *)&bv.qs[0])[j];
             }
         }
         __syncthreads();
