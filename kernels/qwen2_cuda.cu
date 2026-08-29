@@ -862,6 +862,148 @@ __global__ void k_flash_gqa_q8_0_splitk(
         if (i < elems) myacc[i] = oreg[i];
 }
 
+#define BR_PREFILL 8
+#define BC_PREFILL 64
+
+__global__ void k_prefill_flash_q8_0(
+    const float     *__restrict__ Q,
+    const BlockQ8_0 *__restrict__ Kc,
+    const BlockQ8_0 *__restrict__ Vc,
+    float           *__restrict__ Att,
+    int n, int ctx, int e_pos,
+    int n_heads, int n_kv_heads, int head_dim,
+    float scale, int window)
+{
+    const int G = n_heads / n_kv_heads;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int kv = blockIdx.y;
+    const int q_tile = blockIdx.x;
+    const int head = kv * G + warp;
+    if (warp >= G) return;
+
+    const int elems = head_dim / 32;
+    const int blocks_per_head = head_dim / 32;
+
+    extern __shared__ char raw_smem_prefill[];
+    half   *sK_d = (half*)raw_smem_prefill;
+    half   *sV_d = sK_d + BC_PREFILL * blocks_per_head;
+    int8_t *sK_q = (int8_t*)(sV_d + BC_PREFILL * blocks_per_head);
+    int8_t *sV_q = sK_q + BC_PREFILL * head_dim;
+
+    float qreg[BR_PREFILL][4];
+    float m_state[BR_PREFILL];
+    float l_state[BR_PREFILL];
+    float acc[BR_PREFILL][4];
+    int   max_kv[BR_PREFILL];
+    int   row_min_t[BR_PREFILL];
+    bool  active[BR_PREFILL];
+
+#pragma unroll
+    for (int r = 0; r < BR_PREFILL; r++) {
+        const int qrow = q_tile * BR_PREFILL + r;
+        active[r] = (qrow < n);
+        max_kv[r] = active[r] ? (e_pos + qrow) : -1;
+        row_min_t[r] = (window > 0 && active[r] && (e_pos + qrow + 1 > window))
+                       ? (e_pos + qrow + 1 - window) : 0;
+
+        m_state[r] = -1e30f;
+        l_state[r] = 0.0f;
+        acc[r][0] = 0.0f; acc[r][1] = 0.0f; acc[r][2] = 0.0f; acc[r][3] = 0.0f;
+
+        if (active[r]) {
+            const float *qr = Q + (long)qrow * (n_heads * head_dim) + (long)head * head_dim + lane * elems;
+            qreg[r][0] = qr[0]; qreg[r][1] = qr[1]; qreg[r][2] = qr[2]; qreg[r][3] = qr[3];
+        } else {
+            qreg[r][0] = 0.0f; qreg[r][1] = 0.0f; qreg[r][2] = 0.0f; qreg[r][3] = 0.0f;
+        }
+    }
+
+    const int S = (ctx + BC_PREFILL - 1) / BC_PREFILL;
+    const int block_in_head = lane >> 3;
+    const int elem_off = (lane & 7) * elems;
+
+    for (int s = 0; s < S; s++) {
+        const int s_start = s * BC_PREFILL;
+        const int s_end_excl = (s_start + BC_PREFILL < ctx) ? (s_start + BC_PREFILL) : ctx;
+        const int bc_active = s_end_excl - s_start;
+        if (bc_active <= 0) continue;
+
+        const int total_blocks = bc_active * blocks_per_head;
+        for (int i = tid; i < total_blocks; i += blockDim.x) {
+            const int tok = i / blocks_per_head;
+            const int b   = i % blocks_per_head;
+            const long g_idx = ((long)(s_start + tok) * n_kv_heads + kv) * blocks_per_head + b;
+            const BlockQ8_0 bk = Kc[g_idx];
+            const BlockQ8_0 bv = Vc[g_idx];
+            sK_d[tok * blocks_per_head + b] = bk.d;
+            sV_d[tok * blocks_per_head + b] = bv.d;
+            const int row_off = tok * head_dim + b * 32;
+#pragma unroll
+            for (int j = 0; j < 32; j++) {
+                sK_q[row_off + j] = bk.qs[j];
+                sV_q[row_off + j] = bv.qs[j];
+            }
+        }
+        __syncthreads();
+
+        for (int t = s_start; t < s_end_excl; t++) {
+            const int t_in_tile = t - s_start;
+            const int k_q_off = t_in_tile * head_dim + block_in_head * 32 + elem_off;
+            const int v_q_off = k_q_off;
+            const float dk = __half2float(sK_d[t_in_tile * blocks_per_head + block_in_head]);
+            const float dv = __half2float(sV_d[t_in_tile * blocks_per_head + block_in_head]);
+
+            const float k0 = (float)sK_q[k_q_off + 0];
+            const float k1 = (float)sK_q[k_q_off + 1];
+            const float k2 = (float)sK_q[k_q_off + 2];
+            const float k3 = (float)sK_q[k_q_off + 3];
+
+            const float v0 = (float)sV_q[v_q_off + 0];
+            const float v1 = (float)sV_q[v_q_off + 1];
+            const float v2 = (float)sV_q[v_q_off + 2];
+            const float v3 = (float)sV_q[v_q_off + 3];
+
+#pragma unroll
+            for (int r = 0; r < BR_PREFILL; r++) {
+                if (!active[r] || t < row_min_t[r] || t > max_kv[r]) continue;
+
+                float dot_partial = (qreg[r][0]*k0 + qreg[r][1]*k1 + qreg[r][2]*k2 + qreg[r][3]*k3) * dk;
+                float score = warp_sum(dot_partial);
+                score = __shfl_sync(0xffffffff, score, 0) * scale;
+
+                float m_curr = fmaxf(m_state[r], score);
+                float p = expf(score - m_curr);
+                float alpha = expf(m_state[r] - m_curr);
+                l_state[r] = l_state[r] * alpha + p;
+
+                float pdv = p * dv;
+                acc[r][0] = acc[r][0] * alpha + pdv * v0;
+                acc[r][1] = acc[r][1] * alpha + pdv * v1;
+                acc[r][2] = acc[r][2] * alpha + pdv * v2;
+                acc[r][3] = acc[r][3] * alpha + pdv * v3;
+
+                m_state[r] = m_curr;
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < BR_PREFILL; r++) {
+        if (active[r]) {
+            const int qrow = q_tile * BR_PREFILL + r;
+            float inv_l = 1.0f / l_state[r];
+            float *out_row = Att + (long)qrow * (n_heads * head_dim) + (long)head * head_dim + lane * elems;
+            out_row[0] = acc[r][0] * inv_l;
+            out_row[1] = acc[r][1] * inv_l;
+            out_row[2] = acc[r][2] * inv_l;
+            out_row[3] = acc[r][3] * inv_l;
+        }
+    }
+}
+
 extern "C" int tt_kv_scatter(const float *kst, const float *vst, float *Kc, float *Vc,
                              const int *d_pos, int n_kv_heads, int head_dim, int max_ctx, cudaStream_t stream) {
     const int kvdim = n_kv_heads * head_dim;
@@ -2546,12 +2688,21 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
                         KV_l, HDl, c->max_ctx);
                 }
             }
+        }
 
-            if (e->use_q8_kvcache) {
-                k_flash_gqa_q8_0<<<H_l, 32, 0, e->stream>>>(
-                    d_Q + (long)i * attn_qout, Kl_q8, Vl_q8, d_Att + (long)i * attn_qout,
-                    d_pos_i, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l);
-            } else {
+        if (e->use_q8_kvcache) {
+            int num_q_tiles = (n + BR_PREFILL - 1) / BR_PREFILL;
+            dim3 grid_pf(num_q_tiles, KV_l);
+            int threads_pf = (H_l / KV_l) * 32;
+            int blocks_per_head = HDl / 32;
+            size_t smem_bytes = 2 * (size_t)BC_PREFILL * blocks_per_head * sizeof(half)
+                              + 2 * (size_t)BC_PREFILL * HDl * sizeof(int8_t);
+            k_prefill_flash_q8_0<<<grid_pf, threads_pf, smem_bytes, e->stream>>>(
+                d_Q, Kl_q8, Vl_q8, d_Att,
+                n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l);
+        } else {
+            for (int i = 0; i < n; i++) {
+                const int *d_pos_i = d_pos_batch + i;
                 k_flash_gqa<<<H_l, 32, 0, e->stream>>>(
                     d_Q + (long)i * attn_qout, Kl_f, Vl_f, d_Att + (long)i * attn_qout,
                     d_pos_i, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l);
