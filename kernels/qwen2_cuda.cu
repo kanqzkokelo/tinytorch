@@ -1472,6 +1472,39 @@ __global__ void k_embed_q6_K_dyn(const uint8_t *__restrict__ W, const int *__res
     }
 }
 
+__global__ void k_embed_q3_K_dyn(const uint8_t *__restrict__ W, const int *__restrict__ d_tok,
+                                 float *__restrict__ dx, int dim) {
+    const int tok = *d_tok;
+    const int u = threadIdx.x + blockIdx.x * blockDim.x;
+    const int nu = (dim / 256) * 16;
+    if (u >= nu) return;
+    const int sb  = u >> 4;
+    const int is  = u & 15;
+    const int n   = is >> 3;
+    const int j   = (is & 7) >> 1;
+    const int is0 = is & 1;
+    const int shift = j << 1;
+    const uint8_t m = 1 << (4 * n + j);
+
+    const uint8_t *blk = W + (long)tok * (dim / 256) * 110 + sb * 110;
+    const uint8_t *sc_raw = blk + 96;
+    int8_t us = is <  4 ? (sc_raw[is-0] & 0xF) | (((sc_raw[is+8] >> 0) & 3) << 4) :
+                is <  8 ? (sc_raw[is-0] & 0xF) | (((sc_raw[is+4] >> 2) & 3) << 4) :
+                is < 12 ? (sc_raw[is-8] >>  4) | (((sc_raw[is+0] >> 4) & 3) << 4) :
+                          (sc_raw[is-8] >>  4) | (((sc_raw[is-4] >> 6) & 3) << 4);
+    const float d = __half2float(*(const __half *)(blk + 108));
+    const float dl = d * (float)(us - 32);
+
+    const uint8_t *q  = blk + 32 + 32 * n + 16 * is0;
+    const uint8_t *hm = blk + 16 * is0;
+    float *dst = dx + (long)sb * 256 + is * 16;
+
+#pragma unroll
+    for (int l = 0; l < 16; l++) {
+        int8_t w = ((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4);
+        dst[l] = dl * (float)w;
+    }
+}
 /* Position increment INSIDE the captured region: each replay advances the
  * device position scalar exactly once (host mirror does e->pos++ in lockstep). */
 __global__ void k_pos_inc(int *d_pos) { (*d_pos)++; }
@@ -1625,6 +1658,10 @@ struct Qwen2Engine {
     float *ple_pe;                /* cached scaled per-layer token embed row */
     float *d_rope_freqs;          /* [256] partial-rope factors (device) */
     int pos;
+    int n_gpu_layers;
+    float *h_x_buf, *h_xn_buf, *h_q_buf, *h_att_buf, *h_h_buf, *h_g_buf, *h_u_buf, *h_out_buf;
+    float *h_k_stage, *h_v_stage;
+    float *h_kc, *h_vc;
     cudaStream_t stream;
 };
 
@@ -1761,19 +1798,54 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
             e->d_out_w.dtype == GGUF_TYPE_Q4_0 ? "q4_0" : "typed dispatch");
     e->d_out_norm = upload_f32(m, "output_norm.weight");
 
+    int n_gpu_layers = cfg->n_layers;
+    const char *gpu_layers_env = getenv("TT_GPU_LAYERS");
+    if (!gpu_layers_env) gpu_layers_env = getenv("TT_N_GPU_LAYERS");
+    if (gpu_layers_env) {
+        int v = atoi(gpu_layers_env);
+        if (v >= 0 && v <= cfg->n_layers) n_gpu_layers = v;
+    }
+    e->n_gpu_layers = n_gpu_layers;
+    if (n_gpu_layers < cfg->n_layers) {
+        fprintf(stderr, "[qwen2-engine] HYBRID CPU-GPU Offloading: %d GPU layers, %d CPU layers\n",
+                n_gpu_layers, cfg->n_layers - n_gpu_layers);
+    }
     for (int l = 0; l < cfg->n_layers; l++) {
         LayerW *w = &e->L[l];
-        snprintf(name, sizeof(name), "blk.%d.attn_q.weight", l);       upload_w(m, name, &w->q);
-        snprintf(name, sizeof(name), "blk.%d.attn_k.weight", l);       upload_w(m, name, &w->k);
-        snprintf(name, sizeof(name), "blk.%d.attn_v.weight", l);       upload_w(m, name, &w->v);
-        snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);  upload_w(m, name, &w->o);
-        snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", l);     upload_w(m, name, &w->gate);
-        snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", l);       upload_w(m, name, &w->up);
-        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", l);     upload_w(m, name, &w->down);
-        snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", l);    w->attn_norm = upload_f32(m, name);
-        snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", l);     w->ffn_norm  = upload_f32(m, name);
-        snprintf(name, sizeof(name), "blk.%d.attn_q.bias", l);         w->q_bias    = upload_f32(m, name); /* optional */
-        snprintf(name, sizeof(name), "blk.%d.attn_k.bias", l);         w->k_bias    = upload_f32(m, name); /* optional */
+        const int is_gpu = (l < e->n_gpu_layers);
+        snprintf(name, sizeof(name), "blk.%d.attn_q.weight", l);
+        if (is_gpu) upload_w(m, name, &w->q);
+        else { GGUFTensor *t = gguf_get_tensor(m, name); w->q.ptr = t ? t->data : NULL; w->q.dtype = t ? (int)t->type : -1; }
+        snprintf(name, sizeof(name), "blk.%d.attn_k.weight", l);
+        if (is_gpu) upload_w(m, name, &w->k);
+        else { GGUFTensor *t = gguf_get_tensor(m, name); w->k.ptr = t ? t->data : NULL; w->k.dtype = t ? (int)t->type : -1; }
+        snprintf(name, sizeof(name), "blk.%d.attn_v.weight", l);
+        if (is_gpu) upload_w(m, name, &w->v);
+        else { GGUFTensor *t = gguf_get_tensor(m, name); w->v.ptr = t ? t->data : NULL; w->v.dtype = t ? (int)t->type : -1; }
+        snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);
+        if (is_gpu) upload_w(m, name, &w->o);
+        else { GGUFTensor *t = gguf_get_tensor(m, name); w->o.ptr = t ? t->data : NULL; w->o.dtype = t ? (int)t->type : -1; }
+        snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", l);
+        if (is_gpu) upload_w(m, name, &w->gate);
+        else { GGUFTensor *t = gguf_get_tensor(m, name); w->gate.ptr = t ? t->data : NULL; w->gate.dtype = t ? (int)t->type : -1; }
+        snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", l);
+        if (is_gpu) upload_w(m, name, &w->up);
+        else { GGUFTensor *t = gguf_get_tensor(m, name); w->up.ptr = t ? t->data : NULL; w->up.dtype = t ? (int)t->type : -1; }
+        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", l);
+        if (is_gpu) upload_w(m, name, &w->down);
+        else { GGUFTensor *t = gguf_get_tensor(m, name); w->down.ptr = t ? t->data : NULL; w->down.dtype = t ? (int)t->type : -1; }
+        snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", l);
+        if (is_gpu) w->attn_norm = upload_f32(m, name);
+        else { GGUFTensor *t = gguf_get_tensor(m, name); w->attn_norm = t ? (float*)t->data : NULL; }
+        snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", l);
+        if (is_gpu) w->ffn_norm  = upload_f32(m, name);
+        else { GGUFTensor *t = gguf_get_tensor(m, name); w->ffn_norm = t ? (float*)t->data : NULL; }
+        snprintf(name, sizeof(name), "blk.%d.attn_q.bias", l);
+        if (is_gpu) w->q_bias    = upload_f32(m, name);
+        else { GGUFTensor *t = gguf_get_tensor(m, name); w->q_bias = t ? (float*)t->data : NULL; }
+        snprintf(name, sizeof(name), "blk.%d.attn_k.bias", l);
+        if (is_gpu) w->k_bias    = upload_f32(m, name);
+        else { GGUFTensor *t = gguf_get_tensor(m, name); w->k_bias = t ? (float*)t->data : NULL; }
         snprintf(name, sizeof(name), "blk.%d.post_attention_norm.weight", l); w->post_attn_norm = upload_f32(m, name); /* gemma2 sandwich */
         {   /* gemma4 MatFormer block tensors (optional) */
             GGUFTensor *tg = gguf_get_tensor(m, name);
@@ -1989,8 +2061,9 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     e->graph_exec = NULL;
     e->graph_ready = 0;
     /* TT_PROFILE forces eager mode: event records inside the captured region
-     * are illegal, so per-stage profiling always runs graph-free. */
-    e->no_graph = (getenv("TT_NO_GRAPH") || getenv("TT_PROFILE")) ? 1 : 0;
+     * are illegal, so per-stage profiling always runs graph-free. Hybrid
+     * CPU offloading also uses eager mode since CPU layers cannot be captured. */
+    e->no_graph = (getenv("TT_NO_GRAPH") || getenv("TT_PROFILE") || e->n_gpu_layers < cfg->n_layers) ? 1 : 0;
     e->pending_tok = -1;
     cudaMalloc(&e->d_next_tok, sizeof(int));
     cudaHostAlloc(&e->h_sampled, sizeof(int), cudaHostAllocDefault);
@@ -2008,6 +2081,24 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         if (q8_env && atoi(q8_env) != 0) {
             qwen2_engine_enable_q8_kvcache(e, 1);
         }
+    }
+    if (e->n_gpu_layers < cfg->n_layers) {
+        e->h_x_buf = (float *)malloc(D * sizeof(float));
+        e->h_xn_buf = (float *)malloc(D * sizeof(float));
+        e->h_q_buf = (float *)malloc(max_qout * sizeof(float));
+        e->h_att_buf = (float *)malloc(max_qout * sizeof(float));
+        e->h_h_buf = (float *)malloc(max_ffn * sizeof(float));
+        e->h_g_buf = (float *)malloc(max_ffn * sizeof(float));
+        e->h_u_buf = (float *)malloc(max_ffn * sizeof(float));
+        e->h_out_buf = (float *)malloc(D * sizeof(float));
+        e->h_k_stage = (float *)malloc(kvdim_alloc * sizeof(float));
+        e->h_v_stage = (float *)malloc(kvdim_alloc * sizeof(float));
+        e->h_kc = (float *)calloc((size_t)cfg->n_layers * cfg->n_kv_heads * cfg->max_ctx * cfg->head_dim, sizeof(float));
+        e->h_vc = (float *)calloc((size_t)cfg->n_layers * cfg->n_kv_heads * cfg->max_ctx * cfg->head_dim, sizeof(float));
+    } else {
+        e->h_x_buf = e->h_xn_buf = e->h_q_buf = e->h_att_buf = NULL;
+        e->h_h_buf = e->h_g_buf = e->h_u_buf = e->h_out_buf = NULL;
+        e->h_k_stage = e->h_v_stage = e->h_kc = e->h_vc = NULL;
     }
     return e;
 }
@@ -2042,6 +2133,18 @@ void qwen2_engine_free(Qwen2Engine *e) {
     if (e->graph_exec) cudaGraphExecDestroy(e->graph_exec);
     /* NOTE: per-weight cudaFree calls are intentionally not tracked here; they are
      * leaked until process exit by design (engine lifetime == process lifetime).
+    if (e->h_x_buf) free(e->h_x_buf);
+    if (e->h_xn_buf) free(e->h_xn_buf);
+    if (e->h_q_buf) free(e->h_q_buf);
+    if (e->h_att_buf) free(e->h_att_buf);
+    if (e->h_h_buf) free(e->h_h_buf);
+    if (e->h_g_buf) free(e->h_g_buf);
+    if (e->h_u_buf) free(e->h_u_buf);
+    if (e->h_out_buf) free(e->h_out_buf);
+    if (e->h_k_stage) free(e->h_k_stage);
+    if (e->h_v_stage) free(e->h_v_stage);
+    if (e->h_kc) free(e->h_kc);
+    if (e->h_vc) free(e->h_vc);
      * Tracked as known limitation in PLAN_M6 M6.1. */
     if (e->stream) cudaStreamDestroy(e->stream);
     free(e);
@@ -2157,6 +2260,114 @@ static void ple_canary(Qwen2Engine *e, const char *tag, int l) {
     for (long i = 5376; i < n && bad < 0; i++) if (buf[i] != -777.0f) bad = (int)i;
     fprintf(stderr, "[CANARY] L%d %s firstbad=%d\n", l, tag, bad);
 }
+extern "C" long tt_cpu_gemv(const void *W, int dtype, const float *x, float *y,
+                            int M, int K, int n_threads);
+
+static void cpu_rmsnorm(const float *x, const float *w, float *out, int dim, float eps) {
+    float sum = 0.0f;
+    for (int i = 0; i < dim; i++) sum += x[i] * x[i];
+    float scale = 1.0f / sqrtf(sum / (float)dim + eps);
+    for (int i = 0; i < dim; i++) out[i] = x[i] * scale * w[i];
+}
+
+static void cpu_silu_mult(const float *g, const float *u, float *out, int dim) {
+    for (int i = 0; i < dim; i++) {
+        float val = g[i];
+        float silu = val / (1.0f + expf(-val));
+        out[i] = silu * u[i];
+    }
+}
+
+static void cpu_rope(float *v, int n_heads, int head_dim, int pos, float base) {
+    for (int h = 0; h < n_heads; h++) {
+        float *vec = v + h * head_dim;
+        for (int i = 0; i < head_dim / 2; i++) {
+            float theta = powf(base, -2.0f * (float)i / (float)head_dim) * (float)pos;
+            float cos_th = cosf(theta);
+            float sin_th = sinf(theta);
+            float v0 = vec[i];
+            float v1 = vec[i + head_dim / 2];
+            vec[i]                 = v0 * cos_th - v1 * sin_th;
+            vec[i + head_dim / 2] = v0 * sin_th + v1 * cos_th;
+        }
+    }
+}
+
+static void forward_layer_cpu(Qwen2Engine *e, int l) {
+    const TTConfig *c = &e->cfg;
+    LayerW *w = &e->L[l];
+    const int D = c->dim;
+    const int F = c->hidden_dim;
+    const int HD = c->head_dim;
+    const int H_l = e->pl_heads[l] > 0 ? e->pl_heads[l] : c->n_heads;
+    const int KV_l = e->pl_kv[l] > 0 ? e->pl_kv[l] : c->n_kv_heads;
+    const int HDl = e->pl_hd[l] > 0 ? e->pl_hd[l] : HD;
+    const int attn_qout = H_l * HDl;
+    const int kvdim_l = KV_l * HDl;
+    const int n_threads = 8;
+
+    cpu_rmsnorm(e->h_x_buf, w->attn_norm, e->h_xn_buf, D, c->rms_eps);
+
+    tt_cpu_gemv(w->q.ptr, w->q.dtype, e->h_xn_buf, e->h_q_buf, attn_qout, D, n_threads);
+    tt_cpu_gemv(w->k.ptr, w->k.dtype, e->h_xn_buf, e->h_k_stage, kvdim_l, D, n_threads);
+    tt_cpu_gemv(w->v.ptr, w->v.dtype, e->h_xn_buf, e->h_v_stage, kvdim_l, D, n_threads);
+
+    cpu_rope(e->h_q_buf, H_l, HDl, e->pos, c->rope_base);
+    cpu_rope(e->h_k_stage, KV_l, HDl, e->pos, c->rope_base);
+
+    const float scale = 1.0f / sqrtf((float)HDl);
+    const int gqa_ratio = H_l / KV_l;
+    const int kvdim = KV_l * HDl;
+    float *kc = e->h_kc + (long)l * c->max_ctx * kvdim;
+    float *vc = e->h_vc + (long)l * c->max_ctx * kvdim;
+
+    memcpy(kc + (long)e->pos * kvdim, e->h_k_stage, kvdim * sizeof(float));
+    memcpy(vc + (long)e->pos * kvdim, e->h_v_stage, kvdim * sizeof(float));
+
+    const int ctx_len = e->pos + 1;
+    for (int h = 0; h < H_l; h++) {
+        const int kv = h / gqa_ratio;
+        const float *qh = e->h_q_buf + h * HDl;
+        float *out_h = e->h_att_buf + h * HDl;
+        memset(out_h, 0, HDl * sizeof(float));
+
+        float max_score = -1e30f;
+        float scores[4096];
+        for (int t = 0; t < ctx_len && t < 4096; t++) {
+            const float *kt = kc + (long)t * kvdim + kv * HDl;
+            float score = 0.0f;
+            for (int d = 0; d < HDl; d++) score += qh[d] * kt[d];
+            score *= scale;
+            scores[t] = score;
+            if (score > max_score) max_score = score;
+        }
+        float sum_exp = 0.0f;
+        for (int t = 0; t < ctx_len && t < 4096; t++) {
+            scores[t] = expf(scores[t] - max_score);
+            sum_exp += scores[t];
+        }
+        float inv_sum = 1.0f / sum_exp;
+        for (int t = 0; t < ctx_len && t < 4096; t++) {
+            float weight = scores[t] * inv_sum;
+            const float *vt = vc + (long)t * kvdim + kv * HDl;
+            for (int d = 0; d < HDl; d++) {
+                out_h[d] += weight * vt[d];
+            }
+        }
+    }
+    tt_cpu_gemv(w->o.ptr, w->o.dtype, e->h_att_buf, e->h_out_buf, D, attn_qout, n_threads);
+    for (int i = 0; i < D; i++) e->h_x_buf[i] += e->h_out_buf[i];
+
+    cpu_rmsnorm(e->h_x_buf, w->ffn_norm, e->h_xn_buf, D, c->rms_eps);
+
+    tt_cpu_gemv(w->gate.ptr, w->gate.dtype, e->h_xn_buf, e->h_g_buf, F, D, n_threads);
+    tt_cpu_gemv(w->up.ptr, w->up.dtype, e->h_xn_buf, e->h_u_buf, F, D, n_threads);
+
+    cpu_silu_mult(e->h_g_buf, e->h_u_buf, e->h_h_buf, F);
+
+    tt_cpu_gemv(w->down.ptr, w->down.dtype, e->h_h_buf, e->h_out_buf, D, F, n_threads);
+    for (int i = 0; i < D; i++) e->h_x_buf[i] += e->h_out_buf[i];
+}
 static int forward_layers(Qwen2Engine *e) {
     const TTConfig *c = &e->cfg;
     const int HD = c->head_dim;
@@ -2179,6 +2390,15 @@ static int forward_layers(Qwen2Engine *e) {
     static int trace = -1;
     if (trace < 0) trace = getenv("TT_TRACE") ? 1 : 0;
     for (int l = 0; l < c->n_layers; l++) {
+        if (l == e->n_gpu_layers) {
+            cudaMemcpyAsync(e->h_x_buf, e->d_x, c->dim * sizeof(float),
+                            cudaMemcpyDeviceToHost, e->stream);
+            cudaStreamSynchronize(e->stream);
+        }
+        if (l >= e->n_gpu_layers) {
+            forward_layer_cpu(e, l);
+            continue;
+        }
         LayerW *w = &e->L[l];
         float *Kl_f = e->d_kc + l * cache_layer;
         float *Vl_f = e->d_vc + l * cache_layer;
@@ -2696,6 +2916,11 @@ static int forward_layers(Qwen2Engine *e) {
                 }
             }
         }
+    }
+    if (e->n_gpu_layers < c->n_layers) {
+        cudaMemcpyAsync(e->d_x, e->h_x_buf, c->dim * sizeof(float),
+                        cudaMemcpyHostToDevice, e->stream);
+        cudaStreamSynchronize(e->stream);
     }
     return (int)cudaGetLastError();
 }
@@ -3324,8 +3549,7 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
      * variant; fall back to eager for those. Captured graph works for
      * qwen2.5 (q4_0), llama-3.2 (q6_k despite filename), gemma2 (q6_k). */
     const int edt = e->d_embd.dtype;
-    if (edt != GGUF_TYPE_Q4_0 && edt != GGUF_TYPE_Q6_K) return -1;
-
+    if (edt != GGUF_TYPE_Q4_0 && edt != GGUF_TYPE_Q3_K && edt != GGUF_TYPE_Q6_K) return -1;
     /* dummy valid token before capture begins (plain, uncaptured copy) */
     const int dummy = e->pending_tok >= 0 ? e->pending_tok : 0;
     cudaMemcpy(e->d_next_tok, &dummy, sizeof(int), cudaMemcpyHostToDevice);
@@ -3347,6 +3571,10 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
             const int threads = c->dim / 32;
             k_embed_q4_0_dyn<<<(threads + 255) / 256, 256, 0, e->stream>>>(
                 (const BlockQ4_0 *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
+        } else if (edt == GGUF_TYPE_Q3_K) {
+            const int nu = (c->dim / 256) * 16;
+            k_embed_q3_K_dyn<<<(nu + 255) / 256, 256, 0, e->stream>>>(
+                (const uint8_t *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
         } else { /* GGUF_TYPE_Q6_K */
             const int nu = (c->dim / 256) * 8;
             k_embed_q6_K_dyn<<<(nu + 255) / 256, 256, 0, e->stream>>>(
@@ -3376,6 +3604,10 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
             const int threads = c->dim / 32;
             k_embed_q4_0_dyn<<<(threads + 255) / 256, 256, 0, e->stream>>>(
                 (const BlockQ4_0 *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
+        } else if (edt == GGUF_TYPE_Q3_K) {
+            const int nu = (c->dim / 256) * 16;
+            k_embed_q3_K_dyn<<<(nu + 255) / 256, 256, 0, e->stream>>>(
+                (const uint8_t *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
         } else { /* GGUF_TYPE_Q6_K */
             const int nu = (c->dim / 256) * 8;
             k_embed_q6_K_dyn<<<(nu + 255) / 256, 256, 0, e->stream>>>(

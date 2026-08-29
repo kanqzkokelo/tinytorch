@@ -1147,7 +1147,7 @@ int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
                     else if (dtype == TTQ_Q5_K)
                         k_gemv_q5_K_v2<<<g2, b2, 0, stream>>>((const uint8_t *)W, x, y, M, K);
                     else
-                        k_gemv_q6_K_v2<<<g2, b2, 0, stream>>>((const uint8_t *)W, x, y, M, K);
+                        k_gemv_q6_K<<<g, b, 0, stream>>>((const uint8_t *)W, x, y, M, K);
                     break;
                 }
             }
