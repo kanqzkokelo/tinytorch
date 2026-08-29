@@ -1636,16 +1636,18 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         e->d_split_S_max = S_MAX;
     }
     /* per-layer max kv width: gemma4 full layers carry 2x the kv heads */
+    const char *q8_env_check = getenv("TT_Q8_KV");
+    const int init_q8 = (q8_env_check && atoi(q8_env_check) != 0);
     const long cache_per = (long)max_kv * cfg->max_ctx * cfg->head_dim;
-    cudaMalloc(&e->d_kc, cache_per * cfg->n_layers * sizeof(float));
-    cudaMalloc(&e->d_vc, cache_per * cfg->n_layers * sizeof(float));
-    /* Zero every scratch/cache buffer: parity gates compare raw floats, so any
-     * read of never-written device memory (garbage varies with physical page
-     * assignment per process) shows up as cross-process nondeterminism.
-     * All buffers are logically fully overwritten before use; this is a
-     * deterministic-behavior belt-and-suspenders measure. */
-    cudaMemset(e->d_kc, 0, cache_per * cfg->n_layers * sizeof(float));
-    cudaMemset(e->d_vc, 0, cache_per * cfg->n_layers * sizeof(float));
+    if (!init_q8) {
+        cudaMalloc(&e->d_kc, cache_per * cfg->n_layers * sizeof(float));
+        cudaMalloc(&e->d_vc, cache_per * cfg->n_layers * sizeof(float));
+        cudaMemset(e->d_kc, 0, cache_per * cfg->n_layers * sizeof(float));
+        cudaMemset(e->d_vc, 0, cache_per * cfg->n_layers * sizeof(float));
+    } else {
+        e->d_kc = NULL;
+        e->d_vc = NULL;
+    }
     cudaMemset(e->d_xn, 0, D * sizeof(float));
     cudaMemset(e->d_q, 0, max_qout * sizeof(float));
     cudaMemset(e->d_att, 0, max_qout * sizeof(float));
