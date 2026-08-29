@@ -51,8 +51,12 @@ static const ArchEntry kArchTable[] = {
     { "qwen2", { ROPE_NEOX, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
     /* "llama" covers mistral / tinyllama / smollm conversions. Interleaved
      * rope (LLAMA_ROPE_TYPE_NORM), no biases, untied head. */
-    { "llama", { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
-    /* qwen3: qwen2-style rope + per-head q/k rmsnorm pre-rope. */
+    { "llama",    { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
+    { "llama3",   { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
+    { "llama2",   { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
+    { "mistral",  { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
+    { "smollm",   { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
+    { "smollm2",  { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
     { "qwen3", { ROPE_NEOX, ACT_SILU, 0.0f, 0, 0, 1, 1e-6f, 0.0f, 0, 0, 0 } },
     /* gemma: NEOX rope, GeGLU(gelu), tied embeddings, no softcap/swa. */
     { "gemma", { ROPE_NEOX, ACT_GELU, 0.0f, 0, 1, 0, 0.0f, 0.0f, 1, 0, 0 } },

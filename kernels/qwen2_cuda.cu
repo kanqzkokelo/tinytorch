@@ -302,6 +302,27 @@ __global__ void k_rope_gptj(float *__restrict__ q, int n_heads, int head_dim,
     row[i0] = v0 * c - v1 * s;
     row[i1] = v0 * s + v1 * c;
 }
+/* GPT-J style RoPE with per-pair frequency factors:
+ * Consecutive pairs (2i, 2i+1) rotated by ang = pos * freq / div. */
+__global__ void k_rope_gptj_ff(float *__restrict__ q, int n_heads, int head_dim,
+                               const int *__restrict__ d_pos, float base,
+                               const float *__restrict__ ff) {
+    const int pos = *d_pos;
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;   /* 0..head_dim/2 */
+    const int h = blockIdx.y;
+    if (h >= n_heads || i >= head_dim / 2) return;
+
+    float *row = q + (long)h * head_dim;
+    const float freq = powf(base, -2.0f * (float)i / (float)head_dim);
+    const float div = ff ? ff[i] : 1.0f;
+    const float ang = (float)pos * freq / div;
+    const float c = cosf(ang), s = sinf(ang);
+    const int i0 = 2 * i, i1 = 2 * i + 1;
+    const float v0 = row[i0], v1 = row[i1];
+    row[i0] = v0 * c - v1 * s;
+    row[i1] = v0 * s + v1 * c;
+}
+
 
 /* M7 task 3: per-head RMSNorm over q/k rows pre-rope (qwen3 trait).
  * One block per head; mean-of-squares over head_dim only.
@@ -2050,16 +2071,18 @@ static int forward_layers(Qwen2Engine *e) {
             const float *ff_l = (e->has_pl_embd && is_full_l) ? e->d_rope_freqs : NULL;
             void (*rope_fn)(float *, int, int, const int *, float) =
                 (c->tr.rope == ROPE_GPTJ) ? k_rope_gptj : k_rope;
+            void (*rope_ff_fn)(float *, int, int, const int *, float, const float *) =
+                (c->tr.rope == ROPE_GPTJ) ? k_rope_gptj_ff : k_rope_ff;
             g.x = (HDl / 2 + 63) / 64; g.y = H_l; g.z = 1;
             b.x = 64; b.y = 1; b.z = 1;
             if (ff_l)
-                k_rope_ff<<<g, b, 0, e->stream>>>(e->d_q, H_l, HDl, e->d_pos, base_l, ff_l);
+                rope_ff_fn<<<g, b, 0, e->stream>>>(e->d_q, H_l, HDl, e->d_pos, base_l, ff_l);
             else
                 rope_fn<<<g, b, 0, e->stream>>>(e->d_q, H_l, HDl, e->d_pos, base_l);
             g.x = (HDl / 2 + 63) / 64; g.y = KV_l; g.z = 1;
             if (!kv_shared) {
             if (ff_l)
-                k_rope_ff<<<g, b, 0, e->stream>>>(e->d_k_stage, KV_l, HDl, e->d_pos, base_l, ff_l);
+                rope_ff_fn<<<g, b, 0, e->stream>>>(e->d_k_stage, KV_l, HDl, e->d_pos, base_l, ff_l);
             else
                 rope_fn<<<g, b, 0, e->stream>>>(e->d_k_stage, KV_l, HDl, e->d_pos, base_l);
             }
@@ -2766,14 +2789,16 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
             static int no_rope = -1;
             if (no_rope < 0) no_rope = getenv("TT_NO_ROPE") ? 1 : 0;
             if (!no_rope) {
+                void (*rope_ff_fn)(float *, int, int, const int *, float, const float *) =
+                    (c->tr.rope == ROPE_GPTJ) ? k_rope_gptj_ff : k_rope_ff;
                 if (ff_l)
-                    k_rope_ff<<<g_q, b_rope, 0, e->stream>>>(d_Q + (long)i * attn_qout, H_l, HDl, d_pos_i, base_l, ff_l);
+                    rope_ff_fn<<<g_q, b_rope, 0, e->stream>>>(d_Q + (long)i * attn_qout, H_l, HDl, d_pos_i, base_l, ff_l);
                 else
                     rope_fn<<<g_q, b_rope, 0, e->stream>>>(d_Q + (long)i * attn_qout, H_l, HDl, d_pos_i, base_l);
 
                 if (!kv_shared) {
                     if (ff_l)
-                        k_rope_ff<<<g_k, b_rope, 0, e->stream>>>(d_K + (long)i * kvdim_l, KV_l, HDl, d_pos_i, base_l, ff_l);
+                        rope_ff_fn<<<g_k, b_rope, 0, e->stream>>>(d_K + (long)i * kvdim_l, KV_l, HDl, d_pos_i, base_l, ff_l);
                     else
                         rope_fn<<<g_k, b_rope, 0, e->stream>>>(d_K + (long)i * kvdim_l, KV_l, HDl, d_pos_i, base_l);
                 }
