@@ -2928,8 +2928,24 @@ int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
     /* resync device position scalar before any forward work (sync: see advance()) */
     cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
     if (n >= 32 && !e->has_pl_embd && e->cfg.tr.softcap_value == 0.0f) {
-        int rc = prefill_batched_gemm(e, toks, n, NULL);
-        if (rc == 0) {
+        const int CHUNK_SIZE = 512;
+        int offset = 0;
+        int failed = 0;
+        while (offset < n) {
+            int chunk_len = (offset + CHUNK_SIZE <= n) ? CHUNK_SIZE : (n - offset);
+            if (chunk_len >= 32) {
+                int rc = prefill_batched_gemm(e, toks + offset, chunk_len, NULL);
+                if (rc != 0) { failed = 1; break; }
+            } else {
+                for (int i = 0; i < chunk_len; i++) {
+                    int rc = advance(e, toks[offset + i]);
+                    if (rc) { failed = 1; break; }
+                }
+                if (failed) break;
+            }
+            offset += chunk_len;
+        }
+        if (!failed) {
             cudaStreamSynchronize(e->stream);
             return 0;
         }

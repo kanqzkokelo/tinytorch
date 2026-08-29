@@ -153,7 +153,7 @@ int main(int argc, char **argv) {
     float *d_logits = NULL;
     float *h_logits = (float *)malloc(sizeof(float) * cfg.vocab * MAX_CANDIDATES);
     if (!h_logits) { fprintf(stderr, "[spec] OOM h_logits\n"); return 1; }
-    CUDA_OK(cudaMalloc(&d_logits, sizeof(float) * cfg.vocab * MAX_CANDIDATES));
+    CUDA_OK(cudaMalloc((void **)&d_logits, sizeof(float) * cfg.vocab * MAX_CANDIDATES));
 
     /* ---- Decode loop ---- */
     struct timespec t0, t1, tp0;
