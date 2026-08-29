@@ -156,6 +156,12 @@ $(BUILD)/dequant_ref: src/dequant_ref.c src/loader_gguf.c include/dequant_ref.h 
 dequant_ref: $(BUILD)/dequant_ref
 
 .PHONY: dequant_ref
+$(BUILD)/bench_ipc: tools/bench_ipc_throughput.c src/tinytorch_ipc.c include/tinytorch_ipc.h | $(BUILD)
+	$(CC) $(CFLAGS) -Iinclude -o $@ tools/bench_ipc_throughput.c src/tinytorch_ipc.c -lpthread -lrt
+
+bench_ipc: $(BUILD)/bench_ipc
+
+.PHONY: bench_ipc
 
 # M7 task 2: GPU golden GEMV grid for all Tier-1 quant types
 $(BUILD)/test_gemv_typed: tools/test_gemv_typed.cu src/loader_gguf.c src/dequant_ref.c \

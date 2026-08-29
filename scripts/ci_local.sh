@@ -78,6 +78,10 @@ if [ ! -x build/cpu_backend ] || [ src/cpu_backend.c -nt build/cpu_backend ]; th
       -DCPU_BACKEND_MAIN -o build/cpu_backend src/cpu_backend.c -lm
 fi
 run test-cpu-backend python3 tests/test_cpu_backend.py
+if [ ! -x build/bench_ipc ] || [ src/tinytorch_ipc.c -nt build/bench_ipc ] || [ tools/bench_ipc_throughput.c -nt build/bench_ipc ]; then
+  $CC_BIN -O3 -std=c11 -Wall -Wextra -Iinclude src/tinytorch_ipc.c tools/bench_ipc_throughput.c -lpthread -lrt -o build/bench_ipc
+fi
+run test-ipc build/bench_ipc
 
 SEC=$(( $(date +%s) - T0 ))
 if [ "$FAIL" -eq 0 ]; then
