@@ -1472,6 +1472,36 @@ __global__ void k_embed_q6_K_dyn(const uint8_t *__restrict__ W, const int *__res
     }
 }
 
+__global__ void k_embed_q2_K_dyn(const uint8_t *__restrict__ W, const int *__restrict__ d_tok,
+                                 float *__restrict__ dx, int dim) {
+    const int tok = *d_tok;
+    const int u = threadIdx.x + blockIdx.x * blockDim.x;
+    const int nu = (dim / 256) * 16;
+    if (u >= nu) return;
+    const int sb  = u >> 4;
+    const int is  = u & 15;
+    const int n   = is >> 3;
+    const int j   = (is & 7) >> 1;
+    const int is0 = is & 1;
+    const int shift = j << 1;
+
+    const uint8_t *blk = W + (long)tok * (dim / 256) * 84 + sb * 84;
+    const uint8_t sc = blk[is];
+
+    const float d   = __half2float(*(const __half *)(blk + 80));
+    const float dm  = __half2float(*(const __half *)(blk + 82));
+    const float dl  = d  * (float)(sc & 0xF);
+    const float ml  = dm * (float)(sc >> 4);
+
+    const uint8_t *q = blk + 16 + 32 * n + 16 * is0;
+    float *dst = dx + (long)sb * 256 + is * 16;
+
+#pragma unroll
+    for (int l = 0; l < 16; l++) {
+        int8_t w = (int8_t)((q[l] >> shift) & 3);
+        dst[l] = dl * (float)w - ml;
+    }
+}
 __global__ void k_embed_q3_K_dyn(const uint8_t *__restrict__ W, const int *__restrict__ d_tok,
                                  float *__restrict__ dx, int dim) {
     const int tok = *d_tok;
@@ -3566,8 +3596,7 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
      * variant; fall back to eager for those. Captured graph works for
      * qwen2.5 (q4_0), llama-3.2 (q6_k despite filename), gemma2 (q6_k). */
     const int edt = e->d_embd.dtype;
-    if (edt != GGUF_TYPE_Q4_0 && edt != GGUF_TYPE_Q3_K && edt != GGUF_TYPE_Q6_K) return -1;
-    /* dummy valid token before capture begins (plain, uncaptured copy) */
+    if (edt != GGUF_TYPE_Q4_0 && edt != GGUF_TYPE_Q2_K && edt != GGUF_TYPE_Q3_K && edt != GGUF_TYPE_Q6_K) return -1;
     const int dummy = e->pending_tok >= 0 ? e->pending_tok : 0;
     cudaMemcpy(e->d_next_tok, &dummy, sizeof(int), cudaMemcpyHostToDevice);
     cudaStreamSynchronize(e->stream);
@@ -3588,6 +3617,10 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
             const int threads = c->dim / 32;
             k_embed_q4_0_dyn<<<(threads + 255) / 256, 256, 0, e->stream>>>(
                 (const BlockQ4_0 *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
+        } else if (edt == GGUF_TYPE_Q2_K) {
+            const int nu = (c->dim / 256) * 16;
+            k_embed_q2_K_dyn<<<(nu + 255) / 256, 256, 0, e->stream>>>(
+                (const uint8_t *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
         } else if (edt == GGUF_TYPE_Q3_K) {
             const int nu = (c->dim / 256) * 16;
             k_embed_q3_K_dyn<<<(nu + 255) / 256, 256, 0, e->stream>>>(
@@ -3621,6 +3654,10 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
             const int threads = c->dim / 32;
             k_embed_q4_0_dyn<<<(threads + 255) / 256, 256, 0, e->stream>>>(
                 (const BlockQ4_0 *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
+        } else if (edt == GGUF_TYPE_Q2_K) {
+            const int nu = (c->dim / 256) * 16;
+            k_embed_q2_K_dyn<<<(nu + 255) / 256, 256, 0, e->stream>>>(
+                (const uint8_t *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
         } else if (edt == GGUF_TYPE_Q3_K) {
             const int nu = (c->dim / 256) * 16;
             k_embed_q3_K_dyn<<<(nu + 255) / 256, 256, 0, e->stream>>>(

@@ -325,13 +325,15 @@ GGUFModel *gguf_load(const char *filepath) {
         else if (t->type == GGUF_TYPE_Q5_0) t->size_bytes = (size_t)(numel / 32) * 22;
         else if (t->type == GGUF_TYPE_Q5_1) t->size_bytes = (size_t)(numel / 32) * 24;
         else if (t->type == GGUF_TYPE_Q8_0) t->size_bytes = (size_t)(numel / 32) * 34; /* fp16 d + 32 i8 */
-        else if (t->type == GGUF_TYPE_Q3_K || t->type == GGUF_TYPE_Q4_K ||
-                 t->type == GGUF_TYPE_Q5_K || t->type == GGUF_TYPE_Q6_K) {
+        else if (t->type == GGUF_TYPE_Q2_K || t->type == GGUF_TYPE_Q3_K ||
+                 t->type == GGUF_TYPE_Q4_K || t->type == GGUF_TYPE_Q5_K ||
+                 t->type == GGUF_TYPE_Q6_K) {
             if (numel % 256 != 0)
                 fprintf(stderr, "[GGUF] WARN: %s K-quant numel %lld not multiple of 256\n",
                         t->name, (long long)numel);
             long long blocks = numel / 256;
-            if (t->type == GGUF_TYPE_Q3_K)      t->size_bytes = (size_t)(blocks * 110);
+            if (t->type == GGUF_TYPE_Q2_K)      t->size_bytes = (size_t)(blocks * 84);
+            else if (t->type == GGUF_TYPE_Q3_K) t->size_bytes = (size_t)(blocks * 110);
             else if (t->type == GGUF_TYPE_Q4_K) t->size_bytes = (size_t)(blocks * 144);
             else if (t->type == GGUF_TYPE_Q5_K) t->size_bytes = (size_t)(blocks * 176);
             else                                 t->size_bytes = (size_t)(blocks * 210);

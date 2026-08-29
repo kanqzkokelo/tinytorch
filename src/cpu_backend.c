@@ -28,6 +28,7 @@
 /* TTQ_* type codes (dequant_ref.h values; duplicated to stay header-only) */
 #define TTQ_Q4_0 2
 #define TTQ_Q8_0 8
+#define TTQ_Q2_K 10
 #define TTQ_Q3_K 11
 #define TTQ_Q4_K 12
 #define TTQ_Q5_K 13
@@ -38,11 +39,11 @@
 #define K_SCALE_SIZE 12       /* packed 6-bit scale/min bytes (q4_K/q5_K) */
 #define QK4_0_BS 18           /* bytes per q4_0 block: fp16 d + 16 nibbles */
 #define QK8_0_BS 34           /* bytes per q8_0 block: fp16 d + 32 int8    */
+#define QK2_K_BS 84           /* scales[16] | qs[64] | fp16 d, fp16 dmin   */
 #define QK3_K_BS 110          /* hmask[32] | qs[64] | scales[12] | fp16 d  */
 #define QK4_K_BS 144          /* d,dmin | scales[12] | qs[128]            */
 #define QK5_K_BS 176          /* d,dmin | scales[12] | qh[32] | qs[128]   */
 #define QK6_K_BS 210          /* ql[128] | qh[64] | sc[16] | fp16 d       */
-
 #if defined(__x86_64__) || defined(__i386__)
 #define CB_X86 1
 #include <immintrin.h>
@@ -135,6 +136,44 @@ static inline float row_dot_q8_0(const uint8_t *rw, const float *x, int K) {
 
 /* block_q4_K: fp16 d | fp16 dmin | scales[12] | qs[128]  (144 B / 256 vals).
  * Value math: d*sc*(nib) - min*m per sub-block (dequant_ref.c dq_q4_K). */
+static inline float row_dot_q2_K(const uint8_t *rw, const float *x, int K) {
+    const int nb = K / QK_K;
+    float acc = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *blk = rw + (long)b * QK2_K_BS;
+        uint16_t dh, dmh;
+        memcpy(&dh, blk + 80, 2);
+        memcpy(&dmh, blk + 82, 2);
+        const float d = cb_fp16_to_fp32(dh);
+        const float min = cb_fp16_to_fp32(dmh);
+        const uint8_t *q = blk + 16;
+        const float *xb = x + (long)b * QK_K;
+        float sum = 0.0f;
+        int is = 0;
+        for (int n = 0; n < QK_K; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                uint8_t sc0 = blk[is++];
+                float dl0 = d * (float)(sc0 & 0xF);
+                float ml0 = min * (float)(sc0 >> 4);
+                for (int l = 0; l < 16; ++l)
+                    sum += (dl0 * ((int8_t)((q[l] >> shift) & 3)) - ml0) * xb[l];
+
+                uint8_t sc1 = blk[is++];
+                float dl1 = d * (float)(sc1 & 0xF);
+                float ml1 = min * (float)(sc1 >> 4);
+                for (int l = 0; l < 16; ++l)
+                    sum += (dl1 * ((int8_t)((q[l + 16] >> shift) & 3)) - ml1) * xb[l + 16];
+
+                shift += 2;
+                xb += 32;
+            }
+            q += 32;
+        }
+        acc += sum;
+    }
+    return acc;
+}
 static inline float row_dot_q3_K(const uint8_t *rw, const float *x, int K) {
     const int nb = K / QK_K;
     const uint32_t kmask1 = 0x03030303;
@@ -788,6 +827,8 @@ static inline float row_dot(const uint8_t *rw, int dtype, const float *x,
             if (use_avx2) return row_dot_q8_0_avx2(rw, x, K);
 #endif
             return row_dot_q8_0(rw, x, K);
+        case TTQ_Q2_K:
+            return row_dot_q2_K(rw, x, K);
         case TTQ_Q3_K:
             return row_dot_q3_K(rw, x, K);
         case TTQ_Q4_K:
@@ -813,17 +854,17 @@ long tt_cpu_gemv(const void *W, int dtype, const float *x, float *y,
                  int M, int K, int n_threads) {
     if (!W || !x || !y || M <= 0 || K <= 0) return -1;
     if (dtype != TTQ_Q4_0 && dtype != TTQ_Q8_0 &&
-        dtype != TTQ_Q3_K && dtype != TTQ_Q4_K &&
+        dtype != TTQ_Q2_K && dtype != TTQ_Q3_K && dtype != TTQ_Q4_K &&
         dtype != TTQ_Q5_K && dtype != TTQ_Q6_K) {
         fprintf(stderr, "[cpu-backend] unsupported dtype %d "
-                "(Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K only)\n", dtype);
+                "(Q4_0/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K only)\n", dtype);
         return -100;
     }
     if (K % QK != 0 ||
-        ((dtype == TTQ_Q3_K || dtype == TTQ_Q4_K || dtype == TTQ_Q5_K || dtype == TTQ_Q6_K) &&
+        ((dtype == TTQ_Q2_K || dtype == TTQ_Q3_K || dtype == TTQ_Q4_K || dtype == TTQ_Q5_K || dtype == TTQ_Q6_K) &&
          K % QK_K != 0)) {
         fprintf(stderr, "[cpu-backend] K=%d not a multiple of %d%s\n", K, QK,
-                (dtype == TTQ_Q3_K || dtype == TTQ_Q4_K || dtype == TTQ_Q5_K ||
+                (dtype == TTQ_Q2_K || dtype == TTQ_Q3_K || dtype == TTQ_Q4_K || dtype == TTQ_Q5_K ||
                  dtype == TTQ_Q6_K) ? " (K-quants need %256)" : "");
         return -101;
     }
@@ -833,14 +874,14 @@ long tt_cpu_gemv(const void *W, int dtype, const float *x, float *y,
     switch (dtype) {
         case TTQ_Q4_0: bs = QK4_0_BS; break;
         case TTQ_Q8_0: bs = QK8_0_BS; break;
+        case TTQ_Q2_K: bs = QK2_K_BS; break;
         case TTQ_Q3_K: bs = QK3_K_BS; break;
         case TTQ_Q4_K: bs = QK4_K_BS; break;
         case TTQ_Q5_K: bs = QK5_K_BS; break;
         default:       bs = QK6_K_BS; break;
     }
-    const int row_vals = (bs >= QK3_K_BS) ? QK_K : QK;
+    const int row_vals = (bs >= QK2_K_BS) ? QK_K : QK;
     const int use_avx2 = cb_using_avx2();
-
     const uint8_t *w = (const uint8_t *)W;
 #ifdef _OPENMP
 #pragma omp parallel for num_threads(n_threads) schedule(static)
@@ -878,12 +919,13 @@ int main(int argc, char **argv) {
     switch (dtype) {
         case TTQ_Q4_0: bs = QK4_0_BS; break;
         case TTQ_Q8_0: bs = QK8_0_BS; break;
+        case TTQ_Q2_K: bs = QK2_K_BS; break;
         case TTQ_Q3_K: bs = QK3_K_BS; break;
         case TTQ_Q4_K: bs = QK4_K_BS; break;
         case TTQ_Q5_K: bs = QK5_K_BS; break;
         default:       bs = QK6_K_BS; break;
     }
-    long wbytes = (long)M * (K / ((bs >= QK3_K_BS) ? QK_K : QK)) * bs;
+    long wbytes = (long)M * (K / ((bs >= QK2_K_BS) ? QK_K : QK)) * bs;
     FILE *f = fopen(wpath, "rb");
     if (!f) { perror("open W"); return 1; }
     void *W = malloc((size_t)wbytes);

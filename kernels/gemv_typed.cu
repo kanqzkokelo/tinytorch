@@ -161,6 +161,46 @@ __global__ void k_gemv_q8_0(const uint8_t *__restrict__ W,
  * Lane strides units u = sb*8 + s (sb super-block, s sub-block), so all
  * K/32 lanes are busy regardless of how many super-blocks fit in K.       */
 
+/* q2_K: 84B super-blocks of 256 values (16 sub-blocks of 16 values) */
+__global__ void k_gemv_q2_K(const uint8_t *__restrict__ W,
+                            const float *__restrict__ x, float *__restrict__ y,
+                            int M, int K) {
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= M) return;
+    const int lane = threadIdx.x;
+    const int nsb = K / 256;
+    const int nu = nsb * 16;
+    const uint8_t *rw = W + (long)row * nsb * 84;
+    float s = 0.0f;
+
+    for (int u = lane; u < nu; u += 32) {
+        const int sb  = u >> 4;
+        const int is  = u & 15;
+        const int n   = is >> 3;
+        const int j   = (is & 7) >> 1;
+        const int is0 = is & 1;
+        const int shift = j << 1;
+
+        const uint8_t *blk = rw + sb * 84;
+        const uint8_t sc = blk[is];
+
+        const float d   = half_at(blk + 80);
+        const float dm  = half_at(blk + 82);
+        const float dl  = d  * (float)(sc & 0xF);
+        const float ml  = dm * (float)(sc >> 4);
+
+        const uint8_t *q = blk + 16 + 32 * n + 16 * is0;
+        const float *xb = x + (long)sb * 256 + is * 16;
+
+#pragma unroll
+        for (int l = 0; l < 16; l++) {
+            int8_t w = (int8_t)((q[l] >> shift) & 3);
+            s += (dl * (float)w - ml) * xb[l];
+        }
+    }
+    s = warp_reduce_sum(s);
+    if (lane == 0) y[row] = s;
+}
 /* q3_K: 110B super-blocks of 256 values (16 sub-blocks of 16 values) */
 __global__ void k_gemv_q3_K(const uint8_t *__restrict__ W,
                             const float *__restrict__ x, float *__restrict__ y,
@@ -340,6 +380,82 @@ __global__ void k_gemv_q6_K(const uint8_t *__restrict__ W,
  *      N >= 0, even for Q6_K's 210 stride).
  */
 
+/* 2-rows-per-warp V2 for q2_K. 16 sub-blocks of 16 weights = 256 weights (84B). */
+__global__ void k_gemv_q2_K_v2(const uint8_t *__restrict__ W,
+                               const float *__restrict__ x,
+                               float *__restrict__ y,
+                               int M, int K) {
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 2;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x;
+    const int nsb = K / 256;
+    const int nu  = nsb * 16;
+
+    const uint8_t *rw0 = W + (long)row0 * nsb * 84;
+    const uint8_t *rw1 = W + (long)row1 * nsb * 84;
+    float s0 = 0.0f, s1 = 0.0f;
+
+    for (int u = lane; u < nu; u += 32) {
+        const int sb  = u >> 4;
+        const int is  = u & 15;
+        const int n   = is >> 3;
+        const int j   = (is & 7) >> 1;
+        const int is0 = is & 1;
+        const int shift = j << 1;
+
+        const uint8_t *blk0 = rw0 + sb * 84;
+        const uint8_t *blk1 = rw1 + sb * 84;
+
+        const uint8_t sc0 = blk0[is];
+        const uint8_t sc1 = blk1[is];
+
+        const float d0   = half_at(blk0 + 80);
+        const float dm0  = half_at(blk0 + 82);
+        const float dl0  = d0  * (float)(sc0 & 0xF);
+        const float ml0  = dm0 * (float)(sc0 >> 4);
+
+        const float d1   = half_at(blk1 + 80);
+        const float dm1  = half_at(blk1 + 82);
+        const float dl1  = d1  * (float)(sc1 & 0xF);
+        const float ml1  = dm1 * (float)(sc1 >> 4);
+
+        const uint8_t *q0 = blk0 + 16 + 32 * n + 16 * is0;
+        const uint8_t *q1 = blk1 + 16 + 32 * n + 16 * is0;
+
+        const float *xb = x + (long)sb * 256 + is * 16;
+        const float4 *x4 = (const float4 *)xb;
+
+#pragma unroll
+        for (int c = 0; c < 4; c++) {
+            const float4 xv = x4[c];
+            const int base_l = c * 4;
+
+            int8_t w0_0 = (int8_t)((q0[base_l + 0] >> shift) & 3);
+            int8_t w0_1 = (int8_t)((q0[base_l + 1] >> shift) & 3);
+            int8_t w0_2 = (int8_t)((q0[base_l + 2] >> shift) & 3);
+            int8_t w0_3 = (int8_t)((q0[base_l + 3] >> shift) & 3);
+
+            int8_t w1_0 = (int8_t)((q1[base_l + 0] >> shift) & 3);
+            int8_t w1_1 = (int8_t)((q1[base_l + 1] >> shift) & 3);
+            int8_t w1_2 = (int8_t)((q1[base_l + 2] >> shift) & 3);
+            int8_t w1_3 = (int8_t)((q1[base_l + 3] >> shift) & 3);
+
+            s0 += (dl0 * w0_0 - ml0) * xv.x + (dl0 * w0_1 - ml0) * xv.y
+                + (dl0 * w0_2 - ml0) * xv.z + (dl0 * w0_3 - ml0) * xv.w;
+
+            s1 += (dl1 * w1_0 - ml1) * xv.x + (dl1 * w1_1 - ml1) * xv.y
+                + (dl1 * w1_2 - ml1) * xv.z + (dl1 * w1_3 - ml1) * xv.w;
+        }
+    }
+
+    s0 = warp_reduce_sum(s0);
+    s1 = warp_reduce_sum(s1);
+    if (lane == 0) {
+        y[row0] = s0;
+        if (row1 < M) y[row1] = s1;
+    }
+}
 /* 2-rows-per-warp V2 for q3_K. 16 sub-blocks of 16 weights = 256 weights. */
 __global__ void k_gemv_q3_K_v2(const uint8_t *__restrict__ W,
                                const float *__restrict__ x,
@@ -907,6 +1023,35 @@ __global__ void k_embed_q8_0(const uint8_t *__restrict__ W, int tok,
     for (int j = 0; j < 32; j++) out[j] = (float)qs[j] * d;
 }
 
+__global__ void k_embed_q2_K(const uint8_t *__restrict__ W, int tok,
+                             float *__restrict__ x, int dim) {
+    const int u = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nu = (dim / 256) * 16;
+    if (u >= nu) return;
+    const int sb  = u >> 4;
+    const int is  = u & 15;
+    const int n   = is >> 3;
+    const int j   = (is & 7) >> 1;
+    const int is0 = is & 1;
+    const int shift = j << 1;
+
+    const uint8_t *blk = W + (long)tok * (dim / 256) * 84 + sb * 84;
+    const uint8_t sc = blk[is];
+
+    const float d   = half_at(blk + 80);
+    const float dm  = half_at(blk + 82);
+    const float dl  = d  * (float)(sc & 0xF);
+    const float ml  = dm * (float)(sc >> 4);
+
+    const uint8_t *q = blk + 16 + 32 * n + 16 * is0;
+    float *dst = x + (long)sb * 256 + is * 16;
+
+#pragma unroll
+    for (int l = 0; l < 16; l++) {
+        int8_t w = (int8_t)((q[l] >> shift) & 3);
+        dst[l] = dl * (float)w - ml;
+    }
+}
 __global__ void k_embed_q3_K(const uint8_t *__restrict__ W, int tok,
                              float *__restrict__ x, int dim) {
     const int u = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1127,6 +1272,7 @@ int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
             k_gemv_q8_0<<<g, b, 0, stream>>>((const uint8_t *)W, x, y, M, K);
             break;
         }
+        case TTQ_Q2_K:
         case TTQ_Q3_K:
         case TTQ_Q4_K:
         case TTQ_Q5_K:
@@ -1140,7 +1286,9 @@ int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
             if (M >= 2) {
                 dim3 g2, b2;
                 if (gemv_dims2(M, &g2, &b2) == 0) {
-                    if (dtype == TTQ_Q3_K)
+                    if (dtype == TTQ_Q2_K)
+                        k_gemv_q2_K_v2<<<g2, b2, 0, stream>>>((const uint8_t *)W, x, y, M, K);
+                    else if (dtype == TTQ_Q3_K)
                         k_gemv_q3_K_v2<<<g2, b2, 0, stream>>>((const uint8_t *)W, x, y, M, K);
                     else if (dtype == TTQ_Q4_K)
                         k_gemv_q4_K_v2<<<g2, b2, 0, stream>>>((const uint8_t *)W, x, y, M, K);
@@ -1151,7 +1299,9 @@ int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
                     break;
                 }
             }
-            if (dtype == TTQ_Q3_K)
+            if (dtype == TTQ_Q2_K)
+                k_gemv_q2_K<<<g, b, 0, stream>>>((const uint8_t *)W, x, y, M, K);
+            else if (dtype == TTQ_Q3_K)
                 k_gemv_q3_K<<<g, b, 0, stream>>>((const uint8_t *)W, x, y, M, K);
             else if (dtype == TTQ_Q4_K)
                 k_gemv_q4_K<<<g, b, 0, stream>>>((const uint8_t *)W, x, y, M, K);
@@ -1355,6 +1505,7 @@ int tt_embed_typed(const void *dW, int dtype, int tok, float *dx, int dim,
             k_embed_q8_0<<<(dim / 32 + 255) / 256, 256, 0, stream>>>(
                 (const uint8_t *)dW, tok, dx, dim);
             break;
+        case TTQ_Q2_K:
         case TTQ_Q3_K:
         case TTQ_Q4_K:
         case TTQ_Q5_K:
@@ -1365,7 +1516,11 @@ int tt_embed_typed(const void *dW, int dtype, int tok, float *dx, int dim,
                 return -101;
             }
             const int nu = (dim / 256) * 8;
-            if (dtype == TTQ_Q3_K) {
+            if (dtype == TTQ_Q2_K) {
+                const int nu2 = (dim / 256) * 16;
+                k_embed_q2_K<<<(nu2 + 255) / 256, 256, 0, stream>>>(
+                    (const uint8_t *)dW, tok, dx, dim);
+            } else if (dtype == TTQ_Q3_K) {
                 const int nu3 = (dim / 256) * 16;
                 k_embed_q3_K<<<(nu3 + 255) / 256, 256, 0, stream>>>(
                     (const uint8_t *)dW, tok, dx, dim);

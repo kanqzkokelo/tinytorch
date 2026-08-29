@@ -18,6 +18,7 @@ typedef enum {
     GGUF_TYPE_Q5_0 = 6,
     GGUF_TYPE_Q5_1 = 7,
     GGUF_TYPE_Q8_0 = 8,
+    GGUF_TYPE_Q2_K = 10,
     GGUF_TYPE_Q3_K = 11,
     GGUF_TYPE_Q4_K = 12, /* Q4_K_S files use this layout */
     GGUF_TYPE_Q5_K = 13, /* Q5_K_S files use this layout */
