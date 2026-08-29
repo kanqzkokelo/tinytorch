@@ -14,7 +14,9 @@
 3. **Graph Capture Invariant**: Split-K slice count $S$ must be fixed or clamped per graph capture boundary to ensure deterministic node execution.
 
 ### Architectural Solution:
-- **Clean Split-K Partitioning**: Dynamic split count $S = \text{clamp}((\text{pos} + 1 + 31) / 32, 1, 16)$ for eager execution, and fixed $S=16$ (or $S=32$) with explicit masking inside the combine kernel for graph capture.
+- **Clean Split-K Partitioning**:
+  - **Eager Execution**: Dynamic split count $S = \text{clamp}((\text{pos} + 1 + 31) / 32, 1, 16)$ based on host position.
+  - **CUDA Graph Capture Execution**: Static grid with fixed $S = 16$ (or $S=32$). Inside the split kernel, if $s \times 32 \ge \text{active\_slots}$, the block writes sentinel values ($p\_m = -1\times 10^{30}\text{f}, p\_l = 0.0\text{f}, p\_acc = 0.0\text{f}$) and returns immediately. This guarantees 100% static graph topology invariant across position increments.
 - **Robust Combine Reduction**:
   ```cpp
   float m_global = -1e30f, l_global = 0.0f;
@@ -22,7 +24,7 @@
   for (int s = 0; s < S; s++) {
       float m_s = p_m[s * n_heads + h];
       float l_s = p_l[s * n_heads + h];
-      if (l_s <= 0.0f || !isfinite(m_s) || m_s <= -1e20f) continue; // skip inactive slices
+      if (!isfinite(m_s) || !isfinite(l_s) || l_s <= 0.0f || m_s <= -1e20f) continue; // robust skip
       float m_new = fmaxf(m_global, m_s);
       float alpha_prev = expf(m_global - m_new);
       float alpha_s    = expf(m_s - m_new);
@@ -39,6 +41,11 @@
   out[h * head_dim + lane * 4 + 2] = acc[2] * inv_l;
   out[h * head_dim + lane * 4 + 3] = acc[3] * inv_l;
   ```
+- **SWA Windowing Calculation**:
+  `int t_lo = (window > 0 && pos >= window) ? (pos - window + 1) : 0;`
+  `int nslots = pos - t_lo + 1;`
+  `int chunk = (nslots + S - 1) / S;`
+  Slice $s$ strictly indexes within `[t_lo + s*chunk, min(pos+1, t_lo + (s+1)*chunk))`.
 - **Single Source of Truth**: Remove all fallback launches. Output is written directly to `d_att` with zero overwrites.
 
 ---
