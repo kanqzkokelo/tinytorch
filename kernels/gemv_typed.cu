@@ -976,6 +976,18 @@ int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
                                 "(dtype %d)\n", K, dtype);
                 return -101;
             }
+            if (M >= 2) {
+                dim3 g2, b2;
+                if (gemv_dims2(M, &g2, &b2) == 0) {
+                    if (dtype == TTQ_Q4_K)
+                        k_gemv_q4_K_v2<<<g2, b2, 0, stream>>>((const uint8_t *)W, x, y, M, K);
+                    else if (dtype == TTQ_Q5_K)
+                        k_gemv_q5_K_v2<<<g2, b2, 0, stream>>>((const uint8_t *)W, x, y, M, K);
+                    else
+                        k_gemv_q6_K_v2<<<g2, b2, 0, stream>>>((const uint8_t *)W, x, y, M, K);
+                    break;
+                }
+            }
             if (dtype == TTQ_Q4_K)
                 k_gemv_q4_K<<<g, b, 0, stream>>>((const uint8_t *)W, x, y, M, K);
             else if (dtype == TTQ_Q5_K)
