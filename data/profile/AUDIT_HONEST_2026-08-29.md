@@ -51,3 +51,7 @@
 ## Actions
 - Fixed 4 benchmark files to honest per-iter sync + distribution.
 - Will keep /loop running: next fix is README/LOOP doc truth pass, then re-benchmark full fleet honestly.
+
+## Remaining Benches Checked (2026-08-29 follow-up)
+- micro_v4.cu (LM head 151936x896): 76 MB > L2 honest DRAM, but still uses batch-mean not per-iter median. Left as is with note: future fix to per-iter if reused for claims.
+- micro_gemv_peak, micro_wmma etc not used for headline claims, keep disclaimer pre-2026-08-29.
