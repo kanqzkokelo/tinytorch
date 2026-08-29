@@ -134,7 +134,7 @@ int main(int argc, char **argv) {
 
     const char *model_path = getenv("TT_MODEL") ? getenv("TT_MODEL")
         : "data/models/qwen2.5-0.5b-instruct-q4_0.gguf";
-    const int MAX_CTX = 1024;
+    const int MAX_CTX = getenv("TT_MAX_CTX") ? atoi(getenv("TT_MAX_CTX")) : 1024;
 
     GGUFModel *model = gguf_load(model_path);
     if (!model) return 1;
@@ -164,17 +164,17 @@ int main(int argc, char **argv) {
     Qwen2Engine *eng = qwen2_engine_create(&cfg, model);
     if (!eng) { fprintf(stderr, "engine init failed\n"); return 1; }
 
-    char formatted[8192];
+    char formatted[262144];
     if (!getenv("TT_RAW_PROMPT"))
         snprintf(formatted, sizeof(formatted),
                  "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", prompt);
     else
         snprintf(formatted, sizeof(formatted), "%s", prompt);
 
-    int prompt_tokens[512];
+    int prompt_tokens[16384];
     int n_prompt;
     if (tok) {
-        n_prompt = bpe_encode(tok, formatted, prompt_tokens, 512);
+        n_prompt = bpe_encode(tok, formatted, prompt_tokens, 16384);
     } else {
         /* placeholder prefill: valid ids within any vocab */
         const int smoke_ids[5] = {1, 2, 3, 4, 5};
