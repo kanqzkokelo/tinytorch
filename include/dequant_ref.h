@@ -26,6 +26,7 @@ enum {
     TTQ_Q5_0 = 6,   /* 22 B per 32 values: fp16 d, 4 high-bit bytes, 16 nibbles */
     TTQ_Q5_1 = 7,   /* 24 B per 32 values: like q5_0 + fp16 m */
     TTQ_Q8_0 = 8,   /* 34 B per 32 values: fp16 d, 32 int8 */
+    TTQ_Q3_K = 11,  /* 110 B per 256 values */
     TTQ_Q4_K = 12,  /* 144 B per 256 values (Q4_K_S files share this layout) */
     TTQ_Q5_K = 13,  /* 176 B per 256 values (Q5_K_S likewise) */
     TTQ_Q6_K = 14,  /* 210 B per 256 values */

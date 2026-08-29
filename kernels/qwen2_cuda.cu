@@ -1694,6 +1694,9 @@ TTConfig tt_config_from_gguf(const GGUFModel *m, int max_ctx) {
     return c;
 }
 
+extern "C" void qwen2_engine_enable_q8_kvcache(Qwen2Engine *e, int enable);
+extern "C" void qwen2_engine_enable_q4_kvcache(Qwen2Engine *e, int enable);
+
 static void fail(const char *msg) { fprintf(stderr, "[qwen2-engine] %s\n", msg); }
 
 Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
@@ -1809,6 +1812,7 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
 
     /* activations + caches */
     cudaMalloc(&e->d_x,  D * sizeof(float));
+    cudaMalloc(&e->d_xn, D * sizeof(float));
     int max_hd = cfg->head_dim;
     int max_heads = cfg->dim / cfg->head_dim;
     long max_ffn = F;
@@ -2019,6 +2023,8 @@ void qwen2_engine_free(Qwen2Engine *e) {
     cudaFree(e->d_logits); cudaFree(e->d_kc); cudaFree(e->d_vc);
     if (e->d_kc_q8) cudaFree(e->d_kc_q8);
     if (e->d_vc_q8) cudaFree(e->d_vc_q8);
+    if (e->d_kc_q4) cudaFree(e->d_kc_q4);
+    if (e->d_vc_q4) cudaFree(e->d_vc_q4);
     cudaFree(e->d_k_stage); cudaFree(e->d_v_stage); cudaFree(e->d_pos);
     cudaFree(e->d_bvals); cudaFree(e->d_bidxs); cudaFree(e->d_out);
     if (e->d_split_pacc) cudaFree(e->d_split_pacc);
@@ -2180,6 +2186,7 @@ static int forward_layers(Qwen2Engine *e) {
         BlockQ8_0 *Vl_q8 = e->d_vc_q8 ? (e->d_vc_q8 + (long)l * cache_layer_q8) : NULL;
         BlockQ4_0 *Kl_q4 = e->d_kc_q4 ? (e->d_kc_q4 + (long)l * cache_layer_q8) : NULL;
         BlockQ4_0 *Vl_q4 = e->d_vc_q4 ? (e->d_vc_q4 + (long)l * cache_layer_q8) : NULL;
+        /* gemma4 KV sharing: shared layers (pl_src[l] >= 0) read the source
          * layer's cache slab instead of computing/scattering their own K/V.
          * llama-model.cpp:2502 semantics. */
         const int kv_shared = e->has_pl_embd && e->pl_src[l] >= 0;

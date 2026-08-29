@@ -38,12 +38,13 @@ DQBINDIR = os.path.join(ROOT, "build/dequant_ref")
 MODEL = os.path.join(ROOT, "data/models/qwen2.5-0.5b-instruct-q4_0.gguf")
 
 TTQ_Q4_0, TTQ_Q8_0 = 2, 8
+TTQ_Q3_K = 11
 TTQ_Q4_K, TTQ_Q5_K, TTQ_Q6_K = 12, 13, 14
-BLOCK_BYTES = {TTQ_Q4_0: 18, TTQ_Q8_0: 34,
+BLOCK_BYTES = {TTQ_Q4_0: 18, TTQ_Q8_0: 34, TTQ_Q3_K: 110,
                TTQ_Q4_K: 144, TTQ_Q5_K: 176, TTQ_Q6_K: 210}
-DTYPE_NAMES = {TTQ_Q4_0: "q4_0", TTQ_Q8_0: "q8_0",
+DTYPE_NAMES = {TTQ_Q4_0: "q4_0", TTQ_Q8_0: "q8_0", TTQ_Q3_K: "q3_k",
                TTQ_Q4_K: "q4_k", TTQ_Q5_K: "q5_k", TTQ_Q6_K: "q6_k"}
-ALL_DTYPES = (TTQ_Q4_0, TTQ_Q8_0, TTQ_Q4_K, TTQ_Q5_K, TTQ_Q6_K)
+ALL_DTYPES = (TTQ_Q4_0, TTQ_Q8_0, TTQ_Q3_K, TTQ_Q4_K, TTQ_Q5_K, TTQ_Q6_K)
 
 # K-quant golden sources: (model file, tensor) — tensor dtype verified below.
 K_MODELS = {
@@ -180,7 +181,7 @@ def synth_weights(dtype, M, K, seed):
     """Random payload but valid fp16 scale fields (avoid subnormal slowdowns)."""
     rng = np.random.default_rng(seed)
     bs = BLOCK_BYTES[dtype]
-    row_vals = 256 if bs >= 144 else 32
+    row_vals = 256 if bs >= 110 else 32
     nbytes = M * (K // row_vals) * bs
     w = rng.integers(0, 256, size=nbytes, dtype=np.uint8).reshape(-1, bs).copy()
     one16 = np.uint16(np.float16(1.0).view(np.uint16))
@@ -188,10 +189,11 @@ def synth_weights(dtype, M, K, seed):
     if dtype in (TTQ_Q4_0, TTQ_Q8_0, TTQ_Q4_K, TTQ_Q5_K):
         nsc = 2 if bs >= 144 else 1
         w[:, : 2 * nsc] = np.tile(le, nsc)
+    elif dtype == TTQ_Q3_K:
+        w[:, 108:110] = le
     else:  # q6_K: d at offset 208
         w[:, 208:210] = le
     return w.reshape(-1)
-
 
 def path_agreement():
     print("== AVX2 vs scalar agreement (same bytes, 1 thread) ==")

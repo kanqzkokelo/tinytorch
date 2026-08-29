@@ -70,6 +70,9 @@ run test-kvcache build/test_kvcache
 # 4. cpu_backend: compile CLI per include/cpu_backend.h line, then test.
 #    Golden-vs-GGUF correctness skips gracefully when no model committed;
 #    synthetic benchmark still validates the binary end-to-end.
+if [ ! -x build/dequant_ref ]; then
+  $CC_BIN -O3 -std=c11 -Iinclude -DTTQ_MAIN -o build/dequant_ref src/dequant_ref.c src/loader_gguf.c -lm
+fi
 if [ ! -x build/cpu_backend ]; then
   gcc -O3 -mavx2 -mfma -fopenmp -std=c11 -Iinclude \
       -DCPU_BACKEND_MAIN -o build/cpu_backend src/cpu_backend.c -lm

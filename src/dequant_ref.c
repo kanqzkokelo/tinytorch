@@ -163,6 +163,51 @@ static void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
     }
 }
 
+static void dq_q3_K(const void *x, float *y, long k) {
+    /* block_q3_K: hmask[32], qs[64], scales[12], fp16 d -> 110 B per 256 */
+    const uint8_t *xb = (const uint8_t *)x;
+    const long nb = k / QK_K;
+    const uint32_t kmask1 = 0x03030303;
+    const uint32_t kmask2 = 0x0f0f0f0f;
+    uint32_t aux[4];
+    const int8_t *scales = (const int8_t *)aux;
+
+    for (long i = 0; i < nb; i++) {
+        const uint8_t *blk = xb + i * 110;
+        uint16_t dh;
+        memcpy(&dh, blk + 108, 2);
+        const float d_all = fp16_to_fp32(dh);
+        const uint8_t *q = blk + 32;
+        const uint8_t *hm = blk;
+        uint8_t m = 1;
+
+        memcpy(aux, blk + 96, 12);
+        uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+        int is = 0;
+        for (int n = 0; n < QK_K; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                float dl0 = d_all * (float)(scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    *y++ = dl0 * ((int8_t)((q[l + 0] >> shift) & 3) - ((hm[l + 0] & m) ? 0 : 4));
+                }
+                float dl1 = d_all * (float)(scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    *y++ = dl1 * ((int8_t)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+                }
+                shift += 2;
+                m <<= 1;
+            }
+            q += 32;
+        }
+    }
+}
+
 static void dq_q4_K(const void *x, float *y, long k) {
     /* block_q4_K: fp16 d, fp16 dmin, scales[12], qs[128] -> 144 B per 256 */
     const uint8_t *xb = (const uint8_t *)x;
@@ -265,6 +310,7 @@ long ttq_dequant(const void *data, int type_code, long numel, float *out) {
         case TTQ_Q5_0: dq_q5_0(data, out, numel); return numel;
         case TTQ_Q5_1: dq_q5_1(data, out, numel); return numel;
         case TTQ_Q8_0: dq_q8_0(data, out, numel); return numel;
+        case TTQ_Q3_K: if (numel % QK_K) return -5; dq_q3_K(data, out, numel); return numel;
         case TTQ_Q4_K: if (numel % QK_K) return -5; dq_q4_K(data, out, numel); return numel;
         case TTQ_Q5_K: if (numel % QK_K) return -5; dq_q5_K(data, out, numel); return numel;
         case TTQ_Q6_K: if (numel % QK_K) return -5; dq_q6_K(data, out, numel); return numel;
@@ -307,6 +353,9 @@ long ttq_roundtrip(const char *gguf_path, const char *tensor_name,
         case TTQ_Q5_0: dq_q5_0(t->data, out, numel); break;
         case TTQ_Q5_1: dq_q5_1(t->data, out, numel); break;
         case TTQ_Q8_0: dq_q8_0(t->data, out, numel); break;
+        case TTQ_Q3_K:
+            if (numel % QK_K) { gguf_free(m); return -5; }
+            dq_q3_K(t->data, out, numel); break;
         case TTQ_Q4_K:
             if (numel % QK_K) { gguf_free(m); return -5; }
             dq_q4_K(t->data, out, numel); break;
