@@ -1725,7 +1725,7 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
      * workspace capacity = 16, sufficient for any ctx <= 4096. Peak for
      * gemma4 (16 heads * hd 512): 16 * 16 * 514 * 4 ~= 526 KB. */
     {
-        const int S_MAX = 32;
+        const int S_MAX = 64;
         const size_t per_acc = (size_t)max_heads * max_hd;
         const size_t per_ml  = (size_t)max_heads;
         cudaMalloc(&e->d_split_pacc, (size_t)S_MAX * per_acc * sizeof(float));
@@ -2116,8 +2116,17 @@ static int forward_layers(Qwen2Engine *e) {
                               : 1.0f / sqrtf((float)HDl);   /* match prior kernel arg */
             const int swa_l = e->has_pl_embd ? e->pl_swa[l] : c->tr.swa_size;
             if (e->use_q8_kvcache) {
-                int S = 16;
-                if (S > e->d_split_S_max) S = e->d_split_S_max;
+                int S;
+                if (e->graph_ready || g_capturing) {
+                    // Static grid for CUDA graph capture: static S_MAX handles any position
+                    S = e->d_split_S_max; // 64
+                } else {
+                    // Dynamic scaling for eager decode: 1 slice per 64-128 tokens
+                    S = (ctx_l + 63) / 64;
+                    if (S < 2) S = 2;
+                    if (S > 64) S = 64;
+                    if (S > e->d_split_S_max) S = e->d_split_S_max;
+                }
                 dim3 grid_split(S, KV_l);
                 int threads_split = (H_l / KV_l) * 32;
                 int blocks_per_head = HDl / 32;
