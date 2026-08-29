@@ -177,113 +177,164 @@ __global__ void k_gemv_q2_K_v2(const uint8_t *__restrict__ W,
     }
 }
 
+int cmp_f(const void *a, const void *b) {
+ float fa = *(const float *)a;
+ float fb = *(const float *)b;
+ return (fa > fb) - (fa < fb);
+}
+
 int main(int argc, char **argv) {
-    printf("=== Q2_K CUDA GEMV Verification & Benchmark ===\n");
+ printf("=== Q2_K CUDA GEMV Verification & Benchmark (honest DRAM) ===\n");
 
-    const int M = (argc > 1) ? atoi(argv[1]) : 4864;
-    const int K = (argc > 2) ? atoi(argv[2]) : 896;
+ const int M = (argc > 1) ? atoi(argv[1]) : 8192;
+ const int K = (argc > 2) ? atoi(argv[2]) : 4096;
 
-    printf("Matrix Shape: M=%d, K=%d\n", M, K);
-    const int nsb = K / 256;
-    const size_t bytes_W = (size_t)M * nsb * sizeof(BlockQ2_K);
-    const size_t bytes_x = (size_t)K * sizeof(float);
-    const size_t bytes_y = (size_t)M * sizeof(float);
+ if (K % QK_K != 0) {
+ fprintf(stderr, "ERROR: K=%d must be multiple of QK_K=%d (truncation bug). Use K=1024,2048,4096,...\n", K, QK_K);
+ return 1;
+ }
+ if (K % 256 != 0) {
+ fprintf(stderr, "ERROR: K=%d must be multiple of 256 for this kernel.\n", K);
+ return 1;
+ }
 
-    BlockQ2_K *h_W = (BlockQ2_K *)malloc(bytes_W);
-    float *h_x = (float *)malloc(bytes_x);
-    float *h_y_ref = (float *)malloc(bytes_y);
-    float *h_y_gpu = (float *)malloc(bytes_y);
+ printf("Matrix Shape: M=%d, K=%d (nsb=%d)\n", M, K, K / 256);
+ const int nsb = K / 256;
+ const size_t bytes_W = (size_t)M * nsb * sizeof(BlockQ2_K);
+ const size_t bytes_x = (size_t)K * sizeof(float);
+ const size_t bytes_y = (size_t)M * sizeof(float);
 
-    srand(42);
-    for (size_t i = 0; i < (size_t)M * nsb; i++) {
-        for (int j = 0; j < 16; j++) h_W[i].scales[j] = (uint8_t)rand();
-        for (int j = 0; j < 64; j++) h_W[i].qs[j] = (uint8_t)rand();
-        uint16_t d_fp16 = 0x251f;    // ~0.02
-        uint16_t dmin_fp16 = 0x211f; // ~0.01
-        h_W[i].d = d_fp16;
-        h_W[i].dmin = dmin_fp16;
-    }
+ // L2 honesty check: GA107M L2 = 2 MB. Warn if weight fits in L2.
+ const size_t L2_BYTES = 2 * 1024 * 1024;
+ const bool l2_resident = bytes_W < L2_BYTES;
+ if (l2_resident) {
+ printf("WARNING: weight bytes %.2f MB < L2 %.2f MB -> benchmark is L2-bound, not DRAM. Bump M/K.\n",
+ (double)bytes_W / 1e6, (double)L2_BYTES / 1e6);
+ } else {
+ printf("Weight bytes: %.2f MB (exceeds L2 %.2f MB -> DRAM-bound, honest)\n",
+ (double)bytes_W / 1e6, (double)L2_BYTES / 1e6);
+ }
 
-    for (int i = 0; i < K; i++) {
-        h_x[i] = ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
-    }
+ BlockQ2_K *h_W = (BlockQ2_K *)malloc(bytes_W);
+ float *h_x = (float *)malloc(bytes_x);
+ float *h_y_ref = (float *)malloc(bytes_y);
+ float *h_y_gpu = (float *)malloc(bytes_y);
 
-    printf("Computing CPU reference GEMV...\n");
-    gemv_q2_K_cpu_ref(h_W, h_x, h_y_ref, M, K);
+ srand(42);
+ for (size_t i = 0; i < (size_t)M * nsb; i++) {
+ for (int j = 0; j < 16; j++) h_W[i].scales[j] = (uint8_t)rand();
+ for (int j = 0; j < 64; j++) h_W[i].qs[j] = (uint8_t)rand();
+ uint16_t d_fp16 = 0x251f; // ~0.02
+ uint16_t dmin_fp16 = 0x211f; // ~0.01
+ h_W[i].d = d_fp16;
+ h_W[i].dmin = dmin_fp16;
+ }
 
-    uint8_t *d_W;
-    float *d_x, *d_y;
-    cudaMalloc(&d_W, bytes_W);
-    cudaMalloc(&d_x, bytes_x);
-    cudaMalloc(&d_y, bytes_y);
+ for (int i = 0; i < K; i++) {
+ h_x[i] = ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+ }
 
-    cudaMemcpy(d_W, h_W, bytes_W, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_x, h_x, bytes_x, cudaMemcpyHostToDevice);
+ printf("Computing CPU reference GEMV...\n");
+ gemv_q2_K_cpu_ref(h_W, h_x, h_y_ref, M, K);
 
-    dim3 block(32, 4);
-    dim3 grid((M + 7) / 8);
+ uint8_t *d_W;
+ float *d_x, *d_y;
+ cudaMalloc(&d_W, bytes_W);
+ cudaMalloc(&d_x, bytes_x);
+ cudaMalloc(&d_y, bytes_y);
 
-    for (int i = 0; i < 5; i++) {
-        k_gemv_q2_K_v2<<<grid, block>>>(d_W, d_x, d_y, M, K);
-    }
-    cudaDeviceSynchronize();
+ cudaMemcpy(d_W, h_W, bytes_W, cudaMemcpyHostToDevice);
+ cudaMemcpy(d_x, h_x, bytes_x, cudaMemcpyHostToDevice);
 
-    cudaMemcpy(h_y_gpu, d_y, bytes_y, cudaMemcpyDeviceToHost);
+ dim3 block(32, 4);
+ dim3 grid((M + 7) / 8);
 
-    double diff_sq = 0.0, ref_sq = 0.0;
-    double max_abs_diff = 0.0;
-    double max_ref = 0.0;
-    for (int i = 0; i < M; i++) {
-        double diff = fabs((double)h_y_gpu[i] - (double)h_y_ref[i]);
-        if (diff > max_abs_diff) max_abs_diff = diff;
-        if (fabs((double)h_y_ref[i]) > max_ref) max_ref = fabs((double)h_y_ref[i]);
-        diff_sq += diff * diff;
-        ref_sq += (double)h_y_ref[i] * (double)h_y_ref[i];
-    }
-    double l2_rel_error = sqrt(diff_sq) / (sqrt(ref_sq) + 1e-9);
-    double max_rel_inf = max_abs_diff / (max_ref + 1e-9);
+ for (int i = 0; i < 5; i++) {
+ k_gemv_q2_K_v2<<<grid, block>>>(d_W, d_x, d_y, M, K);
+ }
+ cudaDeviceSynchronize();
 
-    printf("Numerical Verification vs CPU Golden:\n");
-    printf("  Max Absolute Error: %.6e\n", max_abs_diff);
-    printf("  L2 Relative Error : %.6e\n", l2_rel_error);
-    printf("  L_inf Rel Error   : %.6e\n", max_rel_inf);
+ cudaMemcpy(h_y_gpu, d_y, bytes_y, cudaMemcpyDeviceToHost);
 
-    const int iters = 200;
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+ double diff_sq = 0.0, ref_sq = 0.0;
+ double max_abs_diff = 0.0;
+ double max_ref = 0.0;
+ for (int i = 0; i < M; i++) {
+ double diff = fabs((double)h_y_gpu[i] - (double)h_y_ref[i]);
+ if (diff > max_abs_diff) max_abs_diff = diff;
+ if (fabs((double)h_y_ref[i]) > max_ref) max_ref = fabs((double)h_y_ref[i]);
+ diff_sq += diff * diff;
+ ref_sq += (double)h_y_ref[i] * (double)h_y_ref[i];
+ }
+ double l2_rel_error = sqrt(diff_sq) / (sqrt(ref_sq) + 1e-9);
+ double max_rel_inf = max_abs_diff / (max_ref + 1e-9);
 
-    cudaEventRecord(start);
-    for (int i = 0; i < iters; i++) {
-        k_gemv_q2_K_v2<<<grid, block>>>(d_W, d_x, d_y, M, K);
-    }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+ printf("Numerical Verification vs CPU Golden:\n");
+ printf("  Max Absolute Error: %.6e\n", max_abs_diff);
+ printf("  L2 Relative Error : %.6e\n", l2_rel_error);
+ printf("  L_inf Rel Error   : %.6e\n", max_rel_inf);
 
-    float ms = 0.0f;
-    cudaEventElapsedTime(&ms, start, stop);
-    float avg_ms = ms / iters;
-    double gb = (double)bytes_W / 1e9;
-    double gbps = (gb / (avg_ms / 1000.0));
+ // Honest per-iteration timing: one event pair per launch, median/p50/p99
+ const int iters = 500;
+ const int warmup = 20;
+ for (int i = 0; i < warmup; i++) k_gemv_q2_K_v2<<<grid, block>>>(d_W, d_x, d_y, M, K);
+ cudaDeviceSynchronize();
 
-    printf("Benchmark Performance (M=%d, K=%d):\n", M, K);
-    printf("  Avg Kernel Time : %.4f ms\n", avg_ms);
-    printf("  Effective DRAM  : %.2f GB/s\n", gbps);
+ cudaEvent_t start, stop;
+ cudaEventCreate(&start);
+ cudaEventCreate(&stop);
+ float *samples = (float *)malloc(iters * sizeof(float));
 
-    if (max_abs_diff < 1e-4 && max_rel_inf < 1e-4) {
-        printf("RESULT: PASS\n");
-    } else {
-        printf("RESULT: FAIL\n");
-        return 1;
-    }
+ for (int i = 0; i < iters; i++) {
+ cudaEventRecord(start);
+ k_gemv_q2_K_v2<<<grid, block>>>(d_W, d_x, d_y, M, K);
+ cudaEventRecord(stop);
+ cudaEventSynchronize(stop);
+ float ms_i = 0.0f;
+ cudaEventElapsedTime(&ms_i, start, stop);
+ samples[i] = ms_i;
+ }
+ qsort(samples, iters, sizeof(float), cmp_f);
+ float min_ms = samples[0];
+ float p50_ms = samples[iters / 2];
+ float p95_ms = samples[(int)(iters * 0.95)];
+ float max_ms = samples[iters - 1];
+ double sum = 0; for (int i = 0; i < iters; i++) sum += samples[i];
+ float mean_ms = (float)(sum / iters);
 
-    cudaFree(d_W);
-    cudaFree(d_x);
-    cudaFree(d_y);
-    free(h_W);
-    free(h_x);
-    free(h_y_ref);
-    free(h_y_gpu);
+ double gb = (double)bytes_W / 1e9;
 
-    return 0;
+ printf("Benchmark Performance (M=%d, K=%d, %d samples, per-iter sync):\n", M, K, iters);
+ printf(" Kernel Time: mean %.4f ms  median(p50) %.4f ms  p95 %.4f ms  min %.4f ms  max %.4f ms\n",
+ mean_ms, p50_ms, p95_ms, min_ms, max_ms);
+ printf(" Effective Bandwidth: mean %.2f GB/s  median %.2f GB/s  p95 %.2f GB/s\n",
+ gb / (mean_ms/1000.0), gb / (p50_ms/1000.0), gb / (p95_ms/1000.0));
+ if (l2_resident) {
+ printf(" NOTE: weight fits in L2 -> reported GB/s is L2 bandwidth (~3-5 TB/s), NOT 176 GB/s DRAM. Use larger M/K for DRAM.\n");
+ } else {
+ printf(" NOTE: weight exceeds L2 -> reported GB/s is honest DRAM bandwidth (peak 176 GB/s on RTX 3050 Laptop).\n");
+ }
+ printf(" Hint: lock clocks with 'sudo nvidia-smi -lgc 1500,1500' for stable numbers.\n");
+
+ if (max_abs_diff < 1e-4 && max_rel_inf < 1e-4) {
+ printf("RESULT: PASS\n");
+ } else {
+ printf("RESULT: FAIL\n");
+ free(samples);
+ return 1;
+ }
+
+ free(samples);
+ cudaEventDestroy(start);
+ cudaEventDestroy(stop);
+
+ cudaFree(d_W);
+ cudaFree(d_x);
+ cudaFree(d_y);
+ free(h_W);
+ free(h_x);
+ free(h_y_ref);
+ free(h_y_gpu);
+
+ return 0;
 }

@@ -14,8 +14,8 @@ TT_MODEL=data/testmodels/smollm2-135m-instruct-Q8_0.gguf ./chat
 
 | Property | Value |
 |---|---|
-| Decode speed | **286.7 tok/s** ctx≤64 / ~250 sustained (Qwen2.5-0.5B q4_0, RTX 3050 laptop) |
-| vs llama.cpp | **~4.9× faster** (58 tok/s same box), output token-equivalent |
+| Decode speed | **~235 tok/s median (5-run, 4.2 ms/tok) @ 28 prompt +64 gen** (honest cross-core, sm_86, CUDA graphs; ~250 short-ctx peak) / ~235 sustained, RTX 3050 laptop |
+| vs llama.cpp | **~1.35× vs current llama.cpp CUDA 174 tok/s same box** (old 4.9× was vs pre-graph 58 tok/s baseline), output token-equivalent |
 | Parity gate | `./scripts/verify.sh m61` — teacher-forced logits vs oracle, 7/7 |
 | Sampling | repeat penalty + Gumbel-max temperature sampling inside CUDA graphs |
 

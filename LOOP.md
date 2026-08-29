@@ -100,7 +100,7 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 
 ### Cycle 9: Q4_0 Quantized KV Cache & Decode Attention
 - **Action**: Implemented `k_kv_scatter_q4_0` and `k_fa2_q4_split` in `tools/micro_fa2_decode_q4.cu`; reviewed by Minimax subagent (`q4kv_reviewer` - APPROVED); wired `TT_Q4_KV=1` into `kernels/qwen2_cuda.cu`.
-- **Performance**: $N=8192$ FA2 latency is $0.147\text{ ms/layer}$ ($26.7\times$ speedup); live engine decode reaches **$259.4\text{ tok/s}$** with CUDA graphs.
+- **Performance**: $N=8192$ FA2 latency is $0.207\text{ ms/layer}$ median p50 (500 samples, per-iter sync, honest DRAM, $15\text{-}18\times$ vs serial; was $0.147$ batch-mean L2-hot); live engine decode **$\sim 235\text{ tok/s}$ median 5-run** with CUDA graphs (was $259$ single-sample).
 - **Verification**: All gates (`ci_local.sh`, `verify.sh m61`, `verify.sh ple`) 100% GREEN.
 
 ### Cycle 10: Q3_K Quantization & Hybrid Layer Offloading (Goal 1)
@@ -122,5 +122,5 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 
 ### Cycle 14: Paged FlashAttention-3 & Zero-Copy POSIX IPC (Frontier Goals 6 & 7)
 - **Action**: Implemented Paged FlashAttention-2/3 (`tools/micro_paged_fa2.cu`) supporting up to 131,072 context tokens in an 18.87 MB pool. Implemented lock-free POSIX shared memory ring buffer IPC (`src/tinytorch_ipc.c`, `include/tinytorch_ipc.h`, `tools/bench_ipc_throughput.c`).
-- **Performance**: IPC benchmark clocked at **$1.96\text{ Million req/s}$** throughput with **$0.50\ \mu\text{s}$** average round-trip latency.
+- **Performance**: IPC honest cross-core **$1.58\text{ Million req/s}$** full-512B (p50 $0.45\ \mu\text{s}$, p95 $0.48\ \mu\text{s}$, 1.75M tiny-0B) vs prior $1.96\text{M}$ same-core inflated.
 - **Verification**: All 19 C sources compile cleanly; `ci_local.sh`, `verify.sh m61`, `verify.sh ple`, `test_engine_golden.py verify` all 100% GREEN.

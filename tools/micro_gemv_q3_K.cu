@@ -18,6 +18,8 @@
 
 #define QK_K 256
 
+int cmp_f(const void *a, const void *b){ float fa=*(const float*)a; float fb=*(const float*)b; return (fa>fb)-(fa<fb); }
+
 typedef struct {
     uint8_t hmask[32]; // quants - high bit (32 bytes)
     uint8_t qs[64];    // quants - low 2 bits (64 bytes)
@@ -206,12 +208,19 @@ __global__ void k_gemv_q3_K_v2(const uint8_t *__restrict__ W,
 int main(int argc, char **argv) {
     printf("=== Q3_K CUDA GEMV Verification & Benchmark ===\n");
 
-    const int M = (argc > 1) ? atoi(argv[1]) : 4864;
-    const int K = (argc > 2) ? atoi(argv[2]) : 896;
+    const int M = (argc > 1) ? atoi(argv[1]) : 8192;
+    const int K = (argc > 2) ? atoi(argv[2]) : 4096;
 
-    printf("Matrix Shape: M=%d, K=%d\n", M, K);
+    if (K % QK_K != 0) { fprintf(stderr,"ERROR: K=%d must be multiple of QK_K=%d\n",K,QK_K); return 1; }
+    if (K % 256 != 0) { fprintf(stderr,"ERROR: K=%d must be multiple of 256\n",K); return 1; }
+
+    printf("Matrix Shape: M=%d, K=%d (nsb=%d)\n", M, K, K/256);
     const int nsb = K / 256;
     const size_t bytes_W = (size_t)M * nsb * sizeof(BlockQ3_K);
+    const size_t L2_BYTES = 2*1024*1024;
+    const bool l2_resident = bytes_W < L2_BYTES;
+    if (l2_resident) printf("WARNING: weight %.2f MB < L2 %.2f MB -> L2-bound\n", (double)bytes_W/1e6, (double)L2_BYTES/1e6);
+    else printf("Weight bytes: %.2f MB (exceeds L2 -> DRAM honest)\n", (double)bytes_W/1e6);
     const size_t bytes_x = (size_t)K * sizeof(float);
     const size_t bytes_y = (size_t)M * sizeof(float);
 
@@ -273,35 +282,44 @@ int main(int argc, char **argv) {
     printf("  L2 Relative Error : %.6e\n", l2_rel_error);
     printf("  L_inf Rel Error   : %.6e\n", max_rel_inf);
 
-    const int iters = 200;
+    const int iters = 500;
+    const int warmup = 20;
+    for(int i=0;i<warmup;i++) k_gemv_q3_K_v2<<<grid, block>>>(d_W, d_x, d_y, M, K);
+    cudaDeviceSynchronize();
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-
-    cudaEventRecord(start);
-    for (int i = 0; i < iters; i++) {
+    float *samples=(float*)malloc(iters*sizeof(float));
+    for(int i=0;i<iters;i++){
+        cudaEventRecord(start);
         k_gemv_q3_K_v2<<<grid, block>>>(d_W, d_x, d_y, M, K);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        float ms_i=0; cudaEventElapsedTime(&ms_i, start, stop);
+        samples[i]=ms_i;
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-
-    float ms = 0.0f;
-    cudaEventElapsedTime(&ms, start, stop);
-    float avg_ms = ms / iters;
+    qsort(samples, iters, sizeof(float), cmp_f);
+    float min_ms=samples[0]; float p50_ms=samples[iters/2]; float p95_ms=samples[(int)(iters*0.95)]; float max_ms=samples[iters-1];
+    double sum=0; for(int i=0;i<iters;i++) sum+=samples[i];
+    float mean_ms=(float)(sum/iters);
     double gb = (double)bytes_W / 1e9;
-    double gbps = (gb / (avg_ms / 1000.0));
+    printf("Benchmark Performance (M=%d, K=%d, %d samples, per-iter sync):\n", M, K, iters);
+    printf("  Kernel Time: mean %.4f ms  median(p50) %.4f ms  p95 %.4f ms  min %.4f max %.4f\n", mean_ms, p50_ms, p95_ms, min_ms, max_ms);
+    printf("  Effective Bandwidth: mean %.2f GB/s  median %.2f GB/s  p95 %.2f GB/s\n", gb/(mean_ms/1000.0), gb/(p50_ms/1000.0), gb/(p95_ms/1000.0));
+    if(l2_resident) printf("  NOTE: weight fits in L2 -> L2 bandwidth, not DRAM 176 GB/s. Use larger M/K.\n");
+    else printf("  NOTE: weight exceeds L2 -> honest DRAM (peak 176 GB/s).\n");
+    printf("  Hint: lock clocks with 'sudo nvidia-smi -lgc 1500,1500'\n");
 
-    printf("Benchmark Performance (M=%d, K=%d):\n", M, K);
-    printf("  Avg Kernel Time : %.4f ms\n", avg_ms);
-    printf("  Effective DRAM  : %.2f GB/s\n", gbps);
-
-    if (max_abs_diff < 1e-4 && max_rel_inf < 1e-4) {
+    bool pass = (max_abs_diff < 1e-4 && max_rel_inf < 1e-4);
+    if (pass) {
         printf("RESULT: PASS\n");
     } else {
         printf("RESULT: FAIL\n");
         return 1;
     }
 
+    free(samples);
+    cudaEventDestroy(start); cudaEventDestroy(stop);
     cudaFree(d_W);
     cudaFree(d_x);
     cudaFree(d_y);
