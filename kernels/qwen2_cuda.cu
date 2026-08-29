@@ -717,8 +717,9 @@ __global__ void k_flash_gqa_q8_0(
     }
 }
 
-/* Split-K Q8_0 Flash GQA kernel */
-__global__ void k_flash_gqa_q8_0_splitk(
+#define BC_SPLIT 64
+
+__global__ void k_fa2_q8_split(
     const float     *__restrict__ q,
     const BlockQ8_0 *__restrict__ Kc_q8,
     const BlockQ8_0 *__restrict__ Vc_q8,
@@ -727,139 +728,229 @@ __global__ void k_flash_gqa_q8_0_splitk(
     float           *__restrict__ p_l,
     const int       *__restrict__ d_pos,
     int n_heads, int n_kv_heads, int head_dim,
-    float scale, int window, int S) {
+    float scale, int window, int S)
+{
     const int pos = *d_pos;
-    const int h = blockIdx.x;
-    const int s = blockIdx.y;
-    const int lane = threadIdx.x;
-    const int kvh = h / (n_heads / n_kv_heads);
+    const int s = blockIdx.x;
+    const int kv = blockIdx.y;
+    if (s >= S || kv >= n_kv_heads) return;
+
+    const int G = n_heads / n_kv_heads;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (warp >= G) return;
+
+    const int head = kv * G + warp;
     const int elems = head_dim / 32;
+    const int blocks_per_head = head_dim / 32;
 
-    int t_lo = 0;
-    if (window > 0 && pos >= window) t_lo = pos - window + 1;
-    const int nslots = pos - t_lo + 1;
-    const int chunk = (nslots + S - 1) / S;
-    const int begin = t_lo + s * chunk;
-    const int end = min(pos + 1, t_lo + (s + 1) * chunk);
-
-    float *myacc = p_acc + ((size_t)s * n_heads + h) * head_dim + lane * elems;
-    float *mym = p_m + (size_t)s * n_heads + h;
-    float *myl = p_l + (size_t)s * n_heads + h;
-
-    if (begin >= end) {
-        if (lane == 0) { *mym = -1e30f; *myl = 0.0f; }
+    // Load Q vector directly into registers for this head & lane
+    const float *qh = q + (long)head * head_dim + lane * elems;
+    float qreg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (elems == 4) {
+        const float4 q_vec = *(const float4 *)qh;
+        qreg[0] = q_vec.x; qreg[1] = q_vec.y; qreg[2] = q_vec.z; qreg[3] = q_vec.w;
+    } else if (elems == 2) {
+        const float2 q_vec = *(const float2 *)qh;
+        qreg[0] = q_vec.x; qreg[1] = q_vec.y;
+    } else {
 #pragma unroll
-        for (int i = 0; i < 16; i++)
+        for (int i = 0; i < 4; i++) {
+            if (i < elems) qreg[i] = qh[i];
+        }
+    }
+
+    // Sliding window & slice bounds
+    int t_lo = (window > 0 && pos >= window) ? (pos - window + 1) : 0;
+    int nslots = pos - t_lo + 1;
+    int chunk = (nslots + S - 1) / S;
+    int begin = t_lo + s * chunk;
+    int end = min(pos + 1, t_lo + (s + 1) * chunk);
+
+    // Inactive slice early exit
+    if (begin >= end) {
+        if (lane == 0) {
+            p_m[(size_t)s * n_heads + head] = -1e30f;
+            p_l[(size_t)s * n_heads + head] = 0.0f;
+        }
+        float *myacc = p_acc + ((size_t)s * n_heads + head) * head_dim + lane * elems;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
             if (i < elems) myacc[i] = 0.0f;
+        }
         return;
     }
 
-    const float *qh = q + (long)h * head_dim + lane * elems;
-    float qreg[16];
-#pragma unroll
-    for (int i = 0; i < 16; i++) qreg[i] = (i < elems) ? qh[i] : 0.0f;
+    // Shared memory: BC=64 KV tokens
+    extern __shared__ char raw_smem_split[];
+    half   *sK_d = (half*)raw_smem_split;
+    half   *sV_d = sK_d + BC_SPLIT * blocks_per_head;
+    int8_t *sK_q = (int8_t*)(sV_d + BC_SPLIT * blocks_per_head);
+    int8_t *sV_q = sK_q + BC_SPLIT * head_dim;
 
-    float m_prev = -1e30f, l_prev = 0.0f;
-    float oreg[16] = {0.0f};
+    float m_prev = -1e30f;
+    float l_prev = 0.0f;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    const int blocks_per_head = head_dim / 32;
-    const int blocks_per_slot = n_kv_heads * blocks_per_head;
     const int block_in_head = (lane * elems) / 32;
-    const int elem_sub_idx = (lane * elems) % 32;
-    const int block_idx = kvh * blocks_per_head + block_in_head;
-    const int block_byte_off = block_idx * 34;
-    const int wsc = block_byte_off >> 2;
-    const int sh_d = block_byte_off & 2;
-    const int a0 = (block_byte_off + 2) >> 2;
-    const int sh_qs = (block_byte_off + 2) & 2;
-    const int k_elem_word = elem_sub_idx >> 2;
 
-    const long stride = (long)blocks_per_slot * 34;
-    const char *k_ptr = (const char *)Kc_q8 + (long)begin * stride;
-    const char *v_ptr = (const char *)Vc_q8 + (long)begin * stride;
+    // Iterate over tokens in [begin, end) in tiles of BC
+    for (int t_tile = begin; t_tile < end; t_tile += BC_SPLIT) {
+        int t_tile_end = min(end, t_tile + BC_SPLIT);
+        int bc_active = t_tile_end - t_tile;
 
-    for (int t = begin; t < end; t++) {
-        const uint32_t *k_slot_u32 = (const uint32_t *)k_ptr;
-        const uint32_t *v_slot_u32 = (const uint32_t *)v_ptr;
-        k_ptr += stride;
-        v_ptr += stride;
-
-        const uint32_t dw_k = k_slot_u32[wsc];
-        const unsigned short d16_k = (unsigned short)(sh_d ? (dw_k >> 16) : (dw_k & 0xFFFFu));
-        const float dk = __half2float(__ushort_as_half(d16_k));
-
-        const uint32_t lo_k = k_slot_u32[a0 + k_elem_word];
-        const uint32_t vv_k = sh_qs ? __byte_perm(lo_k, k_slot_u32[a0 + k_elem_word + 1], 0x5432) : lo_k;
-
-        float score = 0.0f;
-        if (elems == 4) {
-            float k0 = (float)((int8_t)(vv_k      ));
-            float k1 = (float)((int8_t)(vv_k >>  8));
-            float k2 = (float)((int8_t)(vv_k >> 16));
-            float k3 = (float)((int8_t)(vv_k >> 24));
-            score = (qreg[0]*k0 + qreg[1]*k1 + qreg[2]*k2 + qreg[3]*k3) * dk;
-        } else if (elems == 2) {
-            int shift = (elem_sub_idx & 2) ? 16 : 0;
-            float k0 = (float)((int8_t)(vv_k >> shift));
-            float k1 = (float)((int8_t)(vv_k >> (shift + 8)));
-            score = (qreg[0]*k0 + qreg[1]*k1) * dk;
-        } else {
-            #pragma unroll
-            for (int i = 0; i < elems; i++) {
-                int shift = ((elem_sub_idx + i) & 3) * 8;
-                float k_val = (float)((int8_t)(vv_k >> shift));
-                score += qreg[i] * (k_val * dk);
+        // Cooperative load of bc_active KV blocks into smem
+        int total_blocks = bc_active * blocks_per_head;
+        for (int i = tid; i < total_blocks; i += blockDim.x) {
+            int tok = i / blocks_per_head;
+            int b   = i % blocks_per_head;
+            long g_idx = ((long)(t_tile + tok) * n_kv_heads + kv) * blocks_per_head + b;
+            const BlockQ8_0 bk = Kc_q8[g_idx];
+            const BlockQ8_0 bv = Vc_q8[g_idx];
+            sK_d[tok * blocks_per_head + b] = bk.d;
+            sV_d[tok * blocks_per_head + b] = bv.d;
+            int row_off = tok * head_dim + b * 32;
+#pragma unroll
+            for (int j = 0; j < 32; j++) {
+                sK_q[row_off + j] = bk.qs[j];
+                sV_q[row_off + j] = bv.qs[j];
             }
         }
+        __syncthreads();
 
-        score = warp_sum(score);
-        score = __shfl_sync(0xffffffff, score, 0) * scale;
+        // Process tokens in smem tile
+        for (int t_idx = 0; t_idx < bc_active; t_idx++) {
+            const float dk = __half2float(sK_d[t_idx * blocks_per_head + block_in_head]);
+            const float dv = __half2float(sV_d[t_idx * blocks_per_head + block_in_head]);
 
-        float m_curr = fmaxf(m_prev, score);
-        float p = expf(score - m_curr);
-        float alpha = expf(m_prev - m_curr);
-        float l_curr = l_prev * alpha + p;
+            const int byte_off = t_idx * head_dim + lane * elems;
+            float k_val[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float v_val[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-        const uint32_t dw_v = v_slot_u32[wsc];
-        const unsigned short d16_v = (unsigned short)(sh_d ? (dw_v >> 16) : (dw_v & 0xFFFFu));
-        const float dv = __half2float(__ushort_as_half(d16_v));
-
-        const uint32_t lo_v = v_slot_u32[a0 + k_elem_word];
-        const uint32_t vv_v = sh_qs ? __byte_perm(lo_v, v_slot_u32[a0 + k_elem_word + 1], 0x5432) : lo_v;
-
-        const float pdv = p * dv;
-        if (elems == 4) {
-            float v0 = (float)((int8_t)(vv_v      ));
-            float v1 = (float)((int8_t)(vv_v >>  8));
-            float v2 = (float)((int8_t)(vv_v >> 16));
-            float v3 = (float)((int8_t)(vv_v >> 24));
-            oreg[0] = oreg[0] * alpha + pdv * v0;
-            oreg[1] = oreg[1] * alpha + pdv * v1;
-            oreg[2] = oreg[2] * alpha + pdv * v2;
-            oreg[3] = oreg[3] * alpha + pdv * v3;
-        } else if (elems == 2) {
-            int shift = (elem_sub_idx & 2) ? 16 : 0;
-            float v0 = (float)((int8_t)(vv_v >> shift));
-            float v1 = (float)((int8_t)(vv_v >> (shift + 8)));
-            oreg[0] = oreg[0] * alpha + pdv * v0;
-            oreg[1] = oreg[1] * alpha + pdv * v1;
-        } else {
-            #pragma unroll
-            for (int i = 0; i < elems; i++) {
-                int shift = ((elem_sub_idx + i) & 3) * 8;
-                float v_val = (float)((int8_t)(vv_v >> shift));
-                oreg[i] = oreg[i] * alpha + pdv * v_val;
+            if (elems == 4) {
+                const uint32_t k_u32 = *(const uint32_t *)&sK_q[byte_off];
+                const uint32_t v_u32 = *(const uint32_t *)&sV_q[byte_off];
+                k_val[0] = (float)((int8_t)(k_u32      ));
+                k_val[1] = (float)((int8_t)(k_u32 >>  8));
+                k_val[2] = (float)((int8_t)(k_u32 >> 16));
+                k_val[3] = (float)((int8_t)(k_u32 >> 24));
+                v_val[0] = (float)((int8_t)(v_u32      ));
+                v_val[1] = (float)((int8_t)(v_u32 >>  8));
+                v_val[2] = (float)((int8_t)(v_u32 >> 16));
+                v_val[3] = (float)((int8_t)(v_u32 >> 24));
+            } else if (elems == 2) {
+                const uint16_t k_u16 = *(const uint16_t *)&sK_q[byte_off];
+                const uint16_t v_u16 = *(const uint16_t *)&sV_q[byte_off];
+                k_val[0] = (float)((int8_t)(k_u16      ));
+                k_val[1] = (float)((int8_t)(k_u16 >>  8));
+                v_val[0] = (float)((int8_t)(v_u16      ));
+                v_val[1] = (float)((int8_t)(v_u16 >>  8));
+            } else {
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    if (i < elems) {
+                        k_val[i] = (float)sK_q[byte_off + i];
+                        v_val[i] = (float)sV_q[byte_off + i];
+                    }
+                }
             }
-        }
 
-        m_prev = m_curr;
-        l_prev = l_curr;
+            float dot_partial = (qreg[0] * k_val[0] + qreg[1] * k_val[1] + qreg[2] * k_val[2] + qreg[3] * k_val[3]) * dk;
+            float score = warp_sum(dot_partial);
+            score = __shfl_sync(0xffffffff, score, 0) * scale;
+
+            float m_curr = fmaxf(m_prev, score);
+            float p = expf(score - m_curr);
+            float alpha = expf(m_prev - m_curr);
+            l_prev = l_prev * alpha + p;
+
+            float pdv = p * dv;
+            acc[0] = acc[0] * alpha + pdv * v_val[0];
+            acc[1] = acc[1] * alpha + pdv * v_val[1];
+            acc[2] = acc[2] * alpha + pdv * v_val[2];
+            acc[3] = acc[3] * alpha + pdv * v_val[3];
+
+            m_prev = m_curr;
+        }
+        __syncthreads();
     }
 
-    if (lane == 0) { *mym = m_prev; *myl = l_prev; }
+    // Write partials
+    if (lane == 0) {
+        p_m[(size_t)s * n_heads + head] = m_prev;
+        p_l[(size_t)s * n_heads + head] = l_prev;
+    }
+    float *myacc = p_acc + ((size_t)s * n_heads + head) * head_dim + lane * elems;
 #pragma unroll
-    for (int i = 0; i < 16; i++)
-        if (i < elems) myacc[i] = oreg[i];
+    for (int i = 0; i < 4; i++) {
+        if (i < elems) myacc[i] = acc[i];
+    }
+}
+
+__global__ void k_fa2_combine(
+    const float *__restrict__ p_acc,
+    const float *__restrict__ p_m,
+    const float *__restrict__ p_l,
+    float       *__restrict__ out,
+    int n_heads, int head_dim, int S)
+{
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+    const int lane = threadIdx.x;
+    const int elems = head_dim / 32;
+
+    float m_global = -1e30f, l_global = 0.0f;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int s = 0; s < S; s++) {
+        float m_s = p_m[s * n_heads + h];
+        float l_s = p_l[s * n_heads + h];
+        if (!isfinite(m_s) || !isfinite(l_s) || l_s <= 0.0f || m_s <= -1e20f) continue;
+        float m_new = fmaxf(m_global, m_s);
+        float alpha_prev = expf(m_global - m_new);
+        float alpha_s    = expf(m_s - m_new);
+        l_global = l_global * alpha_prev + l_s * alpha_s;
+        const float *p_ptr = p_acc + ((size_t)s * n_heads + h) * head_dim + lane * elems;
+        if (elems == 4) {
+            const float4 p_vec = *(const float4 *)p_ptr;
+            acc[0] = acc[0] * alpha_prev + p_vec.x * alpha_s;
+            acc[1] = acc[1] * alpha_prev + p_vec.y * alpha_s;
+            acc[2] = acc[2] * alpha_prev + p_vec.z * alpha_s;
+            acc[3] = acc[3] * alpha_prev + p_vec.w * alpha_s;
+        } else if (elems == 2) {
+            const float2 p_vec = *(const float2 *)p_ptr;
+            acc[0] = acc[0] * alpha_prev + p_vec.x * alpha_s;
+            acc[1] = acc[1] * alpha_prev + p_vec.y * alpha_s;
+        } else {
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                if (i < elems) acc[i] = acc[i] * alpha_prev + p_ptr[i] * alpha_s;
+            }
+        }
+        m_global = m_new;
+    }
+
+    float inv_l = (l_global > 0.0f) ? (1.0f / l_global) : 0.0f;
+    float *out_ptr = out + (long)h * head_dim + lane * elems;
+    if (elems == 4) {
+        *(float4 *)out_ptr = make_float4(
+            acc[0] * inv_l,
+            acc[1] * inv_l,
+            acc[2] * inv_l,
+            acc[3] * inv_l
+        );
+    } else if (elems == 2) {
+        *(float2 *)out_ptr = make_float2(
+            acc[0] * inv_l,
+            acc[1] * inv_l
+        );
+    } else {
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            if (i < elems) out_ptr[i] = acc[i] * inv_l;
+        }
+    }
 }
 
 #define BR_PREFILL 8
@@ -1041,12 +1132,19 @@ extern "C" int tt_flash_gqa_q8_0_splitk(const float *q, const void *Kc_q8, const
                                         float *p_acc, float *p_m, float *p_l, float *out,
                                         const int *d_pos, int n_heads, int n_kv_heads, int head_dim,
                                         float scale, int window, int S, cudaStream_t stream) {
-    dim3 grid(n_heads, S);
-    k_flash_gqa_q8_0_splitk<<<grid, 32, 0, stream>>>(
-        q, (const BlockQ8_0 *)Kc_q8, (const BlockQ8_0 *)Vc_q8, p_acc, p_m, p_l,
-        d_pos, n_heads, n_kv_heads, head_dim, scale, window, S);
-    k_flash_gqa_combine<<<n_heads, 32, 0, stream>>>(
-        p_acc, p_m, p_l, out, n_heads, head_dim, S);
+    dim3 grid_split(S, n_kv_heads);
+    int threads_split = (n_heads / n_kv_heads) * 32;
+    int blocks_per_head = head_dim / 32;
+    size_t smem_bytes = 2 * (size_t)BC_SPLIT * blocks_per_head * sizeof(half)
+                      + 2 * (size_t)BC_SPLIT * head_dim * sizeof(int8_t);
+    k_fa2_q8_split<<<grid_split, threads_split, smem_bytes, stream>>>(
+        q, (const BlockQ8_0 *)Kc_q8, (const BlockQ8_0 *)Vc_q8,
+        p_acc, p_m, p_l,
+        d_pos, n_heads, n_kv_heads, head_dim,
+        scale, window, S);
+    k_fa2_combine<<<n_heads, 32, 0, stream>>>(
+        p_acc, p_m, p_l,
+        out, n_heads, head_dim, S);
     return 0;
 }
 
@@ -1627,7 +1725,7 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
      * workspace capacity = 16, sufficient for any ctx <= 4096. Peak for
      * gemma4 (16 heads * hd 512): 16 * 16 * 514 * 4 ~= 526 KB. */
     {
-        const int S_MAX = 16;
+        const int S_MAX = 32;
         const size_t per_acc = (size_t)max_heads * max_hd;
         const size_t per_ml  = (size_t)max_heads;
         cudaMalloc(&e->d_split_pacc, (size_t)S_MAX * per_acc * sizeof(float));
@@ -2018,28 +2116,22 @@ static int forward_layers(Qwen2Engine *e) {
                               : 1.0f / sqrtf((float)HDl);   /* match prior kernel arg */
             const int swa_l = e->has_pl_embd ? e->pl_swa[l] : c->tr.swa_size;
             if (e->use_q8_kvcache) {
-                if (ctx_l > 128) {
-                    int S = ctx_l / 256;
-                    if (S < 2) S = 2;
-                    if (S > 16) S = 16;
-                    if (S > e->d_split_S_max) S = e->d_split_S_max;
-                    dim3 grid_split(H_l, S);
-                    k_flash_gqa_q8_0_splitk<<<grid_split, 32, 0, e->stream>>>(
-                        e->d_q, Kl_q8, Vl_q8,
-                        e->d_split_pacc, e->d_split_pm, e->d_split_pl,
-                        e->d_pos,
-                        H_l, KV_l, HDl,
-                        scale_l, swa_l, S);
-                    k_flash_gqa_combine<<<H_l, 32, 0, e->stream>>>(
-                        e->d_split_pacc, e->d_split_pm, e->d_split_pl,
-                        e->d_att, H_l, HDl, S);
-                } else {
-                    k_flash_gqa_q8_0<<<H_l, 32, 0, e->stream>>>(
-                        e->d_q, Kl_q8, Vl_q8, e->d_att,
-                        e->d_pos,
-                        H_l, KV_l, HDl, c->max_ctx,
-                        scale_l, swa_l);
-                }
+                int S = 16;
+                if (S > e->d_split_S_max) S = e->d_split_S_max;
+                dim3 grid_split(S, KV_l);
+                int threads_split = (H_l / KV_l) * 32;
+                int blocks_per_head = HDl / 32;
+                size_t smem_bytes = 2 * (size_t)BC_SPLIT * blocks_per_head * sizeof(half)
+                                  + 2 * (size_t)BC_SPLIT * HDl * sizeof(int8_t);
+                k_fa2_q8_split<<<grid_split, threads_split, smem_bytes, e->stream>>>(
+                    e->d_q, Kl_q8, Vl_q8,
+                    e->d_split_pacc, e->d_split_pm, e->d_split_pl,
+                    e->d_pos,
+                    H_l, KV_l, HDl,
+                    scale_l, swa_l, S);
+                k_fa2_combine<<<H_l, 32, 0, e->stream>>>(
+                    e->d_split_pacc, e->d_split_pm, e->d_split_pl,
+                    e->d_att, H_l, HDl, S);
             } else {
                 if (ctx_l > 128) {
                     int S = ctx_l / 256;
