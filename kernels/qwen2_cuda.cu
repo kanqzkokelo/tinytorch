@@ -3477,19 +3477,36 @@ int qwen2_engine_verify_speculative(Qwen2Engine *e,
     cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
 
     const long vocab_f = (long)c->vocab;
+    const int dim = c->dim;
+    if (n_candidate >= 2 && e->n_gpu_layers == c->n_layers && !e->has_pl_embd && c->tr.softcap_value == 0.0f) {
+        float *h_x_all = (float *)malloc((size_t)n_candidate * dim * sizeof(float));
+        int rc = prefill_batched_gemm(e, h_candidate_tokens, n_candidate, h_x_all);
+        if (rc == 0) {
+            for (int i = 0; i < n_candidate; i++) {
+                cudaMemcpyAsync(e->d_x, h_x_all + (long)i * dim, dim * sizeof(float), cudaMemcpyHostToDevice, e->stream);
+                compute_logits_into_d_logits(e);
+                cudaMemcpyAsync(out_logits + (long)i * vocab_f,
+                                e->d_logits,
+                                vocab_f * sizeof(float),
+                                cudaMemcpyDeviceToDevice,
+                                e->stream);
+            }
+            free(h_x_all);
+            cudaStreamSynchronize(e->stream);
+            return 0;
+        }
+        free(h_x_all);
+    }
+
     for (int i = 0; i < n_candidate; i++) {
         if (advance(e, h_candidate_tokens[i])) return -10 - i;
         if (compute_logits_into_d_logits(e))   return -20 - i;
-        /* D2D copy of d_logits -> out_logits + i*vocab. Async — no host
-         * sync per token. The trailing cudaStreamSynchronize below makes
-         * the whole batch visible. */
         cudaMemcpyAsync(out_logits + (long)i * vocab_f,
                         e->d_logits,
                         vocab_f * sizeof(float),
                         cudaMemcpyDeviceToDevice,
                         e->stream);
     }
-    cudaStreamSynchronize(e->stream);
     return 0;
 }
 
