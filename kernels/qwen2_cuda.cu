@@ -601,6 +601,57 @@ __global__ void k_kv_scatter_q8_0(
     }
 }
 
+/* Scatter kernel: quantizes FP32 K/V staging vectors into Q4_0 cache slot (*d_pos) */
+__global__ void k_kv_scatter_q4_0(
+    const float *__restrict__ kst,
+    const float *__restrict__ vst,
+    BlockQ4_0   *__restrict__ Kc,
+    BlockQ4_0   *__restrict__ Vc,
+    const int   *__restrict__ d_pos,
+    int n_kv_heads, int head_dim, int max_ctx) {
+    const int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int num_blocks_per_slot = (n_kv_heads * head_dim) / 32;
+    if (block_idx >= num_blocks_per_slot) return;
+    const int slot = (*d_pos) % max_ctx;
+    const int src_offset = block_idx * 32;
+
+    float k_vals[32], v_vals[32];
+    float max_k = 0.0f, max_v = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        k_vals[i] = kst[src_offset + i];
+        v_vals[i] = vst[src_offset + i];
+        max_k = fmaxf(max_k, fabsf(k_vals[i]));
+        max_v = fmaxf(max_v, fabsf(v_vals[i]));
+    }
+
+    const float scale_k = (max_k > 0.0f) ? (max_k / 7.0f) : 1.0f;
+    const float inv_k   = (max_k > 0.0f) ? (7.0f / max_k) : 0.0f;
+    const float scale_v = (max_v > 0.0f) ? (max_v / 7.0f) : 1.0f;
+    const float inv_v   = (max_v > 0.0f) ? (7.0f / max_v) : 0.0f;
+
+    BlockQ4_0 *k_dest = Kc + (long)slot * num_blocks_per_slot + block_idx;
+    BlockQ4_0 *v_dest = Vc + (long)slot * num_blocks_per_slot + block_idx;
+
+    k_dest->d = __float2half(scale_k);
+    v_dest->d = __float2half(scale_v);
+
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        int q0_k = __float2int_rn(k_vals[j] * inv_k) + 8;
+        int q1_k = __float2int_rn(k_vals[j + 16] * inv_k) + 8;
+        q0_k = max(0, min(15, q0_k));
+        q1_k = max(0, min(15, q1_k));
+        k_dest->qs[j] = (uint8_t)((q0_k & 0x0F) | ((q1_k & 0x0F) << 4));
+
+        int q0_v = __float2int_rn(v_vals[j] * inv_v) + 8;
+        int q1_v = __float2int_rn(v_vals[j + 16] * inv_v) + 8;
+        q0_v = max(0, min(15, q0_v));
+        q1_v = max(0, min(15, q1_v));
+        v_dest->qs[j] = (uint8_t)((q0_v & 0x0F) | ((q1_v & 0x0F) << 4));
+    }
+}
+
 /* Flash GQA kernel reading Q8_0 KV cache, dequantizing on-the-fly in registers */
 __global__ void k_flash_gqa_q8_0(
     const float     *__restrict__ q,
@@ -907,6 +958,138 @@ __global__ void k_fa2_q8_split(
     for (int i = 0; i < 4; i++) {
         if (i < elems) myacc[i] = acc[i];
     }
+}
+
+__global__ void k_fa2_q4_split(
+    const float     *__restrict__ q,
+    const BlockQ4_0 *__restrict__ Kc_q4,
+    const BlockQ4_0 *__restrict__ Vc_q4,
+    float           *__restrict__ p_acc,
+    float           *__restrict__ p_m,
+    float           *__restrict__ p_l,
+    const int       *__restrict__ d_pos,
+    int n_heads, int n_kv_heads, int head_dim,
+    float scale, int window, int S)
+{
+    const int pos = *d_pos;
+    const int s = blockIdx.x;
+    const int kv = blockIdx.y;
+    if (s >= S || kv >= n_kv_heads) return;
+
+    const int G = n_heads / n_kv_heads;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (warp >= G) return;
+
+    const int head = kv * G + warp;
+
+    const int elems = head_dim / 32;
+    const float4 q_vec = *(const float4 *)(q + (long)head * head_dim + lane * 4);
+    float q0 = q_vec.x, q1 = q_vec.y, q2 = q_vec.z, q3 = q_vec.w;
+
+    int t_lo = (window > 0 && pos >= window) ? (pos - window + 1) : 0;
+    int nslots = pos - t_lo + 1;
+    int chunk = (nslots + S - 1) / S;
+    int begin = t_lo + s * chunk;
+    int end = min(pos + 1, t_lo + (s + 1) * chunk);
+
+    if (begin >= end) {
+        if (lane == 0) {
+            p_m[(size_t)s * n_heads + head] = -1e30f;
+            p_l[(size_t)s * n_heads + head] = 0.0f;
+        }
+        float *myacc = p_acc + ((size_t)s * n_heads + head) * head_dim + lane * elems;
+        myacc[0] = 0.0f; myacc[1] = 0.0f; myacc[2] = 0.0f; myacc[3] = 0.0f;
+        return;
+    }
+
+    const int blocks_per_head = head_dim / 32;
+
+    extern __shared__ char raw_smem_split_q4[];
+    half    *sK_d = (half*)raw_smem_split_q4;
+    half    *sV_d = sK_d + BC_SPLIT * blocks_per_head;
+    uint8_t *sK_q = (uint8_t*)(sV_d + BC_SPLIT * blocks_per_head);
+    uint8_t *sV_q = sK_q + BC_SPLIT * (head_dim / 2);
+
+    float m_prev = -1e30f;
+    float l_prev = 0.0f;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    const int block_in_head = lane >> 3;
+    const int sub = lane & 7;
+    const bool is_high = (sub >= 4);
+    const int byte_offset = (sub & 3) * 4;
+    const uint32_t shift = is_high ? 4 : 0;
+
+    for (int t_tile = begin; t_tile < end; t_tile += BC_SPLIT) {
+        int t_tile_end = min(end, t_tile + BC_SPLIT);
+        int bc_active = t_tile_end - t_tile;
+
+        int total_blocks = bc_active * blocks_per_head;
+        for (int i = tid; i < total_blocks; i += blockDim.x) {
+            int tok = i / blocks_per_head;
+            int b   = i % blocks_per_head;
+            long g_idx = ((long)(t_tile + tok) * n_kv_heads + kv) * blocks_per_head + b;
+            const BlockQ4_0 bk = Kc_q4[g_idx];
+            const BlockQ4_0 bv = Vc_q4[g_idx];
+            sK_d[tok * blocks_per_head + b] = bk.d;
+            sV_d[tok * blocks_per_head + b] = bv.d;
+
+            int row_off = tok * (head_dim / 2) + b * 16;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                ((uint16_t *)&sK_q[row_off])[j] = ((const uint16_t *)&bk.qs[0])[j];
+                ((uint16_t *)&sV_q[row_off])[j] = ((const uint16_t *)&bv.qs[0])[j];
+            }
+        }
+        __syncthreads();
+
+        for (int t_idx = 0; t_idx < bc_active; t_idx++) {
+            const float dk = __half2float(sK_d[t_idx * blocks_per_head + block_in_head]);
+            const float dv = __half2float(sV_d[t_idx * blocks_per_head + block_in_head]);
+
+            const uint32_t k_u32 = *(const uint32_t *)&sK_q[t_idx * (head_dim / 2) + block_in_head * 16 + byte_offset];
+            const uint32_t v_u32 = *(const uint32_t *)&sV_q[t_idx * (head_dim / 2) + block_in_head * 16 + byte_offset];
+
+            uint32_t k_shifted = k_u32 >> shift;
+            const float k0 = (float)((int)((k_shifted      ) & 0x0F) - 8);
+            const float k1 = (float)((int)((k_shifted >>  8) & 0x0F) - 8);
+            const float k2 = (float)((int)((k_shifted >> 16) & 0x0F) - 8);
+            const float k3 = (float)((int)((k_shifted >> 24) & 0x0F) - 8);
+
+            uint32_t v_shifted = v_u32 >> shift;
+            const float v0 = (float)((int)((v_shifted      ) & 0x0F) - 8);
+            const float v1 = (float)((int)((v_shifted >>  8) & 0x0F) - 8);
+            const float v2 = (float)((int)((v_shifted >> 16) & 0x0F) - 8);
+            const float v3 = (float)((int)((v_shifted >> 24) & 0x0F) - 8);
+
+            float dot_partial = (q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3) * dk;
+            float score = warp_sum(dot_partial);
+            score = __shfl_sync(0xffffffff, score, 0) * scale;
+
+            float m_curr = fmaxf(m_prev, score);
+            float p = expf(score - m_curr);
+            float alpha = expf(m_prev - m_curr);
+            l_prev = l_prev * alpha + p;
+
+            float pdv = p * dv;
+            acc[0] = acc[0] * alpha + pdv * v0;
+            acc[1] = acc[1] * alpha + pdv * v1;
+            acc[2] = acc[2] * alpha + pdv * v2;
+            acc[3] = acc[3] * alpha + pdv * v3;
+
+            m_prev = m_curr;
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0) {
+        p_m[(size_t)s * n_heads + head] = m_prev;
+        p_l[(size_t)s * n_heads + head] = l_prev;
+    }
+    float *myacc = p_acc + ((size_t)s * n_heads + head) * head_dim + lane * elems;
+    myacc[0] = acc[0]; myacc[1] = acc[1]; myacc[2] = acc[2]; myacc[3] = acc[3];
 }
 
 __global__ void k_fa2_combine(
@@ -1397,10 +1580,11 @@ struct Qwen2Engine {
     float *d_g, *d_u;
     /* caches: [layer][kv_head][slot][head_dim] */
     float *d_kc, *d_vc;
-    /* Q8_0 KV caches: allocated when use_q8_kvcache is enabled */
+    /* Q8_0 and Q4_0 KV caches: allocated when enabled */
     BlockQ8_0 *d_kc_q8, *d_vc_q8;
     int use_q8_kvcache;
-    /* KV staging rows (pre-scatter) */
+    BlockQ4_0 *d_kc_q4, *d_vc_q4;
+    int use_q4_kvcache;
     float *d_k_stage, *d_v_stage;
     /* device mirror of pos: kernels read position from here (graph-readiness) */
     int *d_pos;
@@ -1625,13 +1809,11 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
 
     /* activations + caches */
     cudaMalloc(&e->d_x,  D * sizeof(float));
-    cudaMalloc(&e->d_xn, D * sizeof(float));
-    /* heterogeneous layers (gemma4): size staging to per-layer maxima */
-    int max_heads = cfg->n_heads, max_kv = cfg->n_kv_heads;
     int max_hd = cfg->head_dim;
+    int max_heads = cfg->dim / cfg->head_dim;
     long max_ffn = F;
-    /* largest q-projection output across layers: full-attn gemma4 layers
-     * carry hd=512 (vs meta hd=256), so qout = heads*hd exceeds
+    int max_kv = cfg->n_kv_heads;
+    /* Default max_qout is the homogeneous case:
      * cfg->n_heads*cfg->head_dim. d_q/d_att must fit every layer. */
     long max_qout = (long)cfg->n_heads * cfg->head_dim;
     if (m && strstr(m->architecture, "gemma4") == m->architecture) {
@@ -1811,11 +1993,18 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     e->d_kc_q8 = NULL;
     e->d_vc_q8 = NULL;
     e->use_q8_kvcache = 0;
-    const char *q8_env = getenv("TT_Q8_KV");
-    if (q8_env && atoi(q8_env) != 0) {
-        qwen2_engine_enable_q8_kvcache(e, 1);
+    e->d_kc_q4 = NULL;
+    e->d_vc_q4 = NULL;
+    e->use_q4_kvcache = 0;
+    const char *q4_env = getenv("TT_Q4_KV");
+    if (q4_env && atoi(q4_env) != 0) {
+        qwen2_engine_enable_q4_kvcache(e, 1);
+    } else {
+        const char *q8_env = getenv("TT_Q8_KV");
+        if (q8_env && atoi(q8_env) != 0) {
+            qwen2_engine_enable_q8_kvcache(e, 1);
+        }
     }
-
     return e;
 }
 
@@ -1989,7 +2178,8 @@ static int forward_layers(Qwen2Engine *e) {
         float *Vl_f = e->d_vc + l * cache_layer;
         BlockQ8_0 *Kl_q8 = e->d_kc_q8 ? (e->d_kc_q8 + (long)l * cache_layer_q8) : NULL;
         BlockQ8_0 *Vl_q8 = e->d_vc_q8 ? (e->d_vc_q8 + (long)l * cache_layer_q8) : NULL;
-        /* gemma4 KV sharing: shared layers (pl_src[l] >= 0) read the source
+        BlockQ4_0 *Kl_q4 = e->d_kc_q4 ? (e->d_kc_q4 + (long)l * cache_layer_q8) : NULL;
+        BlockQ4_0 *Vl_q4 = e->d_vc_q4 ? (e->d_vc_q4 + (long)l * cache_layer_q8) : NULL;
          * layer's cache slab instead of computing/scattering their own K/V.
          * llama-model.cpp:2502 semantics. */
         const int kv_shared = e->has_pl_embd && e->pl_src[l] >= 0;
@@ -2109,7 +2299,12 @@ static int forward_layers(Qwen2Engine *e) {
          * source layer's already-populated slab. */
         if (!kv_shared) {
         if (tt_profiling()) tt_prof_begin(TT_P_SCATTER, e->stream);
-        if (e->use_q8_kvcache) {
+        if (e->use_q4_kvcache) {
+            const int num_blocks = kvdim_l / 32;
+            k_kv_scatter_q4_0<<<(num_blocks + 255) / 256, 256, 0, e->stream>>>(
+                e->d_k_stage, e->d_v_stage, Kl_q4, Vl_q4, e->d_pos,
+                KV_l, HDl, c->max_ctx);
+        } else if (e->use_q8_kvcache) {
             const int num_blocks = kvdim_l / 32;
             k_kv_scatter_q8_0<<<(num_blocks + 255) / 256, 256, 0, e->stream>>>(
                 e->d_k_stage, e->d_v_stage, Kl_q8, Vl_q8, e->d_pos,
@@ -2139,13 +2334,35 @@ static int forward_layers(Qwen2Engine *e) {
             const float scale_l = c->tr.attn_scale_one ? 1.0f
                               : 1.0f / sqrtf((float)HDl);   /* match prior kernel arg */
             const int swa_l = e->has_pl_embd ? e->pl_swa[l] : c->tr.swa_size;
-            if (e->use_q8_kvcache) {
+            if (e->use_q4_kvcache) {
                 int S;
                 if (e->graph_ready || g_capturing) {
-                    // Static grid for CUDA graph capture: static S_MAX handles any position
-                    S = e->d_split_S_max; // 64
+                    S = e->d_split_S_max;
                 } else {
-                    // Dynamic scaling for eager decode: 1 slice per 64-128 tokens
+                    S = (ctx_l + 63) / 64;
+                    if (S < 2) S = 2;
+                    if (S > 64) S = 64;
+                    if (S > e->d_split_S_max) S = e->d_split_S_max;
+                }
+                dim3 grid_split(S, KV_l);
+                int threads_split = (H_l / KV_l) * 32;
+                int blocks_per_head = HDl / 32;
+                size_t smem_bytes = 2 * (size_t)BC_SPLIT * blocks_per_head * sizeof(half)
+                                  + 2 * (size_t)BC_SPLIT * (HDl / 2) * sizeof(uint8_t);
+                k_fa2_q4_split<<<grid_split, threads_split, smem_bytes, e->stream>>>(
+                    e->d_q, Kl_q4, Vl_q4,
+                    e->d_split_pacc, e->d_split_pm, e->d_split_pl,
+                    e->d_pos,
+                    H_l, KV_l, HDl,
+                    scale_l, swa_l, S);
+                k_fa2_combine<<<H_l, 32, 0, e->stream>>>(
+                    e->d_split_pacc, e->d_split_pm, e->d_split_pl,
+                    e->d_att, H_l, HDl, S);
+            } else if (e->use_q8_kvcache) {
+                int S;
+                if (e->graph_ready || g_capturing) {
+                    S = e->d_split_S_max;
+                } else {
                     S = (ctx_l + 63) / 64;
                     if (S < 2) S = 2;
                     if (S > 64) S = 64;
@@ -3305,6 +3522,33 @@ extern "C" void qwen2_engine_enable_q8_kvcache(Qwen2Engine *e, int enable) {
         fprintf(stderr, "[qwen2-engine] Q8_0 KV cache ENABLED (4x DRAM traffic reduction)\n");
     }
     e->use_q8_kvcache = enable;
+}
+
+extern "C" void qwen2_engine_enable_q4_kvcache(Qwen2Engine *e, int enable) {
+    if (!e) return;
+    if (enable && (!e->d_kc_q4 || !e->d_vc_q4)) {
+        long cache_per_blocks = (long)e->cfg.n_kv_heads * e->cfg.max_ctx * (e->cfg.head_dim / 32);
+        if (e->pl_hd[0] > 0) {
+            long mx_q4 = 0;
+            for (int l = 0; l < e->cfg.n_layers; l++) {
+                int kv = e->pl_kv[l] > 0 ? e->pl_kv[l] : e->cfg.n_kv_heads;
+                int hd = e->pl_hd[l] > 0 ? e->pl_hd[l] : e->cfg.head_dim;
+                long w2_q4 = (long)kv * (hd / 32);
+                if (w2_q4 > mx_q4) mx_q4 = w2_q4;
+            }
+            cache_per_blocks = mx_q4 * e->cfg.max_ctx;
+        }
+        if (!e->d_kc_q4) {
+            cudaMalloc(&e->d_kc_q4, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ4_0));
+            cudaMemset(e->d_kc_q4, 0, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ4_0));
+        }
+        if (!e->d_vc_q4) {
+            cudaMalloc(&e->d_vc_q4, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ4_0));
+            cudaMemset(e->d_vc_q4, 0, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ4_0));
+        }
+        fprintf(stderr, "[qwen2-engine] Q4_0 KV cache ENABLED (8x DRAM traffic reduction vs FP32)\n");
+    }
+    e->use_q4_kvcache = enable;
 }
 
 void qwen2_engine_set_sampling(Qwen2Engine *e, float temp, int topk,

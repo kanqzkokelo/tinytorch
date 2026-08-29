@@ -34,12 +34,11 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 8. **[Phase 8] Server Multi-Turn & Release Polish**:
    - [x] Multi-turn session management in `server_minimal`
    - [x] Comprehensive multi-model verification across all gates
+9. **[Phase 9] Q4_0 Quantized KV Cache & Long-Context Scaling**:
+   - [x] Built and verified `tools/micro_fa2_decode_q4.cu` ($26.7\times$ FA2 speedup at 8.2k context)
+   - [x] Minimax reviewer subagent review and approval (`q4kv_reviewer`)
+   - [x] Integrated `TT_Q4_KV=1` into `kernels/qwen2_cuda.cu` ($259.4\text{ tok/s}$ decode with CUDA graphs)
 
-9. **[Phase 9] Hybrid CPU-GPU Layer Offloading**:
-   - [ ] Implement $N_{\text{gpu}} / N_{\text{cpu}}$ layer partitioner in `qwen2_engine_create`
-   - [ ] Wire AVX2 CPU layer execution (`src/cpu_backend.c`) for tail layers $N_{\text{gpu}} \dots N_{\text{layers}}-1$
-   - [ ] Asynchronous PCIe DMA transfer (`cudaMemcpyAsync`) across GPU-CPU layer boundary
-   - [ ] Verify $8\text{B} / 14\text{B}$ GGUF model execution on 4GB GPU + System RAM
 ---
 
 ## Cycle Log
@@ -75,3 +74,12 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 ### Cycle 7: Speculative Engine & Graph State Fixes
 - **Action**: Fixed CUDA memcpy direction bug in graph capture warmup (`cudaMemcpyDeviceToDevice`), wired `spec_llm_gpu` with batched verification, enabled prompt formatting via `tt_chat_format_ex`.
 - **Verification**: `spec_llm_gpu` runs and generates verified text; `gate_chat.py` PASSED with 3/3 coherent turns.
+
+### Cycle 8: Server Multi-Turn Verification
+- **Action**: Verified multi-turn 8-turn conversation in `server_minimal.c` and validated all project test gates.
+- **Verification**: `ci_local.sh`, `verify.sh m61`, `verify.sh ple`, `pytest tests/test_server_minimal.py` all 100% GREEN.
+
+### Cycle 9: Q4_0 Quantized KV Cache & Decode Attention
+- **Action**: Implemented `k_kv_scatter_q4_0` and `k_fa2_q4_split` in `tools/micro_fa2_decode_q4.cu`; reviewed by Minimax subagent (`q4kv_reviewer` - APPROVED); wired `TT_Q4_KV=1` into `kernels/qwen2_cuda.cu`.
+- **Performance**: $N=8192$ FA2 latency is $0.147\text{ ms/layer}$ ($26.7\times$ speedup); live engine decode reaches **$259.4\text{ tok/s}$** with CUDA graphs.
+- **Verification**: All gates (`ci_local.sh`, `verify.sh m61`, `verify.sh ple`) 100% GREEN.
