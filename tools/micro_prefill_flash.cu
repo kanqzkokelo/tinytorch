@@ -153,7 +153,7 @@ __global__ void k_flash_gqa_q8_0(
 //     head-dim slice) for the row it just processed.
 //
 // Causal mask: query i attends to KV [0, e_pos + i] ONLY.
-#define BR_PF 64
+#define BR_PF 8
 #define BC_PF 64
 
 __global__ void k_prefill_flash_q8_0(
@@ -177,154 +177,133 @@ __global__ void k_prefill_flash_q8_0(
     const int elems = head_dim / 32;             // 4 for HD=128
     const int blocks_per_head = head_dim / 32;   // 4 for HD=128
 
-    // smem layout:
-    //   sQ: [BR_PF, head_dim] FP16 (one-time load, 16384 bytes)
-    //   sK_d: [BC_PF, blocks_per_head] FP16 scales (one FP16 per 32-elem block)  (512 bytes)
-    //   sV_d: [BC_PF, blocks_per_head] FP16 scales  (512 bytes)
-    //   sK_q: [BC_PF, head_dim] int8 quantized  (8192 bytes)
-    //   sV_q: [BC_PF, head_dim] int8 quantized  (8192 bytes)
-    //   total dynamic smem: 16384 + 512 + 512 + 8192 + 8192 = 33792 bytes
-    //   (with sQ stored as fp16: q is precomputed fp16; k/v are dequantized in
-    //    registers on the fly, NOT precomputed in smem, to preserve FP32 precision.)
+    // Smem layout: BC_PF KV tokens
+    // sK_d, sV_d: [BC_PF, blocks_per_head] FP16 scales
+    // sK_q, sV_q: [BC_PF, head_dim] int8 quantized
     extern __shared__ char raw_smem[];
-    half  *sQ   = (half*)raw_smem;                              // [BR_PF, head_dim] FP16
-    half  *sK_d = sQ + BR_PF * head_dim;                       // [BC_PF, blocks_per_head] FP16
-    half  *sV_d = sK_d + BC_PF * blocks_per_head;              // [BC_PF, blocks_per_head] FP16
-    int8_t *sK_q = (int8_t*)(sV_d + BC_PF * blocks_per_head);  // [BC_PF, head_dim] int8
-    int8_t *sV_q = sK_q + BC_PF * head_dim;                    // [BC_PF, head_dim] int8
+    half   *sK_d = (half*)raw_smem;
+    half   *sV_d = sK_d + BC_PF * blocks_per_head;
+    int8_t *sK_q = (int8_t*)(sV_d + BC_PF * blocks_per_head);
+    int8_t *sV_q = sK_q + BC_PF * head_dim;
 
-    // ---------------- one-time Q load into sQ (FP16) ----------------
-    // Q[query, head, :] where query = q_tile*BR + i in BR tile, head = this warp's head.
-    // Lane m writes elems [m*elems, m*elems+elems) of each of the BR rows for this head.
+    // Each warp is dedicated to one query head (`head`).
+    // The 32 lanes in the warp cooperate on each query row:
+    // lane m holds elements [m*4 .. m*4+3] of head_dim=128.
+    // In registers, each lane holds Q, m, l, acc for all BR_PF rows of this q-tile.
+    float qreg[BR_PF][4];
+    float m_state[BR_PF];
+    float l_state[BR_PF];
+    float acc[BR_PF][4];
+    int   max_kv[BR_PF];
+    int   row_min_t[BR_PF];
+    bool  active[BR_PF];
+
+#pragma unroll
     for (int r = 0; r < BR_PF; r++) {
         const int qrow = q_tile * BR_PF + r;
-        const bool active = (qrow < n);
-        const float *qr = Q + (long)qrow * (n_heads * head_dim) + (long)head * head_dim;
-#pragma unroll
-        for (int j = 0; j < 4; j++) {
-            if (j < elems) {
-                half v = __float2half(active ? qr[lane * elems + j] : 0.0f);
-                sQ[r * head_dim + lane * elems + j] = v;
-            }
+        active[r] = (qrow < n);
+        max_kv[r] = active[r] ? (e_pos + qrow) : -1;
+        row_min_t[r] = (window > 0 && active[r] && (e_pos + qrow + 1 > window))
+                       ? (e_pos + qrow + 1 - window) : 0;
+
+        m_state[r] = -1e30f;
+        l_state[r] = 0.0f;
+        acc[r][0] = 0.0f; acc[r][1] = 0.0f; acc[r][2] = 0.0f; acc[r][3] = 0.0f;
+
+        if (active[r]) {
+            const float *qr = Q + (long)qrow * (n_heads * head_dim) + (long)head * head_dim + lane * elems;
+            qreg[r][0] = qr[0]; qreg[r][1] = qr[1]; qreg[r][2] = qr[2]; qreg[r][3] = qr[3];
+        } else {
+            qreg[r][0] = 0.0f; qreg[r][1] = 0.0f; qreg[r][2] = 0.0f; qreg[r][3] = 0.0f;
         }
     }
-    __syncthreads();
 
     const int S = (ctx + BC_PF - 1) / BC_PF;
+    const int block_in_head = lane >> 3;         // lane / 8
+    const int elem_off = (lane & 7) * elems;     // (lane % 8) * 4
 
-    // For each owned row (warp w -> rows w, w+G, ...), run the full attention
-    // pass. We must process rows one at a time within a warp because the
-    // online-softmax state (m, l, acc) is per-row and has a serial dependency.
-    for (int r = 0; r < BR_PF; r++) {
-        const int qrow = q_tile * BR_PF + r;
-        const bool active = (qrow < n);
-        // Match engine's prefill: serial uses pos_i = e_pos + i + 1, processes t in [0, e_pos + i + 1].
-        // Batched mask matches: t < e_pos + i + 1 + 1 = e_pos + i + 2 (to match the inclusive serial loop).
-        // Actually: to match the engine exactly, we use the SAME pos_i as serial: t <= e_pos + i + 1.
-        // So mask: t <= e_pos + qrow + 1  (inclusive).
-        // Match serial baseline: pos_i = e_pos + i, processes t in [0, e_pos + i] inclusive.
-        // Batched mask: t <= e_pos + qrow, so mask t > e_pos + qrow.
-        const int max_kv = active ? (e_pos + qrow) : -1;  // inclusive upper
-        int row0 = 0;
-        if (window > 0 && active) {
-            row0 = (e_pos + qrow + 1 > window) ? (e_pos + qrow + 1 - window) : 0;
-        }
-        // load this row's Q from sQ: lane m reads [m*elems, m*elems+elems)
-        float q0, q1, q2, q3;
-        {
-            const half *qp = sQ + r * head_dim + lane * elems;
-            q0 = __half2float(qp[0]);
-            q1 = __half2float(qp[1]);
-            q2 = __half2float(qp[2]);
-            q3 = __half2float(qp[3]);
-        }
-        float m_prev = -1e30f, l_prev = 0.0f;
-        float acc[4] = {0,0,0,0};
+    for (int s = 0; s < S; s++) {
+        const int s_start = s * BC_PF;
+        const int s_end_excl = (s_start + BC_PF < ctx) ? (s_start + BC_PF) : ctx;
+        const int bc_active = s_end_excl - s_start;
+        if (bc_active <= 0) continue;
 
-        for (int s = 0; s < S; s++) {
-            const int s_start = s * BC_PF;
-            const int s_end_excl = (s_start + BC_PF < ctx) ? (s_start + BC_PF) : ctx;
-            const int bc_active = s_end_excl - s_start;
-            if (bc_active <= 0) continue;
-
-            // Cooperative load of this BC tile's Q8 blocks into sK_q/sV_q (int8) +
-            // sK_d/sV_d (FP16 scales). Dequant is done in registers on the fly
-            // during the inner loop to preserve FP32 precision.
-            const int total_blocks = bc_active * blocks_per_head;
-            for (int i = tid; i < total_blocks; i += blockDim.x) {
-                const int tok = i / blocks_per_head;     // 0..BC-1
-                const int b   = i % blocks_per_head;
-                const long g_idx = ((long)(s_start + tok) * n_kv_heads + kv) * blocks_per_head + b;
-                const BlockQ8_0 bk = Kc[g_idx];
-                const BlockQ8_0 bv = Vc[g_idx];
-                sK_d[tok * blocks_per_head + b] = bk.d;
-                sV_d[tok * blocks_per_head + b] = bv.d;
-                const int row_off = tok * head_dim + b * 32;
+        // Cooperative load of BC_PF KV blocks into smem
+        const int total_blocks = bc_active * blocks_per_head;
+        for (int i = tid; i < total_blocks; i += blockDim.x) {
+            const int tok = i / blocks_per_head;
+            const int b   = i % blocks_per_head;
+            const long g_idx = ((long)(s_start + tok) * n_kv_heads + kv) * blocks_per_head + b;
+            const BlockQ8_0 bk = Kc[g_idx];
+            const BlockQ8_0 bv = Vc[g_idx];
+            sK_d[tok * blocks_per_head + b] = bk.d;
+            sV_d[tok * blocks_per_head + b] = bv.d;
+            const int row_off = tok * head_dim + b * 32;
 #pragma unroll
-                for (int j = 0; j < 32; j++) {
-                    sK_q[row_off + j] = bk.qs[j];
-                    sV_q[row_off + j] = bv.qs[j];
-                }
+            for (int j = 0; j < 32; j++) {
+                sK_q[row_off + j] = bk.qs[j];
+                sV_q[row_off + j] = bv.qs[j];
             }
-            __syncthreads();
+        }
+        __syncthreads();
 
-            // Per-token causal-masked online softmax update over the BC tile.
-            for (int t = s_start; t < s_end_excl; t++) {
-                const int t_in_tile = t - s_start;
-                // Lane m's slice: head-dim [m*elems, m*elems+elems) of token t.
-                // The slice is one 32-elem block of one head; lane m == block index m? no.
-                // For HD=128 elems=4: lane m covers head-dim [m*4, m*4+4) of one block
-                // (block b = m%blocks_per_head ... but with 4 blocks and 32 lanes, lane m maps
-                // to block m/8, offset (m%8)*4. For HD=128, elems=4, blocks_per_head=4:
-                //   lane m: block_idx = m / 8 (0..3), elem_off = (m%8) * 4 (0..28)
-                const int block_in_head = lane >> 3;        // 0..blocks_per_head-1
-                const int elem_off = (lane & 7) * elems;    // 0,4,8,..,28
-                const int k_q_off = t_in_tile * head_dim + block_in_head * 32 + elem_off;
-                const int v_q_off = k_q_off;
-                const float dk = __half2float(sK_d[t_in_tile * blocks_per_head + block_in_head]);
-                const float dv = __half2float(sV_d[t_in_tile * blocks_per_head + block_in_head]);
-                float k0 = (float)sK_q[k_q_off + 0] * dk;
-                float k1 = (float)sK_q[k_q_off + 1] * dk;
-                float k2 = (float)sK_q[k_q_off + 2] * dk;
-                float k3 = (float)sK_q[k_q_off + 3] * dk;
-                float v0 = (float)sV_q[v_q_off + 0] * dv;
-                float v1 = (float)sV_q[v_q_off + 1] * dv;
-                float v2 = (float)sV_q[v_q_off + 2] * dv;
-                float v3 = (float)sV_q[v_q_off + 3] * dv;
-                float score = q0*k0 + q1*k1 + q2*k2 + q3*k3;
-                if (!active || t < row0 || t > max_kv) score = -1e30f;
-                score = warp_sum(score);
+        for (int t = s_start; t < s_end_excl; t++) {
+            const int t_in_tile = t - s_start;
+            const int k_q_off = t_in_tile * head_dim + block_in_head * 32 + elem_off;
+            const int v_q_off = k_q_off;
+            const float dk = __half2float(sK_d[t_in_tile * blocks_per_head + block_in_head]);
+            const float dv = __half2float(sV_d[t_in_tile * blocks_per_head + block_in_head]);
+
+            const float k0 = (float)sK_q[k_q_off + 0];
+            const float k1 = (float)sK_q[k_q_off + 1];
+            const float k2 = (float)sK_q[k_q_off + 2];
+            const float k3 = (float)sK_q[k_q_off + 3];
+
+            const float v0 = (float)sV_q[v_q_off + 0];
+            const float v1 = (float)sV_q[v_q_off + 1];
+            const float v2 = (float)sV_q[v_q_off + 2];
+            const float v3 = (float)sV_q[v_q_off + 3];
+
+#pragma unroll
+            for (int r = 0; r < BR_PF; r++) {
+                if (!active[r] || t < row_min_t[r] || t > max_kv[r]) continue;
+
+                // Dot product slice for lane m
+                float dot_partial = (qreg[r][0]*k0 + qreg[r][1]*k1 + qreg[r][2]*k2 + qreg[r][3]*k3) * dk;
+                float score = warp_sum(dot_partial);
                 score = __shfl_sync(0xffffffff, score, 0) * scale;
 
+                float m_curr = fmaxf(m_state[r], score);
+                float p = expf(score - m_curr);
+                float alpha = expf(m_state[r] - m_curr);
+                l_state[r] = l_state[r] * alpha + p;
 
-                // Online softmax merge
-                float m_new = fmaxf(m_prev, score);
-                float p = __expf(score - m_new);
-                float alpha = __expf(m_prev - m_new);
-                l_prev = l_prev * alpha + p;
-                acc[0] = acc[0] * alpha + p * v0;
-                acc[1] = acc[1] * alpha + p * v1;
-                acc[2] = acc[2] * alpha + p * v2;
-                acc[3] = acc[3] * alpha + p * v3;
-                m_prev = m_new;
+                float pdv = p * dv;
+                acc[r][0] = acc[r][0] * alpha + pdv * v0;
+                acc[r][1] = acc[r][1] * alpha + pdv * v1;
+                acc[r][2] = acc[r][2] * alpha + pdv * v2;
+                acc[r][3] = acc[r][3] * alpha + pdv * v3;
+
+                m_state[r] = m_curr;
             }
-            __syncthreads();  // protect sK/sV for next s iteration
         }
+        __syncthreads();
+    }
 
-        // Write output: lane m -> [head*head_dim + m*elems, +elems)
-        if (active) {
-            float inv = 1.0f / (l_prev + 1e-30f);
-            float *out = Att + (long)qrow * (n_heads * head_dim) + (long)head * head_dim + lane * elems;
-            out[0] = acc[0] * inv;
-            out[1] = acc[1] * inv;
-            out[2] = acc[2] * inv;
-            out[3] = acc[3] * inv;
+    // Write output: 32 lanes cooperatively write each row's 128 elements
+#pragma unroll
+    for (int r = 0; r < BR_PF; r++) {
+        if (active[r]) {
+            const int qrow = q_tile * BR_PF + r;
+            float inv_l = 1.0f / l_state[r];
+            float *out_row = Att + (long)qrow * (n_heads * head_dim) + (long)head * head_dim + lane * elems;
+            out_row[0] = acc[r][0] * inv_l;
+            out_row[1] = acc[r][1] * inv_l;
+            out_row[2] = acc[r][2] * inv_l;
+            out_row[3] = acc[r][3] * inv_l;
         }
     }
 }
-
-// ---------------- helpers to fill the KV cache ----------------
-static float frand(){ return (float)rand()/(float)RAND_MAX*2.0f - 1.0f; }
 
 __global__ void k_kv_scatter_q8_0(const float *kst, const float *vst,
                                   BlockQ8_0 *Kc, BlockQ8_0 *Vc,
@@ -355,6 +334,8 @@ __global__ void k_kv_scatter_q8_0(const float *kst, const float *vst,
         vd->qs[i] = (int8_t)__float2int_rn(v_vals[i] * inv_v);
     }
 }
+
+static float frand(){ return (float)rand()/(float)RAND_MAX*2.0f - 1.0f; }
 
 // ---------------- bench ----------------
 int main() {
@@ -394,8 +375,8 @@ int main() {
     float *d_kst, *d_vst;
     float *d_qbuf, *d_attbuf;
     cudaMalloc(&d_qrow,  qrow_bytes);
-    cudaMalloc(&d_att_ser, att_bytes);
-    cudaMalloc(&d_att_bat, att_bytes);
+    cudaMalloc(&d_att_ser, att_buf_bytes);
+    cudaMalloc(&d_att_bat, att_buf_bytes);
     cudaMalloc(&d_Kc_q8,  q8_cache_bytes);
     cudaMalloc(&d_Vc_q8,  q8_cache_bytes);
     cudaMalloc(&d_pos,    sizeof(int));
@@ -427,6 +408,26 @@ int main() {
                     d_kst, d_vst, d_Kc_q8, d_Vc_q8, d_pos, n_kv_heads, head_dim, max_ctx);
             }
             cudaDeviceSynchronize();
+            if (n == 32) {
+                int nb_dbg = (n_kv_heads * head_dim) / 32;
+                BlockQ8_0 *h_Kc = (BlockQ8_0*)malloc((size_t)nb_dbg * sizeof(BlockQ8_0));
+                cudaMemcpy(h_Kc, d_Kc_q8 + (long)0 * nb_dbg, (size_t)nb_dbg * sizeof(BlockQ8_0), cudaMemcpyDeviceToHost);
+                printf("    [sanity t=0] Kc[0].d=%.5f qs[0..7]=", __half2float(h_Kc[0].d));
+                for (int j = 0; j < 8; j++) printf("%d ", (int)h_Kc[0].qs[j]);
+                printf("qs[28..31]=");
+                for (int j = 28; j < 32; j++) printf("%d ", (int)h_Kc[0].qs[j]);
+                printf("\n");
+                cudaMemcpy(h_Kc, d_Vc_q8 + (long)0 * nb_dbg, (size_t)nb_dbg * sizeof(BlockQ8_0), cudaMemcpyDeviceToHost);
+                printf("    [sanity t=0] Vc[0].d=%.5f qs[0..7]=", __half2float(h_Kc[0].d));
+                for (int j = 0; j < 8; j++) printf("%d ", (int)h_Kc[0].qs[j]);
+                printf("qs[28..31]=");
+                for (int j = 28; j < 32; j++) printf("%d ", (int)h_Kc[0].qs[j]);
+                printf("Vc[1].d=%.5f qs[0..7]=", __half2float(h_Kc[1].d));
+                for (int j = 0; j < 8; j++) printf("%d ", (int)h_Kc[1].qs[j]);
+                printf("\n");
+                free(h_Kc);
+                fflush(stdout);
+            }
 
             float *h_q = (float*)malloc((size_t)n * n_heads * head_dim * sizeof(float));
             for (size_t i = 0; i < (size_t)n * n_heads * head_dim; i++) h_q[i] = frand() * 0.5f;
@@ -447,7 +448,15 @@ int main() {
                         d_pos, n_heads, n_kv_heads, head_dim, max_ctx, scale, window);
                 }
             }
-            cudaDeviceSynchronize();
+             cudaDeviceSynchronize();
+            if (n == 32) {
+                float h_dbg[16];
+                cudaMemcpy(h_dbg, d_attbuf, 16 * sizeof(float), cudaMemcpyDeviceToHost);
+                printf("    [post-warmup] d_attbuf[0..15] = ");
+                for (int i = 0; i < 16; i++) printf("%.4f ", h_dbg[i]);
+                printf("\n");
+                fflush(stdout);
+            }
             cudaEventRecord(start);
             for (int it = 0; it < iters; it++) {
                 for (int i = 0; i < n; i++) {
@@ -473,8 +482,7 @@ int main() {
             int num_q_tiles = (n + BR_PF - 1) / BR_PF;
             dim3 grid(num_q_tiles, n_kv_heads);
             int threads = G * 32;            // 224
-            size_t smem_bytes = (size_t)BR_PF * head_dim * sizeof(half)            // sQ
-                              + 2 * (size_t)BC_PF * blocks_per_head * sizeof(half)  // sK_d, sV_d
+            size_t smem_bytes = 2 * (size_t)BC_PF * blocks_per_head * sizeof(half)  // sK_d, sV_d
                               + 2 * (size_t)BC_PF * head_dim * sizeof(int8_t);     // sK_q, sV_q
             cudaFuncSetAttribute(k_prefill_flash_q8_0,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -502,12 +510,44 @@ int main() {
             float *h_att_bat_d = (float*)malloc((size_t)n * n_heads * head_dim * sizeof(float));
             cudaMemcpy(h_att_ser_d, d_att_ser, (size_t)n * n_heads * head_dim * sizeof(float), cudaMemcpyDeviceToHost);
             cudaMemcpy(h_att_bat_d, d_attbuf, (size_t)n * n_heads * head_dim * sizeof(float), cudaMemcpyDeviceToHost);
+            if (n == 32) {
+                // Debug: show first few values
+                for (int q = 0; q < std::min(n, 4); q++) {
+                    for (int h = 0; h < std::min(n_heads, 4); h++) {
+                        printf("  [q=%d h=%d] ser=[", q, h);
+                        for (int e = 0; e < 4; e++) {
+                            int idx = q*n_heads*head_dim + h*head_dim + 0*4 + e;
+                            printf("%.3f ", h_att_ser_d[idx]);
+                        }
+                        printf("] bat=[");
+                        for (int e = 0; e < 4; e++) {
+                            int idx = q*n_heads*head_dim + h*head_dim + 0*4 + e;
+                            printf("%.3f ", h_att_bat_d[idx]);
+                        }
+                        printf("]\n");
+                    }
+                }
+                fflush(stdout);
+            }
             float max_err = 0.0f;
             int naninf = 0;
-            for (size_t i = 0; i < (size_t)n * n_heads * head_dim; i++) {
-                if (!isfinite(h_att_ser_d[i]) || !isfinite(h_att_bat_d[i])) naninf++;
-                float e = fabsf(h_att_bat_d[i] - h_att_ser_d[i]);
-                if (e > max_err) max_err = e;
+            for (int q = 0; q < n; q++) {
+                for (int h = 0; h < n_heads; h++) {
+                    float qh_max_err = 0;
+                    int worst_d = -1;
+                    for (int d = 0; d < head_dim; d++) {
+                        size_t idx = (size_t)q * n_heads * head_dim + (size_t)h * head_dim + d;
+                        if (!isfinite(h_att_ser_d[idx]) || !isfinite(h_att_bat_d[idx])) naninf++;
+                        float diff = fabsf(h_att_bat_d[idx] - h_att_ser_d[idx]);
+                        if (diff > qh_max_err) { qh_max_err = diff; worst_d = d; }
+                        if (diff > max_err) max_err = diff;
+                    }
+                    if (qh_max_err > 0.01f && n == 32 && q < 4) {
+                        size_t idx = (size_t)q * n_heads * head_dim + (size_t)h * head_dim + worst_d;
+                        printf("  [ERR n=%d q=%d h=%d worst_d=%d (ser=%.4f bat=%.4f diff=%.4f)]\n",
+                               n, q, h, worst_d, h_att_ser_d[idx], h_att_bat_d[idx], qh_max_err);
+                    }
+                }
             }
             float speedup = ms_serial / ms_batched;
             const char *pass = (max_err < 1e-2f && naninf == 0) ? "PASS" : "FAIL";
