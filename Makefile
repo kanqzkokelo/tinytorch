@@ -76,6 +76,16 @@ $(BUILD)/chat_llm_gpu: examples/chat_llm_gpu.c src/loader_gguf.c src/arch_regist
 
 chat_llm_gpu: $(BUILD)/chat_llm_gpu
 
+$(BUILD)/server_minimal: examples/server_minimal.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/tokenizer_bpe.c src/chat_template.c src/samplers.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
+	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
+	  -o $@ \
+	  examples/server_minimal.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/tokenizer_bpe.c src/chat_template.c src/samplers.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
+	  -L$(HOME)/mmcuda/lib -lcudart -lpthread
+
+server_minimal: $(BUILD)/server_minimal
+
 # Universal Speculative Engine orchestrator: N-gram drafter (host) +
 # batched verify_speculative() (CUDA). Source list mirrors run_llm_gpu
 # plus src/ngram_lookup.c.

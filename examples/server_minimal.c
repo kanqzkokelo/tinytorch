@@ -233,6 +233,9 @@ static void write_status(int fd, int code, const char *reason,
     writef(fd, "Content-Type: %s\r\n", ctype);
     writef(fd, "Content-Length: %zu\r\n", body_len);
     writef(fd, "Server: %s\r\n", SERVER_NAME);
+    writef(fd, "Access-Control-Allow-Origin: *\r\n");
+    writef(fd, "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+    writef(fd, "Access-Control-Allow-Headers: Content-Type, Authorization\r\n");
     writef(fd, "Connection: close\r\n\r\n");
     if (body && body_len) write_all(fd, body, body_len);
 }
@@ -351,6 +354,87 @@ static int json_top_int(const char *body, const char *key, int dflt) {
         int depth = 0;
         if (*p == '{' || *p == '[') { depth = 1; p++; }
         else if (*p == '"') { char *tmp; if (json_parse_string(&p, &tmp)<0) return dflt; free(tmp); }
+        else {
+            while (*p && *p != ',' && *p != '}') p++;
+        }
+        while (depth) {
+            if (*p == '{' || *p == '[') depth++;
+            else if (*p == '}' || *p == ']') depth--;
+            p++;
+        }
+        json_skip_ws(&p);
+        if (*p == ',') { p++; continue; }
+        if (*p == '}') return dflt;
+    }
+}
+
+/* Find a top-level float field. Returns dflt if missing. */
+static float json_top_float(const char *body, const char *key, float dflt) {
+    const char *p = body;
+    json_skip_ws(&p);
+    if (*p != '{') return dflt;
+    p++;
+    while (1) {
+        json_skip_ws(&p);
+        if (*p == '}' || *p == '\0') return dflt;
+        if (*p != '"') return dflt;
+        char *k = NULL;
+        if (json_parse_string(&p, &k) < 0) return dflt;
+        json_skip_ws(&p);
+        int match = k && strcmp(k, key) == 0;
+        free(k);
+        if (*p != ':') return dflt;
+        p++;
+        json_skip_ws(&p);
+        if (match) {
+            char *end = NULL;
+            float v = strtof(p, &end);
+            if (end != p) return v;
+            return dflt;
+        }
+        int depth = 0;
+        if (*p == '{' || *p == '[') { depth = 1; p++; }
+        else if (*p == '"') { char *tmp; if (json_parse_string(&p, &tmp) < 0) return dflt; free(tmp); }
+        else {
+            while (*p && *p != ',' && *p != '}') p++;
+        }
+        while (depth) {
+            if (*p == '{' || *p == '[') depth++;
+            else if (*p == '}' || *p == ']') depth--;
+            p++;
+        }
+        json_skip_ws(&p);
+        if (*p == ',') { p++; continue; }
+        if (*p == '}') return dflt;
+    }
+}
+
+/* Find a top-level boolean field. Returns dflt if missing. */
+static int json_top_bool(const char *body, const char *key, int dflt) {
+    const char *p = body;
+    json_skip_ws(&p);
+    if (*p != '{') return dflt;
+    p++;
+    while (1) {
+        json_skip_ws(&p);
+        if (*p == '}' || *p == '\0') return dflt;
+        if (*p != '"') return dflt;
+        char *k = NULL;
+        if (json_parse_string(&p, &k) < 0) return dflt;
+        json_skip_ws(&p);
+        int match = k && strcmp(k, key) == 0;
+        free(k);
+        if (*p != ':') return dflt;
+        p++;
+        json_skip_ws(&p);
+        if (match) {
+            if (strncmp(p, "true", 4) == 0) return 1;
+            if (strncmp(p, "false", 5) == 0) return 0;
+            return dflt;
+        }
+        int depth = 0;
+        if (*p == '{' || *p == '[') { depth = 1; p++; }
+        else if (*p == '"') { char *tmp; if (json_parse_string(&p, &tmp) < 0) return dflt; free(tmp); }
         else {
             while (*p && *p != ',' && *p != '}') p++;
         }
@@ -493,6 +577,35 @@ static void sb_json_string(SB *s, const char *t) {
     sb_putc(s, '"');
 }
 
+static void sb_json_string_len(SB *s, const char *t, size_t len) {
+    sb_putc(s, '"');
+    if (t) {
+        for (size_t i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)t[i];
+            switch (c) {
+                case '"':  sb_puts(s, "\\\""); break;
+                case '\\': sb_puts(s, "\\\\"); break;
+                case '\n': sb_puts(s, "\\n"); break;
+                case '\r': sb_puts(s, "\\r"); break;
+                case '\t': sb_puts(s, "\\t"); break;
+                case '\b': sb_puts(s, "\\b"); break;
+                case '\f': sb_puts(s, "\\f"); break;
+                default:
+                    if (c < 0x20) {
+                        char esc[8]; snprintf(esc, sizeof(esc), "\\u%04x", c);
+                        sb_puts(s, esc);
+                    } else if (c >= 0x80) {
+                        char esc[8]; snprintf(esc, sizeof(esc), "\\u00%02x", c);
+                        sb_puts(s, esc);
+                    } else {
+                        sb_putc(s, (char)c);
+                    }
+            }
+        }
+    }
+    sb_putc(s, '"');
+}
+
 /* --------------------------- stop strings ----------------------------- */
 
 #define MAX_STOP_STRINGS 16
@@ -532,7 +645,9 @@ typedef struct {
 } GenResult;
 
 /* Run one chat completion. MUST be called with g_srv.mu held. */
-static int run_chat(tt_msg *msgs, int n_msgs, int max_tokens, GenResult *out) {
+static int run_chat(tt_msg *msgs, int n_msgs, int max_tokens,
+                    float temp, float top_p, float rep_pen,
+                    int stream_fd, GenResult *out) {
     memset(out, 0, sizeof(*out));
     out->text[0] = '\0';
     if (n_msgs <= 0) { out->finish_reason = 4; return -1; }
@@ -570,16 +685,19 @@ static int run_chat(tt_msg *msgs, int n_msgs, int max_tokens, GenResult *out) {
         out->finish_reason = 4; return -1;
     }
 
-    /* seed the sampler (greedy by default; env knobs mirror chat_llm_gpu) */
+    /* seed the sampler */
     tt_sampler_chain sc;
     tt_sampler_chain_init(&sc);
-    const int greedy = getenv(ENV_GREEDY) && getenv(ENV_GREEDY)[0] != '\0';
+    const int greedy = (temp <= 0.0f) || (getenv(ENV_GREEDY) && getenv(ENV_GREEDY)[0] != '\0');
     sc.greedy = greedy;
-    sc.temp   = env_float(ENV_TEMP, 0.8f);
-    sc.repeat_penalty = 1.15f;
+    sc.temp   = temp > 0.0f ? temp : env_float(ENV_TEMP, 0.8f);
+    sc.repeat_penalty = rep_pen > 0.0f ? rep_pen : 1.15f;
     sc.use_rep_penalty = 1;
     sc.penalty_last_n = 64;
     sc.freq_last_n = 64;
+    if (top_p > 0.0f && top_p < 1.0f) {
+        sc.top_p = top_p;
+    }
     int32_t hist[256];
     int n_hist = 0;
     /* seed history with the prompt tail */
@@ -587,6 +705,14 @@ static int run_chat(tt_msg *msgs, int n_msgs, int max_tokens, GenResult *out) {
     for (int i = start; i < n_prompt && n_hist < 256; i++) hist[n_hist++] = prompt_toks[i];
     sc.history = hist; sc.n_history = n_hist;
 
+    if (stream_fd >= 0) {
+        writef(stream_fd, "HTTP/1.1 200 OK\r\n"
+                          "Content-Type: text/event-stream\r\n"
+                          "Cache-Control: no-cache\r\n"
+                          "Access-Control-Allow-Origin: *\r\n"
+                          "Connection: close\r\n"
+                          "Server: %s\r\n\r\n", SERVER_NAME);
+    }
     /* logits buffer for host-side sampling (graph path only) */
     float *logits = (float *)malloc(sizeof(float) * (size_t)g_srv.vocab);
     float *wb     = (float *)malloc(sizeof(float) * (size_t)tt_sampler_workbuf_size(g_srv.vocab));
@@ -628,6 +754,18 @@ static int run_chat(tt_msg *msgs, int n_msgs, int max_tokens, GenResult *out) {
             memcpy(out->text + out->text_len, s, (size_t)olen);
             out->text_len += (size_t)olen;
             out->text[out->text_len] = '\0';
+            if (stream_fd >= 0) {
+                SB chunk; sb_init(&chunk);
+                sb_puts(&chunk, "data: {\"id\":\"chatcmpl-tt-1\",\"object\":\"chat.completion.chunk\",\"created\":");
+                sb_putd(&chunk, (long)time(NULL));
+                sb_puts(&chunk, ",\"model\":");
+                sb_json_string(&chunk, g_srv.model->architecture[0] ? g_srv.model->architecture : "model");
+                sb_puts(&chunk, ",\"choices\":[{\"index\":0,\"delta\":{\"content\":");
+                sb_json_string_len(&chunk, s, (size_t)olen);
+                sb_puts(&chunk, "},\"finish_reason\":null}]}\n\n");
+                write_all(stream_fd, chunk.p, chunk.len);
+                free(chunk.p);
+            }
         }
         /* stop-string scan on the WHOLE accumulated text so markers that
          * span token boundaries are caught (mirrors chat_llm_gpu). */
@@ -666,6 +804,20 @@ static int run_chat(tt_msg *msgs, int n_msgs, int max_tokens, GenResult *out) {
         if (gen >= max_tokens) out->finish_reason = 1;
     }
 
+    if (stream_fd >= 0) {
+        const char *fin = (out->finish_reason == 0 || out->finish_reason == 2) ? "stop" :
+                          (out->finish_reason == 1 || out->finish_reason == 3) ? "length" : "error";
+        SB chunk; sb_init(&chunk);
+        sb_puts(&chunk, "data: {\"id\":\"chatcmpl-tt-1\",\"object\":\"chat.completion.chunk\",\"created\":");
+        sb_putd(&chunk, (long)time(NULL));
+        sb_puts(&chunk, ",\"model\":");
+        sb_json_string(&chunk, g_srv.model->architecture[0] ? g_srv.model->architecture : "model");
+        sb_puts(&chunk, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
+        sb_json_string(&chunk, fin);
+        sb_puts(&chunk, "}]}\n\ndata: [DONE]\n\n");
+        write_all(stream_fd, chunk.p, chunk.len);
+        free(chunk.p);
+    }
     cudaDeviceSynchronize();
     out->latency_sec = now_sec() - t0;
 
@@ -737,15 +889,20 @@ static void respond_chat(int fd, const char *body) {
     char *model_id = json_top_string(body, "model");    /* advisory */
     free(model_id);
 
+    int stream = json_top_bool(body, "stream", 0);
+    float temp = json_top_float(body, "temperature", env_float(ENV_TEMP, 0.8f));
+    float top_p = json_top_float(body, "top_p", 1.0f);
+    float rep_pen = json_top_float(body, "repetition_penalty", 1.15f);
+
     GenResult r;
     double t_lock = now_sec();
     pthread_mutex_lock(&g_srv.mu);
     double t_locked = now_sec();
-    int rc = run_chat(msgs, n_msgs, max_tokens, &r);
+    int rc = run_chat(msgs, n_msgs, max_tokens, temp, top_p, rep_pen, stream ? fd : -1, &r);
     pthread_mutex_unlock(&g_srv.mu);
     double t_done = now_sec();
-    log_info("req: msgs=%d max_tokens=%d gen=%d finish=%d lock_wait=%.1fms engine=%.1fms total=%.1fms",
-             n_msgs, max_tokens, r.n_generated, r.finish_reason,
+    log_info("req: msgs=%d stream=%d max_tokens=%d gen=%d finish=%d lock_wait=%.1fms engine=%.1fms total=%.1fms",
+             n_msgs, stream, max_tokens, r.n_generated, r.finish_reason,
              (t_locked - t_lock) * 1000.0,
              r.latency_sec * 1000.0,
              (t_done - t_lock) * 1000.0);
@@ -756,9 +913,10 @@ static void respond_chat(int fd, const char *body) {
     if (rc < 0) {
         char msg[128];
         snprintf(msg, sizeof(msg), "generation failed (finish=%d)", r.finish_reason);
-        respond_500(fd, msg);
+        if (!stream) respond_500(fd, msg);
         return;
     }
+    if (stream) return;
 
     /* response body */
     SB s; sb_init(&s);

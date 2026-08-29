@@ -232,3 +232,38 @@ def test_chat_max_tokens_truncates(server: str) -> None:
         # With a 4-token budget, 0-4 generated tokens is the expected band.
         usage = body.get("usage", {})
         assert usage.get("completion_tokens", 99) <= 4, body
+
+def test_chat_streaming_sse(server: str) -> None:
+    """SSE streaming mode (stream=True); tokens yield line by line."""
+    payload = {
+        "model": "qwen2.5-0.5b-instruct-q4_0",
+        "messages": [{"role": "user", "content": "Count from 1 to 5: 1, 2, "}],
+        "max_tokens": 16,
+        "stream": True,
+    }
+    r = requests.post(
+        server + "/v1/chat/completions",
+        data=json.dumps(payload),
+        headers={"Content-Type": "application/json"},
+        stream=True,
+        timeout=30.0,
+    )
+    assert r.status_code == 200
+    assert "text/event-stream" in r.headers.get("Content-Type", "")
+    chunks = []
+    for line in r.iter_lines():
+        if not line:
+            continue
+        line_str = line.decode("utf-8")
+        if line_str.startswith("data: "):
+            data_str = line_str[6:]
+            if data_str == "[DONE]":
+                break
+            chunk = json.loads(data_str)
+            assert chunk["object"] == "chat.completion.chunk"
+            delta = chunk["choices"][0]["delta"]
+            if "content" in delta and delta["content"]:
+                chunks.append(delta["content"])
+    assert len(chunks) > 0, "no streaming chunks received"
+    full_text = "".join(chunks)
+    assert len(full_text) > 0, f"empty streamed text: {full_text}"
