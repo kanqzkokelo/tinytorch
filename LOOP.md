@@ -35,6 +35,11 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
    - [x] Multi-turn session management in `server_minimal`
    - [x] Comprehensive multi-model verification across all gates
 
+9. **[Phase 9] Hybrid CPU-GPU Layer Offloading**:
+   - [ ] Implement $N_{\text{gpu}} / N_{\text{cpu}}$ layer partitioner in `qwen2_engine_create`
+   - [ ] Wire AVX2 CPU layer execution (`src/cpu_backend.c`) for tail layers $N_{\text{gpu}} \dots N_{\text{layers}}-1$
+   - [ ] Asynchronous PCIe DMA transfer (`cudaMemcpyAsync`) across GPU-CPU layer boundary
+   - [ ] Verify $8\text{B} / 14\text{B}$ GGUF model execution on 4GB GPU + System RAM
 ---
 
 ## Cycle Log
