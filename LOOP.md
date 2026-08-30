@@ -53,10 +53,10 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 13. **[Phase 13] Q2_K 2-Bit Quantization (Frontier Goal 5)**:
     - [x] Implemented `BlockQ2_K` (84B, 2.625 bits/weight) CPU golden dequantization (`src/dequant_ref.c`), AVX2 backend (`src/cpu_backend.c`), and CUDA GEMV `k_gemv_q2_K_v2`
     - [x] Reviewed by Minimax subagent (`q2k_reviewer` - APPROVED with 92% confidence)
-    - [x] Validated CUDA GEMV speedup ($0.026\text{ ms}$ per hidden matrix, $2.5\times$ faster than $Q4\_0$)
+    - [x] Validated CUDA GEMV speedup honest DRAM median $0.137\text{ ms}$ @8192x4096, $80\text{ GB/s}$ (was $0.026$ L2-hot 1.17MB, $2.5\times$ inflated)
 14. **[Phase 14] Paged FlashAttention-3 & Zero-Copy POSIX IPC (Frontier Goals 6 & 7)**:
     - [x] Implemented Paged FlashAttention-2/3 (`tools/micro_paged_fa2.cu`) with 64-token physical blocks scaling to **131,072 context tokens** in $18.87\text{ MB}$ pool
-    - [x] Implemented Lock-Free POSIX Shared Memory IPC (`src/tinytorch_ipc.c`) achieving **$1.96\text{ Million req/s}$** throughput with **$0.50\ \mu\text{s}$** round-trip latency
+    - [x] Implemented Lock-Free POSIX Shared Memory IPC (`src/tinytorch_ipc.c`) achieving **$1.58\text{ Million req/s}$ cross-core honest** (p50 $0.45\ \mu\text{s}$, p95 $0.48\ \mu\text{s}$, 1.75M tiny-0B, per-iter 500, 5-run median) — was $1.96\text{M}$ same-core inflated
 
 ---
 
