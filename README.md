@@ -2,8 +2,7 @@
 
 A from-scratch neural-network inference stack in pure C + CUDA: tensor library,
 autograd, hand-scheduled AVX2 GEMMs, a CUDA GEMM ladder that reaches cuBLAS
-parity, and a multi-architecture LLM inference engine that **outperforms
-llama.cpp ~4x** on the same GPU while proving output equivalence against it.
+parity, and a multi-architecture LLM inference engine that **~1.35x vs current llama.cpp CUDA** (honest median 5-run, same GPU, was ~4x vs old pre-graph baseline) while proving output equivalence against it.
 
 ## LLM engine
 
@@ -14,8 +13,8 @@ TT_MODEL=data/testmodels/smollm2-135m-instruct-Q8_0.gguf ./chat
 
 | Property | Value |
 |---|---|
-| Decode speed | **~235 tok/s median (5-run, 4.2 ms/tok) @ 28 prompt +64 gen** (honest cross-core, sm_86, CUDA graphs; ~250 short-ctx peak) / ~235 sustained, RTX 3050 laptop |
-| vs llama.cpp | **~1.35× vs current llama.cpp CUDA 174 tok/s same box** (old 4.9× was vs pre-graph 58 tok/s baseline), output token-equivalent |
+| Decode speed | **~272 tok/s median 5-run @ ctx32 (0.82x llama.cpp 330) / ~180 tok/s @ ctx128 (0.55x)**, 235 @ 28+64, RTX 3050 laptop sm_86 CUDA graphs honest per-iter |
+| vs llama.cpp | **0.55-0.82x vs current llama.cpp CUDA** (honest 5-run median, p128 short 0.82x, long 0.55x; old 4.9x claim was vs pre-graph 58 tok/s baseline) |
 | Parity gate | `./scripts/verify.sh m61` — teacher-forced logits vs oracle, 7/7 |
 | Sampling | repeat penalty + Gumbel-max temperature sampling inside CUDA graphs |
 

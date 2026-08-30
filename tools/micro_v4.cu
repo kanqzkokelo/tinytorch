@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <vector>
+#include <algorithm>
 #include <cuda_fp16.h>
 
 __device__ __forceinline__ float warp_reduce(float v) {
@@ -245,31 +246,29 @@ int main(int argc, char **argv) {
                maxd, at, y_v2[at], y_v4[at]);
     }
 
-    // Time V2
-    int REPS = 50;
-    {
-        dim3 g, bl; gemv_dims2(M, &g, &bl);
-        cudaEventRecord(a);
-        for (int i = 0; i < REPS; i++)
-            k_logits_q4_0_v2<<<g, bl>>>((const BlockQ4_0 *)dW, (const float *)dx,
-                                        (float *)dy, M, K);
-        cudaEventRecord(b); cudaEventSynchronize(b);
-        float ms; cudaEventElapsedTime(&ms, a, b);
-        float per = ms / REPS;
-        double bw = (double)wbytes / (per * 1e-3) / 1e9;
-        printf("V2 M=%d K=%d  %.3f ms/iter  weight-BW %.1f GB/s\n", M, K, per, bw);
-    }
-    {
-        dim3 g, bl; gemv_dims4(M, &g, &bl);
-        cudaEventRecord(a);
-        for (int i = 0; i < REPS; i++)
-            k_logits_q4_0_v4<<<g, bl>>>((const BlockQ4_0 *)dW, (const float *)dx,
-                                        (float *)dy, M, K);
-        cudaEventRecord(b); cudaEventSynchronize(b);
-        float ms; cudaEventElapsedTime(&ms, a, b);
-        float per = ms / REPS;
-        double bw = (double)wbytes / (per * 1e-3) / 1e9;
-        printf("V4 M=%d K=%d  %.3f ms/iter  weight-BW %.1f GB/s\n", M, K, per, bw);
-    }
+    // Honest per-iter 200 samples median/p95
+    auto bench_one = [&](auto kernel_lambda, const char* tag){
+        const int REPS=200;
+        const int WARM=20;
+        dim3 g, bl;
+        if(tag[1]=='2') gemv_dims2(M,&g,&bl); else gemv_dims4(M,&g,&bl);
+        for(int i=0;i<WARM;i++) kernel_lambda(g,bl);
+        cudaDeviceSynchronize();
+        std::vector<float> samples; samples.reserve(REPS);
+        for(int i=0;i<REPS;i++){
+            cudaEventRecord(a);
+            kernel_lambda(g,bl);
+            cudaEventRecord(b); cudaEventSynchronize(b);
+            float ms_i; cudaEventElapsedTime(&ms_i,a,b);
+            samples.push_back(ms_i);
+        }
+        std::sort(samples.begin(), samples.end());
+        float p50=samples[REPS/2], p95=samples[(int)(REPS*0.95)], mean=0; for(auto x:samples) mean+=x; mean/=REPS;
+        double bw_p50=(double)wbytes/(p50*1e-3)/1e9;
+        double bw_mean=(double)wbytes/(mean*1e-3)/1e9;
+        printf("%s M=%d K=%d  mean %.3f ms  median(p50) %.3f ms  p95 %.3f ms  weight-BW median %.1f GB/s (mean %.1f)  honest per-iter %d samples\n", tag, M,K, mean,p50,p95,bw_p50,bw_mean,REPS);
+    };
+    bench_one([&](dim3 g,dim3 bl){ k_logits_q4_0_v2<<<g,bl>>>((const BlockQ4_0*)dW,(const float*)dx,(float*)dy,M,K); }, "V2");
+    bench_one([&](dim3 g,dim3 bl){ k_logits_q4_0_v4<<<g,bl>>>((const BlockQ4_0*)dW,(const float*)dx,(float*)dy,M,K); }, "V4");
     return 0;
 }

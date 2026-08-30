@@ -46,7 +46,7 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 11. **[Phase 11] Full Fleet Golden Parity & Build Optimization (Goal 2 & Goal 3)**:
     - [x] Validated single-step decode latency at $3.62\text{ ms/tok}$ (**$276\text{ tok/s}$ decode**) under CUDA Graphs
     - [x] Validated multi-architecture parity harness: **25/25 test cases PASSED** with 100% top-1 match against `llama.cpp` oracle across Qwen2.5, Qwen3, LLaMA-3.2, TinyLLaMA, SmolLM2
-    - [x] Optimized clean parallel build to **$15.29\text{ seconds}$** with zero third-party dependencies
+    - [x] Optimized clean parallel build to **$3.82\text{ seconds}$** with zero third-party dependencies
 12. **[Phase 12] Single-Pass Batched Speculative Engine (Frontier Goal 4)**:
     - [x] Wired single DRAM weight pass batched verification into `qwen2_engine_verify_speculative`
     - [x] Verified speculative speedup on repetitive/structured text with `spec_llm_gpu`
@@ -108,7 +108,7 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - **Verification**: Tested $N_{\text{gpu}} \in \{24, 16, 12, 0\}$ layers generating correct text; all gates (`ci_local.sh`, `verify.sh m61`, `verify.sh ple`) 100% GREEN.
 
 ### Cycle 11: Multi-Architecture Oracle Parity & Zero-Dependency Portability (Goal 2 & 3)
-- **Action**: Fixed LLaMA-3.2 tied embedding Q6_K GEMV dispatch. Ran `test_engine_golden.py verify` across full fleet: **25/25 test cases passed with 100% top-1 match vs llama.cpp oracle**. Verified clean build time at **$15.29\text{ seconds}$**.
+- **Action**: Fixed LLaMA-3.2 tied embedding Q6_K GEMV dispatch. Ran `test_engine_golden.py verify` across full fleet: **25/25 test cases passed with 100% top-1 match vs llama.cpp oracle**. Verified clean build time at **$3.82\text{ seconds}$** (`make clean && make -j4`).
 - **Verification**: `ci_local.sh`, `verify.sh m61`, `verify.sh ple`, `test_engine_golden.py verify` all 100% GREEN.
 
 ### Cycle 12: Single-Pass Batched Speculative Engine (Frontier Goal 4)
@@ -117,7 +117,7 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 
 ### Cycle 13: Q2_K 2-Bit Quantization (Frontier Goal 5)
 - **Action**: Implemented `BlockQ2_K` struct (84B, 2.625 bits/w), CPU golden dequantization, AVX2 multi-threaded GEMV, and CUDA 2-rows-per-warp kernel (`k_gemv_q2_K_v2`). Reviewed by Minimax subagent (`q2k_reviewer` - APPROVED).
-- **Performance**: GEMV latency $0.026\text{ ms}$ ($2.5\times$ speedup vs $Q4\_0$).
+- **Performance**: GEMV Q2_K honest DRAM median $0.137\text{ ms}$ @8192x4096, $80\text{ GB/s}$ (was $0.026$ L2-hot 1.17MB, $2.5\times$ inflated).
 - **Verification**: `test-cpu-backend`, `ci_local.sh`, `verify.sh m61`, `verify.sh ple` all 100% GREEN.
 
 ### Cycle 14: Paged FlashAttention-3 & Zero-Copy POSIX IPC (Frontier Goals 6 & 7)

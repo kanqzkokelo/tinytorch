@@ -1,3 +1,5 @@
+> **Honesty note (2026-08-29):** Numbers below are pre-honest (single-sample/batch-mean, L2-hot possible, -arch=native). See `data/profile/AUDIT_HONEST_2026-08-29.md` for honest per-iter median, cross-core, sm_86 pinned measurements.
+
 # Batched Prefill GEMM — Findings & Deferred Items
 
 **Date:** 2026-08-28
