@@ -195,19 +195,20 @@ int main(int argc, char **argv) {
     if ((nb & 1) != 0) { fprintf(stderr, "nb must be even\n"); return 1; }
     if (M & 3) { M = (M + 3) & ~3; fprintf(stderr, "[warn] M padded to %d\n", M); }
 
-    size_t wbytes = (size_t)M * nb * 18;
+    size_t wbytes_alloc = (size_t)M * nb * 18;
+    size_t wbytes = wbytes_alloc; // honest weight bytes: M*nb*18 = M*K*0.5625 for q4_0 (not M*K*2)
     size_t xbytes = (size_t)K * 4;
     size_t ybytes = (size_t)M * 4;
 
-    void *hW = malloc(wbytes);
+    void *hW = malloc(wbytes_alloc);
     void *hx = malloc(xbytes);
     float *hy = (float *)malloc(ybytes);
-    memset(hW, 0xab, wbytes);
+    memset(hW, 0xab, wbytes_alloc);
     for (int i = 0; i < K; i++) ((float *)hx)[i] = sinf(0.7f * i + 0.3f);
     memset(hy, 0, ybytes);
 
     void *dW, *dx, *dy;
-    cudaMalloc(&dW, wbytes); cudaMemcpy(dW, hW, wbytes, cudaMemcpyHostToDevice);
+    cudaMalloc(&dW, wbytes_alloc); cudaMemcpy(dW, hW, wbytes_alloc, cudaMemcpyHostToDevice);
     cudaMalloc(&dx, xbytes); cudaMemcpy(dx, hx, xbytes, cudaMemcpyHostToDevice);
     cudaMalloc(&dy, ybytes);
 
