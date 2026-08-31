@@ -53,6 +53,8 @@ int tt_swiglu_q4_0(const void *dGate, const void *dUp, const float *dx,
                    float *dh, int M, int K, cudaStream_t stream);
 int tt_logits_q4_0(const void *dW, const float *dx, float *dlogits,
                    int vocab, int K, cudaStream_t stream);
+int tt_logits_q4_0_batch4(const void *dW, const float *dX_4xK, float *dL_4xVocab,
+                          int vocab, int K, cudaStream_t stream);
 /* M7 task 2: typed dispatch (kernels/gemv_typed.cu) */
 int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
                   int M, int K, cudaStream_t stream);
@@ -1673,6 +1675,23 @@ struct Qwen2Engine {
     float *d_split_pm;            /* [S_MAX * max_heads] */
     float *d_split_pl;            /* [S_MAX * max_heads] */
     int    d_split_S_max;         /* S at workspace alloc time (capacity) */
+    /* M10+ batched speculative verify (TT_SPEC_BATCH): persistent device buffers */
+    float *d_x_batch;             /* [d_x_batch_cap * dim] */
+    float *d_xn_batch;            /* [d_x_batch_cap * dim] */
+    float *d_logits_batch;        /* [d_logits_batch_cap * vocab] */
+    int    d_x_batch_cap;         /* capacity in tokens (0 = unallocated) */
+    int    d_logits_batch_cap;    /* capacity in vocab rows (0 = unallocated) */
+    /* Batch workspace for prefill_batched_gemm_dx (allocated for max spec batch) */
+    float *d_Xn_batch;
+    float *d_q_batch;
+    float *d_k_batch;
+    float *d_v_batch;
+    float *d_att_batch;
+    float *d_h_batch;
+    float *d_g_batch;
+    float *d_u_batch;
+    int   *d_pos_batch_ws;
+    int    d_batch_ws_cap;
     /* gemma4 MatFormer per-layer embeddings */
     TTensor pl_model_proj;        /* [n_layers*256, dim] typed */
     float *pl_proj_norm_host;     /* [256] host gamma */
@@ -2130,6 +2149,22 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         e->h_h_buf = e->h_g_buf = e->h_u_buf = e->h_out_buf = NULL;
         e->h_k_stage = e->h_v_stage = e->h_kc = e->h_vc = NULL;
     }
+    /* M10+ batched speculative buffers: lazy-allocated on first verify */
+    e->d_x_batch = NULL;
+    e->d_xn_batch = NULL;
+    e->d_logits_batch = NULL;
+    e->d_x_batch_cap = 0;
+    e->d_logits_batch_cap = 0;
+    e->d_Xn_batch = NULL;
+    e->d_q_batch = NULL;
+    e->d_k_batch = NULL;
+    e->d_v_batch = NULL;
+    e->d_att_batch = NULL;
+    e->d_h_batch = NULL;
+    e->d_g_batch = NULL;
+    e->d_u_batch = NULL;
+    e->d_pos_batch_ws = NULL;
+    e->d_batch_ws_cap = 0;
     return e;
 }
 
@@ -2151,6 +2186,18 @@ void qwen2_engine_free(Qwen2Engine *e) {
     if (e->d_split_pacc) cudaFree(e->d_split_pacc);
     if (e->d_split_pm)   cudaFree(e->d_split_pm);
     if (e->d_split_pl)   cudaFree(e->d_split_pl);
+    if (e->d_x_batch) cudaFree(e->d_x_batch);
+    if (e->d_xn_batch) cudaFree(e->d_xn_batch);
+    if (e->d_logits_batch) cudaFree(e->d_logits_batch);
+    if (e->d_Xn_batch) cudaFree(e->d_Xn_batch);
+    if (e->d_q_batch) cudaFree(e->d_q_batch);
+    if (e->d_k_batch) cudaFree(e->d_k_batch);
+    if (e->d_v_batch) cudaFree(e->d_v_batch);
+    if (e->d_att_batch) cudaFree(e->d_att_batch);
+    if (e->d_h_batch) cudaFree(e->d_h_batch);
+    if (e->d_g_batch) cudaFree(e->d_g_batch);
+    if (e->d_u_batch) cudaFree(e->d_u_batch);
+    if (e->d_pos_batch_ws) cudaFree(e->d_pos_batch_ws);
     if (e->d_recent) cudaFree(e->d_recent);
     if (e->d_n_recent) cudaFree(e->d_n_recent);
     if (e->h_sampled) cudaFreeHost(e->h_sampled);
@@ -3394,6 +3441,131 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
     return 0;
 }
 
+/* M10+ Batched prefill that writes to device buffer d_x_out (no host bounce).
+ * Uses engine-persistent workspace to avoid per-call cudaMalloc overhead. */
+int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_out) {
+    if (!e || !toks || n <= 0 || !d_x_out) return -1;
+    const TTConfig *c = &e->cfg;
+    if (e->pos + n > c->max_ctx) return -2;
+    int (*prefill_gemm_fn)(const void *, const float *, float *, int, int, int, cudaStream_t) = tt_gemm_q4_0_prefill;
+    const int dim = c->dim;
+    const int hidden_dim = c->hidden_dim;
+    const int HD = c->head_dim;
+    long cache_layer = c->n_kv_heads * (long)c->max_ctx * HD;
+    long cache_layer_q8 = c->n_kv_heads * (long)c->max_ctx * (HD / 32);
+    if (e->pl_hd[0] > 0) {
+        long mx = 0; long mx_q8 = 0;
+        for (int l = 0; l < c->n_layers; l++) {
+            const long w2 = (long)e->pl_kv[l] * e->pl_hd[l];
+            if (w2 > mx) mx = w2;
+            const long w2_q8 = (long)e->pl_kv[l] * (e->pl_hd[l] / 32);
+            if (w2_q8 > mx_q8) mx_q8 = w2_q8;
+        }
+        cache_layer = mx * c->max_ctx;
+        cache_layer_q8 = mx_q8 * c->max_ctx;
+    }
+    float *d_X = d_x_out;
+    int max_qout = c->n_heads * HD;
+    int max_kvdim = c->n_kv_heads * HD;
+    for (int l = 0; l < c->n_layers; l++) {
+        int H_l = e->pl_heads[l] > 0 ? e->pl_heads[l] : c->n_heads;
+        int KV_l = e->pl_kv[l] > 0 ? e->pl_kv[l] : c->n_kv_heads;
+        int HDl = e->pl_hd[l] > 0 ? e->pl_hd[l] : HD;
+        if (H_l * HDl > max_qout) max_qout = H_l * HDl;
+        if (KV_l * HDl > max_kvdim) max_kvdim = KV_l * HDl;
+    }
+    if (!e->d_Xn_batch || e->d_batch_ws_cap < n) {
+        if (e->d_Xn_batch) cudaFree(e->d_Xn_batch);
+        if (e->d_q_batch) cudaFree(e->d_q_batch);
+        if (e->d_k_batch) cudaFree(e->d_k_batch);
+        if (e->d_v_batch) cudaFree(e->d_v_batch);
+        if (e->d_att_batch) cudaFree(e->d_att_batch);
+        if (e->d_h_batch) cudaFree(e->d_h_batch);
+        if (e->d_g_batch) cudaFree(e->d_g_batch);
+        if (e->d_u_batch) cudaFree(e->d_u_batch);
+        if (e->d_pos_batch_ws) cudaFree(e->d_pos_batch_ws);
+        size_t need_xn = (size_t)n * dim * sizeof(float);
+        size_t need_q = (size_t)n * max_qout * sizeof(float);
+        size_t need_kv = (size_t)n * max_kvdim * sizeof(float);
+        size_t need_h = (size_t)n * hidden_dim * sizeof(float);
+        if (cudaMalloc(&e->d_Xn_batch, need_xn) != cudaSuccess) return -4;
+        if (cudaMalloc(&e->d_q_batch, need_q) != cudaSuccess) return -5;
+        if (cudaMalloc(&e->d_k_batch, need_kv) != cudaSuccess) return -6;
+        if (cudaMalloc(&e->d_v_batch, need_kv) != cudaSuccess) return -7;
+        if (cudaMalloc(&e->d_att_batch, need_q) != cudaSuccess) return -8;
+        if (cudaMalloc(&e->d_h_batch, need_h) != cudaSuccess) return -9;
+        if (cudaMalloc(&e->d_g_batch, need_h) != cudaSuccess) return -10;
+        if (cudaMalloc(&e->d_u_batch, need_h) != cudaSuccess) return -11;
+        if (cudaMalloc(&e->d_pos_batch_ws, (size_t)n * sizeof(int)) != cudaSuccess) return -12;
+        e->d_batch_ws_cap = n;
+    }
+    float *d_Xn = e->d_Xn_batch;
+    float *d_Q = e->d_q_batch;
+    float *d_K = e->d_k_batch;
+    float *d_V = e->d_v_batch;
+    float *d_Att = e->d_att_batch;
+    float *d_H = e->d_h_batch;
+    float *d_G = e->d_g_batch;
+    float *d_U = e->d_u_batch;
+    int *d_pos_batch = e->d_pos_batch_ws;
+    {
+        int h_pos_batch[16];
+        const int pos0 = e->pos;
+        for (int i = 0; i < n; i++) h_pos_batch[i] = pos0 + i;
+        cudaMemcpy(d_pos_batch, h_pos_batch, (size_t)n * sizeof(int), cudaMemcpyHostToDevice);
+    }
+    for (int i = 0; i < n; i++) {
+        tt_embed_typed(e->d_embd.ptr, e->d_embd.dtype, toks[i], d_X + (long)i * dim, dim, e->stream);
+        if (c->tr.embed_sqrt) k_scale<<<(dim + 255) / 256, 256, 0, e->stream>>>(d_X + (long)i * dim, sqrtf((float)dim), dim);
+    }
+    for (int l = 0; l < c->n_layers; l++) {
+        LayerW *w = &e->L[l];
+        float *Kl_f = e->d_kc + (long)l * cache_layer;
+        float *Vl_f = e->d_vc + (long)l * cache_layer;
+        BlockQ8_0 *Kl_q8 = e->d_kc_q8 ? (e->d_kc_q8 + (long)l * cache_layer_q8) : NULL;
+        BlockQ8_0 *Vl_q8 = e->d_vc_q8 ? (e->d_vc_q8 + (long)l * cache_layer_q8) : NULL;
+        const int kv_shared = e->has_pl_embd && e->pl_src[l] >= 0;
+        if (kv_shared) { Kl_f = e->d_kc + (long)e->pl_src[l] * cache_layer; Vl_f = e->d_vc + (long)e->pl_src[l] * cache_layer; if (e->d_kc_q8) { Kl_q8 = e->d_kc_q8 + (long)e->pl_src[l] * cache_layer_q8; Vl_q8 = e->d_vc_q8 + (long)e->pl_src[l] * cache_layer_q8; } }
+        const int H_l = e->pl_heads[l] > 0 ? e->pl_heads[l] : c->n_heads;
+        const int KV_l = e->pl_kv[l] > 0 ? e->pl_kv[l] : c->n_kv_heads;
+        const int FF_l = e->pl_ffn[l] > 0 ? e->pl_ffn[l] : hidden_dim;
+        const int HDl = e->pl_hd[l] > 0 ? e->pl_hd[l] : HD;
+        const int attn_qout = H_l * HDl;
+        const int kvdim_l = KV_l * HDl;
+        for (int i = 0; i < n; i++) k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(d_X + (long)i * dim, w->attn_norm, d_Xn + (long)i * dim, dim, c->rms_eps, c->tr.norm_offset);
+        if (w->q.dtype == TTQ_Q4_0) { prefill_gemm_fn(w->q.ptr, d_Xn, d_Q, attn_qout, dim, n, e->stream); if (!kv_shared) { prefill_gemm_fn(w->k.ptr, d_Xn, d_K, kvdim_l, dim, n, e->stream); prefill_gemm_fn(w->v.ptr, d_Xn, d_V, kvdim_l, dim, n, e->stream); } } else { for (int i = 0; i < n; i++) { tt_gemv_typed(w->q.ptr, w->q.dtype, d_Xn + (long)i * dim, d_Q + (long)i * attn_qout, attn_qout, dim, e->stream); if (!kv_shared) { tt_gemv_typed(w->k.ptr, w->k.dtype, d_Xn + (long)i * dim, d_K + (long)i * kvdim_l, kvdim_l, dim, e->stream); tt_gemv_typed(w->v.ptr, w->v.dtype, d_Xn + (long)i * dim, d_V + (long)i * kvdim_l, kvdim_l, dim, e->stream); } } }
+        if (w->q_bias) for (int i = 0; i < n; i++) k_add<<<(attn_qout + 255) / 256, 256, 0, e->stream>>>(d_Q + (long)i * attn_qout, w->q_bias, attn_qout);
+        if (!kv_shared && w->k_bias) for (int i = 0; i < n; i++) k_add<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(d_K + (long)i * kvdim_l, w->k_bias, kvdim_l);
+        if (!kv_shared && w->v_bias) for (int i = 0; i < n; i++) k_add<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(d_V + (long)i * kvdim_l, w->v_bias, kvdim_l);
+        if (c->tr.qk_norm_rms) { const int qkthreads = HDl < 256 ? HDl : 256; for (int i = 0; i < n; i++) { k_qk_norm_rms<<<H_l, qkthreads, qkthreads * sizeof(float), e->stream>>>(d_Q + (long)i * attn_qout, w->q_norm, H_l, HDl, c->tr.qk_norm_eps); if (!kv_shared) k_qk_norm_rms<<<KV_l, qkthreads, qkthreads * sizeof(float), e->stream>>>(d_K + (long)i * kvdim_l, w->k_norm, KV_l, HDl, c->tr.qk_norm_eps); } }
+        const int is_full_l = (e->pl_swa[l] == 0);
+        const float base_l = e->has_pl_embd ? (is_full_l ? 1e6f : 1e4f) : c->rope_base;
+        const float *ff_l = (e->has_pl_embd && is_full_l) ? e->d_rope_freqs : NULL;
+        void (*rope_fn)(float *, int, int, const int *, float) = (c->tr.rope == ROPE_GPTJ) ? k_rope_gptj : k_rope;
+        const float scale_l = c->tr.attn_scale_one ? 1.0f : 1.0f / sqrtf((float)HDl);
+        const int swa_l = e->has_pl_embd ? e->pl_swa[l] : c->tr.swa_size;
+        dim3 g_q((HDl / 2 + 63) / 64, H_l, 1), b_rope(64, 1, 1);
+        dim3 g_k((HDl / 2 + 63) / 64, KV_l, 1);
+        for (int i = 0; i < n; i++) { const int *d_pos_i = d_pos_batch + i; static int no_rope = -1; if (no_rope < 0) no_rope = getenv("TT_NO_ROPE") ? 1 : 0; if (!no_rope) { void (*rope_ff_fn)(float *, int, int, const int *, float, const float *) = (c->tr.rope == ROPE_GPTJ) ? k_rope_gptj_ff : k_rope_ff; if (ff_l) rope_ff_fn<<<g_q, b_rope, 0, e->stream>>>(d_Q + (long)i * attn_qout, H_l, HDl, d_pos_i, base_l, ff_l); else rope_fn<<<g_q, b_rope, 0, e->stream>>>(d_Q + (long)i * attn_qout, H_l, HDl, d_pos_i, base_l); if (!kv_shared) { if (ff_l) rope_ff_fn<<<g_k, b_rope, 0, e->stream>>>(d_K + (long)i * kvdim_l, KV_l, HDl, d_pos_i, base_l, ff_l); else rope_fn<<<g_k, b_rope, 0, e->stream>>>(d_K + (long)i * kvdim_l, KV_l, HDl, d_pos_i, base_l); } } if (!kv_shared) { if (e->use_q8_kvcache) { const int num_blocks = kvdim_l / 32; k_kv_scatter_q8_0<<<(num_blocks + 255) / 256, 256, 0, e->stream>>>(d_K + (long)i * kvdim_l, d_V + (long)i * kvdim_l, Kl_q8, Vl_q8, d_pos_i, KV_l, HDl, c->max_ctx); } else { k_kv_scatter<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(d_K + (long)i * kvdim_l, d_V + (long)i * kvdim_l, Kl_f, Vl_f, d_pos_i, KV_l, HDl, c->max_ctx); } } }
+        if (e->use_q8_kvcache) { int num_q_tiles = (n + BR_PREFILL - 1) / BR_PREFILL; dim3 grid_pf(num_q_tiles, KV_l); int threads_pf = (H_l / KV_l) * 32; int blocks_per_head = HDl / 32; size_t smem_bytes = 2 * (size_t)BC_PREFILL * blocks_per_head * sizeof(half) + 2 * (size_t)BC_PREFILL * HDl * sizeof(int8_t); k_prefill_flash_q8_0<<<grid_pf, threads_pf, smem_bytes, e->stream>>>(d_Q, Kl_q8, Vl_q8, d_Att, n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l); } else { for (int i = 0; i < n; i++) { const int *d_pos_i = d_pos_batch + i; k_flash_gqa<<<H_l, 32, 0, e->stream>>>(d_Q + (long)i * attn_qout, Kl_f, Vl_f, d_Att + (long)i * attn_qout, d_pos_i, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l); } }
+        if (w->o.dtype == TTQ_Q4_0) prefill_gemm_fn(w->o.ptr, d_Att, d_Xn, dim, attn_qout, n, e->stream); else for (int i = 0; i < n; i++) tt_gemv_typed(w->o.ptr, w->o.dtype, d_Att + (long)i * attn_qout, d_Xn + (long)i * dim, dim, attn_qout, e->stream);
+        if (w->post_attn_norm) for (int i = 0; i < n; i++) k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(d_Xn + (long)i * dim, w->post_attn_norm, d_Xn + (long)i * dim, dim, c->rms_eps, c->tr.norm_offset);
+        k_add<<<(n * dim + 255) / 256, 256, 0, e->stream>>>(d_X, d_Xn, n * dim);
+        for (int i = 0; i < n; i++) k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(d_X + (long)i * dim, w->ffn_norm, d_Xn + (long)i * dim, dim, c->rms_eps, c->tr.norm_offset);
+        const int act_gelu = (c->tr.act == ACT_GELU) ? 1 : 0;
+        if (w->gate.dtype == TTQ_Q4_0) { prefill_gemm_fn(w->gate.ptr, d_Xn, d_G, FF_l, dim, n, e->stream); prefill_gemm_fn(w->up.ptr, d_Xn, d_U, FF_l, dim, n, e->stream); } else { for (int i = 0; i < n; i++) { tt_gemv_typed(w->gate.ptr, w->gate.dtype, d_Xn + (long)i * dim, d_G + (long)i * FF_l, FF_l, dim, e->stream); tt_gemv_typed(w->up.ptr, w->up.dtype, d_Xn + (long)i * dim, d_U + (long)i * FF_l, FF_l, dim, e->stream); } }
+        k_swiglu_apply<<<(n * FF_l + 255) / 256, 256, 0, e->stream>>>(d_G, d_U, d_H, n * FF_l, act_gelu);
+        if (w->down.dtype == TTQ_Q4_0) prefill_gemm_fn(w->down.ptr, d_H, d_Xn, dim, FF_l, n, e->stream); else for (int i = 0; i < n; i++) tt_gemv_typed(w->down.ptr, w->down.dtype, d_H + (long)i * FF_l, d_Xn + (long)i * dim, dim, FF_l, e->stream);
+        if (w->post_ffn_norm) for (int i = 0; i < n; i++) k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(d_Xn + (long)i * dim, w->post_ffn_norm, d_Xn + (long)i * dim, dim, c->rms_eps, c->tr.norm_offset);
+        k_add<<<(n * dim + 255) / 256, 256, 0, e->stream>>>(d_X, d_Xn, n * dim);
+    }
+    e->pos += n;
+    cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(e->d_x, d_X + (long)(n - 1) * dim, (size_t)dim * sizeof(float), cudaMemcpyDeviceToDevice, e->stream);
+    return 0;
+}
+
+
 int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
     if (!e || !toks || n <= 0) return -1;
     if (e->pos + n > e->cfg.max_ctx) return -2;          /* context overflow */
@@ -3508,24 +3680,52 @@ int qwen2_engine_verify_speculative(Qwen2Engine *e,
 
     const long vocab_f = (long)c->vocab;
     const int dim = c->dim;
+    const char *sb_env = getenv("TT_SPEC_BATCH");
+    int spec_batch = sb_env ? atoi(sb_env) : 0;
+    (void)spec_batch;
     if (n_candidate >= 2 && e->n_gpu_layers == c->n_layers && !e->has_pl_embd && c->tr.softcap_value == 0.0f) {
-        float *h_x_all = (float *)malloc((size_t)n_candidate * dim * sizeof(float));
-        int rc = prefill_batched_gemm(e, h_candidate_tokens, n_candidate, h_x_all);
-        if (rc == 0) {
-            for (int i = 0; i < n_candidate; i++) {
-                cudaMemcpyAsync(e->d_x, h_x_all + (long)i * dim, dim * sizeof(float), cudaMemcpyHostToDevice, e->stream);
-                compute_logits_into_d_logits(e);
-                cudaMemcpyAsync(out_logits + (long)i * vocab_f,
-                                e->d_logits,
-                                vocab_f * sizeof(float),
-                                cudaMemcpyDeviceToDevice,
-                                e->stream);
-            }
-            free(h_x_all);
-            cudaStreamSynchronize(e->stream);
-            return 0;
+        int can_batch = 1;
+        if (!e->d_x_batch || e->d_x_batch_cap < n_candidate) {
+            if (e->d_x_batch) { cudaFree(e->d_x_batch); e->d_x_batch = NULL; }
+            if (e->d_xn_batch) { cudaFree(e->d_xn_batch); e->d_xn_batch = NULL; }
+            size_t need = (size_t)n_candidate * dim * sizeof(float);
+            if (cudaMalloc(&e->d_x_batch, need) != cudaSuccess) can_batch = 0;
+            else if (cudaMalloc(&e->d_xn_batch, need) != cudaSuccess) { cudaFree(e->d_x_batch); e->d_x_batch = NULL; can_batch = 0; }
+            else e->d_x_batch_cap = n_candidate;
         }
-        free(h_x_all);
+        if (can_batch && (!e->d_logits_batch || e->d_logits_batch_cap < n_candidate)) {
+            if (e->d_logits_batch) { cudaFree(e->d_logits_batch); e->d_logits_batch = NULL; }
+            size_t need = (size_t)n_candidate * vocab_f * sizeof(float);
+            if (cudaMalloc(&e->d_logits_batch, need) != cudaSuccess) can_batch = 0;
+            else e->d_logits_batch_cap = n_candidate;
+        }
+        if (can_batch) {
+            int rc = prefill_batched_gemm_dx(e, h_candidate_tokens, n_candidate, e->d_x_batch);
+            if (rc == 0) {
+                for (int i = 0; i < n_candidate; i++) {
+                    k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
+                        e->d_x_batch + (long)i * dim, e->d_out_norm, e->d_xn_batch + (long)i * dim,
+                        dim, c->rms_eps, c->tr.norm_offset);
+                }
+                if (n_candidate == 4 && (vocab_f % 4) == 0 && (dim % 32) == 0 && e->d_out_w.dtype == GGUF_TYPE_Q4_0) {
+                    int lrc = tt_logits_q4_0_batch4(e->d_out_w.ptr, e->d_xn_batch, e->d_logits_batch, (int)vocab_f, dim, e->stream);
+                    if (lrc == 0) {
+                        cudaMemcpyAsync(out_logits, e->d_logits_batch, (size_t)n_candidate * vocab_f * sizeof(float), cudaMemcpyDeviceToDevice, e->stream);
+                        cudaStreamSynchronize(e->stream);
+                        return 0;
+                    }
+                }
+                for (int i = 0; i < n_candidate; i++) {
+                    int lrc = tt_logits_dispatch(e->d_out_w.ptr, e->d_out_w.dtype, e->d_xn_batch + (long)i * dim, e->d_logits_batch + (long)i * vocab_f, (int)vocab_f, dim, e->stream);
+                    if (lrc) { can_batch = 0; break; }
+                }
+                if (can_batch) {
+                    cudaMemcpyAsync(out_logits, e->d_logits_batch, (size_t)n_candidate * vocab_f * sizeof(float), cudaMemcpyDeviceToDevice, e->stream);
+                    cudaStreamSynchronize(e->stream);
+                    return 0;
+                }
+            }
+        }
     }
 
     for (int i = 0; i < n_candidate; i++) {

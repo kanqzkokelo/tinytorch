@@ -109,6 +109,11 @@ int qwen2_engine_step_logits(Qwen2Engine *e, int tok, float *host_logits);
 // 4-rows-per-warp Q8_0 LM head: logits [vocab] = X [K] * W^T [vocab, K]
 // W is Q8_0 quantized. Evaluates 4 vocab rows per warp in parallel.
 int tt_logits_q8_0_v4(const void *dW, const float *dx, float *dlogits, int vocab, int K, cudaStream_t s);
+// M10+ Batched-4 LM head (q4_0): 4 vocab rows x 4 candidates in one weight pass.
+// X is [4, K], L is [4, vocab] candidate-major (L[c*vocab+v] = X[c*K+:] @ W[v,:]).
+// Requires K%32==0, nb even, vocab%4==0. Returns 0 on success.
+int tt_logits_q4_0_batch4(const void *dW, const float *dX_4xK, float *dL_4xVocab,
+                          int vocab, int K, cudaStream_t s);
 int tt_logits_q8_0(const void *dW, const float *dx, float *dlogits, int vocab, int K, cudaStream_t s);
 
 // Fused QKV: 1 launch for Q + K + V projections sharing input X.
@@ -130,9 +135,21 @@ int tt_gemm_q4_0_prefill(const void *dW, const float *dX_NxK, float *dY_NxM, int
 // W is Q4_0 quantized. Uses Ampere Tensor Cores (nvcuda::wmma 16x16x16 fragments).
 int tt_gemm_wmma_q4_0_prefill(const void *dW, const float *dX_NxK, float *dY_NxM, int M, int K, int N, cudaStream_t s);
 int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out);
+// M10+ Batched prefill that writes final hidden states to device buffer d_x_out (no host bounce).
+// Used by speculative verify path.
+int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_out);
 
 void qwen2_engine_reset(Qwen2Engine *e);
 void qwen2_engine_free(Qwen2Engine *e);
+
+/* Qwen2Engine batched buffers (device) - must match kernels/qwen2_cuda.cu struct */
+#if 0
+struct Qwen2Engine {
+    float *d_x_batch;
+    float *d_xn_batch;
+    float *d_logits_batch;
+};
+#endif
 
 /* Q8_0 KV Cache APIs */
 void qwen2_engine_enable_q8_kvcache(Qwen2Engine *e, int enable);
