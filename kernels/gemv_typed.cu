@@ -542,7 +542,14 @@ __global__ void k_gemv_q3_K_v2(const uint8_t *__restrict__ W,
  * uses the ds*sum(w*x) - dm*sum(x) form so each sub-block's two scale
  * multiplies amortize over 32 weight-x MACs. Weight bytes loaded via
  * __ldg (read-only cache). Mirrors the k_gemv_q4_0 V2 shape (one warp,
- * two rows, lane-stride) so existing grid/block helpers apply. */
+ * two rows, lane-stride) so existing grid/block helpers apply.
+ *
+ * Nibble extraction: a sub-block of 32 values occupies 32 bytes of qs
+ * (val l = q[l] & 0xF for even sub, val l = q[l] >> 4 for odd sub). The
+ * V2 reads 8 bytes (uint64) at a time covering 8 values, paired with
+ * 2 float4 (8 floats) of x; 4 inner steps cover the 32-value sub-block.
+ * Both rows share every x read, so each lane does 4 uint64 (row0) + 4
+ * uint64 (row1) + 8 float4 (shared) = 16 loads per sub-block. */
 __global__ void k_gemv_q4_K_v2(const uint8_t *__restrict__ W,
                                const float *__restrict__ x,
                                float *__restrict__ y,
@@ -568,8 +575,9 @@ __global__ void k_gemv_q4_K_v2(const uint8_t *__restrict__ W,
         int sc0, mn0, sc1, mn1;
         k4_scale_min(sub, blk0 + 4, &sc0, &mn0);
         k4_scale_min(sub, blk1 + 4, &sc1, &mn1);
-        /* qs[128]: sub-block `sub` at bytes [sub/2*32, +32). Even sub =
-         * low nibble, odd sub = high nibble (dequant_ref.c dq_q4_K). */
+        /* qs[128]: sub-block `sub` at bytes [sub/2*32, +32). Even sub uses
+         * low nibble (val l = q[l] & 0xF), odd sub uses high (val l = q[l]
+         * >> 4). */
         const uint8_t *q0 = blk0 + 16 + (sub >> 1) * 32;
         const uint8_t *q1 = blk1 + 16 + (sub >> 1) * 32;
         const float *xb = x + (long)sb * 256 + sub * 32;
@@ -577,44 +585,66 @@ __global__ void k_gemv_q4_K_v2(const uint8_t *__restrict__ W,
         const float ds1 = d1 * sc1, dmd1 = dm1 * mn1;
         const int low = (sub & 1) == 0;
         const float4 *x4 = (const float4 *)xb;
-        float swx = 0.0f, sx = 0.0f;     /* shared x stats; both rows reuse */
-        /* 2 chunks of 16 bytes (8 nibbles) per sub-block = 32 nibbles.
-         * uint32 (4 bytes) packs 4 nibbles paired with one float4. */
+        float swx0 = 0.0f, swx1 = 0.0f, sx = 0.0f;
+        /* 4 chunks of 8 bytes (uint64) per sub-block = 32 bytes = 32
+         * values. Each uint64 covers 8 bytes (8 values), paired with 2
+         * float4 (8 floats) of x. */
 #pragma unroll
-        for (int q = 0; q < 2; q++) {
-            const uint32_t w0 = __ldg((const uint32_t *)(q0 + q * 16));
-            const uint32_t w1 = __ldg((const uint32_t *)(q1 + q * 16));
+        for (int q = 0; q < 4; q++) {
+            const uint64_t w0 = __ldg((const uint64_t *)(q0 + q * 8));
+            const uint64_t w1 = __ldg((const uint64_t *)(q1 + q * 8));
             const float4 xv0 = x4[q * 2 + 0];
             const float4 xv1 = x4[q * 2 + 1];
-            /* low: byte 0 = bits 0..3, byte 1 = bits 8..11, ...  */
-            /* high: byte 0 = bits 4..7, byte 1 = bits 12..15, ... */
-            int a0, a1, a2, a3, b0, b1, b2, b3;
+            /* nibble extraction: byte j of uint64 = q[q*8 + j]. For low
+             * (sub even), val j = q[j] & 0xF = (w >> 8j) & 0xF (byte j low
+             * nibble). For high (sub odd), val j = q[j] >> 4 = (w >> 8j+4)
+             * & 0xF (byte j high nibble). j in [0,8) gives 8 values. */
+            int a0, a1, a2, a3, a4, a5, a6, a7;
+            int b0, b1, b2, b3, b4, b5, b6, b7;
             if (low) {
-                a0 = (int)( w0        & 0xFu);
-                a1 = (int)((w0 >>  8) & 0xFu);
-                a2 = (int)((w0 >> 16) & 0xFu);
-                a3 = (int)((w0 >> 24)       );
-                b0 = (int)( w1        & 0xFu);
-                b1 = (int)((w1 >>  8) & 0xFu);
-                b2 = (int)((w1 >> 16) & 0xFu);
-                b3 = (int)((w1 >> 24)       );
+                a0 = (int)( w0          & 0xFu);
+                a1 = (int)((w0 >>   8)  & 0xFu);
+                a2 = (int)((w0 >>  16)  & 0xFu);
+                a3 = (int)((w0 >>  24)  & 0xFu);
+                a4 = (int)((w0 >>  32)  & 0xFu);
+                a5 = (int)((w0 >>  40)  & 0xFu);
+                a6 = (int)((w0 >>  48)  & 0xFu);
+                a7 = (int)((w0 >>  56)        );
+                b0 = (int)( w1          & 0xFu);
+                b1 = (int)((w1 >>   8)  & 0xFu);
+                b2 = (int)((w1 >>  16)  & 0xFu);
+                b3 = (int)((w1 >>  24)  & 0xFu);
+                b4 = (int)((w1 >>  32)  & 0xFu);
+                b5 = (int)((w1 >>  40)  & 0xFu);
+                b6 = (int)((w1 >>  48)  & 0xFu);
+                b7 = (int)((w1 >>  56)        );
             } else {
-                a0 = (int)((w0 >>  4) & 0xFu);
-                a1 = (int)((w0 >> 12) & 0xFu);
-                a2 = (int)((w0 >> 20) & 0xFu);
-                a3 = (int)( w0 >> 28       );
-                b0 = (int)((w1 >>  4) & 0xFu);
-                b1 = (int)((w1 >> 12) & 0xFu);
-                b2 = (int)((w1 >> 20) & 0xFu);
-                b3 = (int)( w1 >> 28       );
+                a0 = (int)((w0 >>   4)  & 0xFu);
+                a1 = (int)((w0 >>  12)  & 0xFu);
+                a2 = (int)((w0 >>  20)  & 0xFu);
+                a3 = (int)((w0 >>  28)  & 0xFu);
+                a4 = (int)((w0 >>  36)  & 0xFu);
+                a5 = (int)((w0 >>  44)  & 0xFu);
+                a6 = (int)((w0 >>  52)  & 0xFu);
+                a7 = (int)((w0 >>  60)        );
+                b0 = (int)((w1 >>   4)  & 0xFu);
+                b1 = (int)((w1 >>  12)  & 0xFu);
+                b2 = (int)((w1 >>  20)  & 0xFu);
+                b3 = (int)((w1 >>  28)  & 0xFu);
+                b4 = (int)((w1 >>  36)  & 0xFu);
+                b5 = (int)((w1 >>  44)  & 0xFu);
+                b6 = (int)((w1 >>  52)  & 0xFu);
+                b7 = (int)((w1 >>  60)        );
             }
-            swx += a0 * xv0.x + a1 * xv0.y + a2 * xv0.z + a3 * xv0.w
-                 + b0 * xv1.x + b1 * xv1.y + b2 * xv1.z + b3 * xv1.w;
+            swx0 += a0 * xv0.x + a1 * xv0.y + a2 * xv0.z + a3 * xv0.w
+                  + a4 * xv1.x + a5 * xv1.y + a6 * xv1.z + a7 * xv1.w;
+            swx1 += b0 * xv0.x + b1 * xv0.y + b2 * xv0.z + b3 * xv0.w
+                  + b4 * xv1.x + b5 * xv1.y + b6 * xv1.z + b7 * xv1.w;
             sx  += xv0.x + xv0.y + xv0.z + xv0.w
                  + xv1.x + xv1.y + xv1.z + xv1.w;
         }
-        s0 += ds0 * swx - dmd0 * sx;
-        s1 += ds1 * swx - dmd1 * sx;
+        s0 += ds0 * swx0 - dmd0 * sx;
+        s1 += ds1 * swx1 - dmd1 * sx;
     }
     s0 = warp_reduce_sum(s0);
     s1 = warp_reduce_sum(s1);
@@ -625,12 +655,10 @@ __global__ void k_gemv_q4_K_v2(const uint8_t *__restrict__ W,
 }
 
 /* 2-rows-per-warp V2 for q5_K. Same shape as q4_K V2, plus the 5th-bit
- * qh plane. For sub-block `sub`, value l's high bit is `(qh[l] >> sub) & 1`
- * and adds 16 to the 4-bit value (so the 5-bit integer weight is in
- * [0, 31]). Each sub-block uses 32 qh bits = 4 uint32 words for q=0..1.
- * Note the qh bytes for sub-block `sub` are at super-block+16+l (byte l,
- * bit sub). Reading qh[q*16..q*16+4] as uint32 gives bits for indices
- * [q*16, q*16+3]; bit positions within each byte are `sub`. */
+ * qh plane. For sub-block `sub`, value l's 5-bit value = (q4 nibble) +
+ * 16*(qh[l] >> sub & 1). qh[32] holds 32 high bits (one per value l in
+ * 0..31), bit `sub` of byte l. The V2 reads 8 bytes of ql (uint64) +
+ * 8 bytes of qh (uint64) per inner step, 4 steps per sub-block. */
 __global__ void k_gemv_q5_K_v2(const uint8_t *__restrict__ W,
                                const float *__restrict__ x,
                                float *__restrict__ y,
@@ -665,46 +693,64 @@ __global__ void k_gemv_q5_K_v2(const uint8_t *__restrict__ W,
         const float ds1 = d1 * sc1, dmd1 = dm1 * mn1;
         const int low = (sub & 1) == 0;
         const float4 *x4 = (const float4 *)xb;
-        float swx = 0.0f, sx = 0.0f;
+        float swx0 = 0.0f, swx1 = 0.0f, sx = 0.0f;
 #pragma unroll
-        for (int q = 0; q < 2; q++) {
-            const uint32_t w0  = __ldg((const uint32_t *)(ql0 + q * 16));
-            const uint32_t w1  = __ldg((const uint32_t *)(ql1 + q * 16));
-            const uint32_t h0  = __ldg((const uint32_t *)(qh0 + q * 16));
-            const uint32_t h1  = __ldg((const uint32_t *)(qh1 + q * 16));
+        for (int q = 0; q < 4; q++) {
+            const uint64_t w0 = __ldg((const uint64_t *)(ql0 + q * 8));
+            const uint64_t w1 = __ldg((const uint64_t *)(ql1 + q * 8));
+            const uint64_t h0 = __ldg((const uint64_t *)(qh0 + q * 8));
+            const uint64_t h1 = __ldg((const uint64_t *)(qh1 + q * 8));
             const float4 xv0 = x4[q * 2 + 0];
             const float4 xv1 = x4[q * 2 + 1];
-            /* High bit for value l: (qh[l] >> sub) & 1. For 4 packed bytes
-             * loaded as uint32, bit `sub` of byte l = bit (l*8 + sub) of
-             * the uint32. */
-            int a0, a1, a2, a3, b0, b1, b2, b3;
-            const unsigned s0_ = (unsigned)sub;
+            /* nibble extraction matches Q4_K V2: low uses byte j low
+             * nibble, high uses byte j high nibble. 5th bit = bit `sub`
+             * of byte j = bit (8j+sub) of qh's uint64. */
+            int a0, a1, a2, a3, a4, a5, a6, a7;
+            int b0, b1, b2, b3, b4, b5, b6, b7;
             if (low) {
-                a0 = (int)( w0        & 0xFu) | (int)((h0      ) >> s0_ & 1u) << 4;
-                a1 = (int)((w0 >>  8) & 0xFu) | (int)((h0 >>  8) >> s0_ & 1u) << 4;
-                a2 = (int)((w0 >> 16) & 0xFu) | (int)((h0 >> 16) >> s0_ & 1u) << 4;
-                a3 = (int)((w0 >> 24)       ) | (int)((h0 >> 24) >> s0_ & 1u) << 4;
-                b0 = (int)( w1        & 0xFu) | (int)((h1      ) >> s0_ & 1u) << 4;
-                b1 = (int)((w1 >>  8) & 0xFu) | (int)((h1 >>  8) >> s0_ & 1u) << 4;
-                b2 = (int)((w1 >> 16) & 0xFu) | (int)((h1 >> 16) >> s0_ & 1u) << 4;
-                b3 = (int)((w1 >> 24)       ) | (int)((h1 >> 24) >> s0_ & 1u) << 4;
+                a0 = (int)( w0          & 0xFu) | (int)(((h0      ) >> sub) & 1u) << 4;
+                a1 = (int)((w0 >>   8)  & 0xFu) | (int)(((h0 >>   8) >> sub) & 1u) << 4;
+                a2 = (int)((w0 >>  16)  & 0xFu) | (int)(((h0 >>  16) >> sub) & 1u) << 4;
+                a3 = (int)((w0 >>  24)  & 0xFu) | (int)(((h0 >>  24) >> sub) & 1u) << 4;
+                a4 = (int)((w0 >>  32)  & 0xFu) | (int)(((h0 >>  32) >> sub) & 1u) << 4;
+                a5 = (int)((w0 >>  40)  & 0xFu) | (int)(((h0 >>  40) >> sub) & 1u) << 4;
+                a6 = (int)((w0 >>  48)  & 0xFu) | (int)(((h0 >>  48) >> sub) & 1u) << 4;
+                a7 = (int)((w0 >>  56)        ) | (int)(((h0 >>  56) >> sub) & 1u) << 4;
+                b0 = (int)( w1          & 0xFu) | (int)(((h1      ) >> sub) & 1u) << 4;
+                b1 = (int)((w1 >>   8)  & 0xFu) | (int)(((h1 >>   8) >> sub) & 1u) << 4;
+                b2 = (int)((w1 >>  16)  & 0xFu) | (int)(((h1 >>  16) >> sub) & 1u) << 4;
+                b3 = (int)((w1 >>  24)  & 0xFu) | (int)(((h1 >>  24) >> sub) & 1u) << 4;
+                b4 = (int)((w1 >>  32)  & 0xFu) | (int)(((h1 >>  32) >> sub) & 1u) << 4;
+                b5 = (int)((w1 >>  40)  & 0xFu) | (int)(((h1 >>  40) >> sub) & 1u) << 4;
+                b6 = (int)((w1 >>  48)  & 0xFu) | (int)(((h1 >>  48) >> sub) & 1u) << 4;
+                b7 = (int)((w1 >>  56)        ) | (int)(((h1 >>  56) >> sub) & 1u) << 4;
             } else {
-                a0 = (int)((w0 >>  4) & 0xFu) | (int)((h0 >>  4) >> s0_ & 1u) << 4;
-                a1 = (int)((w0 >> 12) & 0xFu) | (int)((h0 >> 12) >> s0_ & 1u) << 4;
-                a2 = (int)((w0 >> 20) & 0xFu) | (int)((h0 >> 20) >> s0_ & 1u) << 4;
-                a3 = (int)( w0 >> 28       ) | (int)((h0 >> 28) >> s0_ & 1u) << 4;
-                b0 = (int)((w1 >>  4) & 0xFu) | (int)((h1 >>  4) >> s0_ & 1u) << 4;
-                b1 = (int)((w1 >> 12) & 0xFu) | (int)((h1 >> 12) >> s0_ & 1u) << 4;
-                b2 = (int)((w1 >> 20) & 0xFu) | (int)((h1 >> 20) >> s0_ & 1u) << 4;
-                b3 = (int)( w1 >> 28       ) | (int)((h1 >> 28) >> s0_ & 1u) << 4;
+                a0 = (int)((w0 >>   4)  & 0xFu) | (int)(((h0 >>   4) >> sub) & 1u) << 4;
+                a1 = (int)((w0 >>  12)  & 0xFu) | (int)(((h0 >>  12) >> sub) & 1u) << 4;
+                a2 = (int)((w0 >>  20)  & 0xFu) | (int)(((h0 >>  20) >> sub) & 1u) << 4;
+                a3 = (int)((w0 >>  28)  & 0xFu) | (int)(((h0 >>  28) >> sub) & 1u) << 4;
+                a4 = (int)((w0 >>  36)  & 0xFu) | (int)(((h0 >>  36) >> sub) & 1u) << 4;
+                a5 = (int)((w0 >>  44)  & 0xFu) | (int)(((h0 >>  44) >> sub) & 1u) << 4;
+                a6 = (int)((w0 >>  52)  & 0xFu) | (int)(((h0 >>  52) >> sub) & 1u) << 4;
+                a7 = (int)((w0 >>  60)        ) | (int)(((h0 >>  60) >> sub) & 1u) << 4;
+                b0 = (int)((w1 >>   4)  & 0xFu) | (int)(((h1 >>   4) >> sub) & 1u) << 4;
+                b1 = (int)((w1 >>  12)  & 0xFu) | (int)(((h1 >>  12) >> sub) & 1u) << 4;
+                b2 = (int)((w1 >>  20)  & 0xFu) | (int)(((h1 >>  20) >> sub) & 1u) << 4;
+                b3 = (int)((w1 >>  28)  & 0xFu) | (int)(((h1 >>  28) >> sub) & 1u) << 4;
+                b4 = (int)((w1 >>  36)  & 0xFu) | (int)(((h1 >>  36) >> sub) & 1u) << 4;
+                b5 = (int)((w1 >>  44)  & 0xFu) | (int)(((h1 >>  44) >> sub) & 1u) << 4;
+                b6 = (int)((w1 >>  52)  & 0xFu) | (int)(((h1 >>  52) >> sub) & 1u) << 4;
+                b7 = (int)((w1 >>  60)        ) | (int)(((h1 >>  60) >> sub) & 1u) << 4;
             }
-            swx += a0 * xv0.x + a1 * xv0.y + a2 * xv0.z + a3 * xv0.w
-                 + b0 * xv1.x + b1 * xv1.y + b2 * xv1.z + b3 * xv1.w;
+            swx0 += a0 * xv0.x + a1 * xv0.y + a2 * xv0.z + a3 * xv0.w
+                  + a4 * xv1.x + a5 * xv1.y + a6 * xv1.z + a7 * xv1.w;
+            swx1 += b0 * xv0.x + b1 * xv0.y + b2 * xv0.z + b3 * xv0.w
+                  + b4 * xv1.x + b5 * xv1.y + b6 * xv1.z + b7 * xv1.w;
             sx  += xv0.x + xv0.y + xv0.z + xv0.w
                  + xv1.x + xv1.y + xv1.z + xv1.w;
         }
-        s0 += ds0 * swx - dmd0 * sx;
-        s1 += ds1 * swx - dmd1 * sx;
+        s0 += ds0 * swx0 - dmd0 * sx;
+        s1 += ds1 * swx1 - dmd1 * sx;
     }
     s0 = warp_reduce_sum(s0);
     s1 = warp_reduce_sum(s1);
