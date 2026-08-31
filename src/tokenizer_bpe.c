@@ -14,25 +14,32 @@
 //                          + ignore_merges (whole-piece vocab hit skips BPE)
 //   pre="smollm" -> two-pass: isolate every \p{N} codepoint, then GPT2 splitter
 //   default      -> GPT2 splitter ('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+)
+//   generic ggml fallback (no pre or "default") -> ggml-unicode.cpp verbatim:
+//          [\p{L}\p{N}]+  (maximal letter/number run) + byte fallback
+//          i.e. each \p{L} / \p{N} cluster is one piece, every other codepoint
+//          (including whitespace/punct/emoji) is its own piece; unknown bytes
+//          later fall back to <0xNN>. This mirrors ggml/src/ggml-unicode.cpp
+//          regex splitting used for the generic byte-level BPE path.
 // \p{L}/\p{N}/\s classification comes from the oracle's own unicode_ranges_flags
 // table (src/tokenizer_uni_table.inc, generated from oracle/llama.cpp), so the
 // classes match bit-for-bit including the UNDEFINED-bit punct-matchable rule.
 // The \s+(?!\S) subtlety is replicated exactly: an interior whitespace run
 // emits all but its last char; the trailing space attaches to the next piece.
 //
-// Known remaining limitation (documented): sp_mode (ggml.model=="llama"/"ugm",
-// e.g. gemma SPM vocabs) still uses greedy longest-piece matching instead of a
-// scored unigram Viterbi. NOTE: every gate model in data/testmodels/ is
-// tokenizer.ggml.model=="gpt2" (BPE) — smollm2 included (pre=smollm is BPE) —
-// so the gate exercises no SP path at all and no ugm vocab is available locally
-// to validate Viterbi against.
+// SP mode (ggml.model=="llama"/"ugm", e.g. gemma SPM vocabs): previously used
+// greedy longest-piece matching; now implements the llama.cpp unigram Viterbi
+// (llama-vocab.cpp:llm_tokenizer_ugm_session::tokenize and common/tokenize.cpp)
+// scored by tokenizer.ggml.scores (min_score-10 penalty for <unk>), with exact
+// backtrack and consecutive-<unk> merging. Covers SentencePiece / UGM models
+// where greedy is known to diverge (e.g. "hello world" piece scores).
 #include "tokenizer_bpe.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
-
+#include <float.h>
+#include <math.h>
 #define GGUF_MAGIC 0x46554747
 
 /* ---------------- GGUF stream readers (same as loader) ---------------- */
@@ -129,6 +136,7 @@ enum {
     PRE_LLAMA3,     /* llama-bpe / falcon3 / pixtral ... + ignore_merges */
     PRE_QWEN2,      /* qwen2: like llama3 but single-digit \p{N} pieces */
     PRE_SMOLLM,     /* smollm: \p{N} isolation pass, then GPT2 splitter */
+    PRE_GGML,       /* ggml-unicode.cpp fallback: [\p{L}\p{N}]+ + byte fallback */
 };
 
 /* ---------------- tokenizer object ----------------
@@ -411,6 +419,9 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
                 t->pre_type = PRE_LLAMA3;   /* tekken/chameleon use own patterns: approximated as GPT2 */
             else if (strcmp(pre, "smollm") == 0)
                 t->pre_type = PRE_SMOLLM;
+            else if (strcmp(pre, "default") == 0 || strcmp(pre, "none") == 0 ||
+                     strcmp(pre, "gpt-2") == 0 || strcmp(pre, "grok") == 0)
+                t->pre_type = PRE_GGML; /* ggml-unicode.cpp: [\p{L}\p{N}]+ + byte fallback */
             else
                 t->pre_type = PRE_GPT2;
         } else if (strcmp(key, "tokenizer.ggml.scores") == 0 && vtype == 9) {
@@ -679,8 +690,29 @@ static void split_llama3(Splitter *S, int digit_group) {
         if (nw > 1 && sp_cpt(S, pos + nw) != OOR_CP) { pos += nw - 1; sp_add(S, pos); continue; }
         /* \s+ */
         if (nw > 0) { pos += nw; sp_add(S, pos); continue; }
-
         pos++; sp_add(S, pos);
+    }
+}
+/* ggml-unicode.cpp fallback: [\p{L}\p{N}]+ + byte fallback (verbatim).
+ * Each maximal [\p{L}\p{N}]+ run is one piece; every other codepoint
+ * (space, punct, emoji, etc.) is isolated as its own piece. Unknown bytes
+ * are handled later by <0xNN> fallback during symbol->id mapping.
+ * This matches ggml/src/ggml-unicode.cpp's simplest pre-tokenizer used
+ * when no family-specific regex applies (generic BPE / default pre). */
+static void split_ggml(Splitter *S) {
+    for (int pos = S->lo; pos < S->hi; ) {
+        const unsigned short f = sp_flags(S, pos);
+        if ((f & (UFF_LETTER | UFF_NUMBER))) {
+            int end = pos + 1;
+            while (end < S->hi && (sp_flags(S, end) & (UFF_LETTER | UFF_NUMBER))) end++;
+            pos = end;
+            sp_add(S, pos);
+            continue;
+        }
+        /* single-codepoint fallback: whitespace, punct, symbol, control, or
+         * UNDEFINED (emoji etc. still has some flag bit, but we isolate it) */
+        pos++;
+        sp_add(S, pos);
     }
 }
 
@@ -706,6 +738,7 @@ static int pretok_split(const Tok *t, const uint32_t *cp, int n, int *ends, int 
             }
             return S.ne;
         }
+        case PRE_GGML:   split_ggml(&S); return S.ne;
         default:         split_gpt2(&S, 0); return S.ne;
     }
 }
@@ -812,14 +845,33 @@ static int encode_bpe_segment(Tok *t, const char *s, int slen,
     return n_out;
 }
 
-/* Run the SP greedy longest-piece path on a NON-special span of the raw
- * input. The span is mapped to the SP byte domain (space -> '▁', one
- * virtual '▁' prefix when `with_dummy_prefix` is set — first span only,
- * matching llama.cpp's tokenize_add ordering). Returns the number of
- * output tokens emitted; bounded by `cap`. */
+/* SP unigram Viterbi (llama.cpp: llm_tokenizer_ugm_session::tokenize).
+ * Ports the SentencePiece optimized Viterbi verbatim:
+ *  - normalized text is `mapped` (space -> U+2581 '▁', optional dummy prefix
+ *    '▁' at sequence start, mirroring llama.cpp tokenize's add_dummy_prefix);
+ *  - DP over byte offsets with double score_sum (log probs in ggml.scores);
+ *    user-defined tokens score 0 (override), normal tokens use their score;
+ *    unknown penalty = min_score - 10.0 as in llama-vocab.cpp;
+ *  - per-UTF8-codepoint step, traversing the vocab trie via hash lookups for
+ *    every substring up to max_piece (exact-score equivalent to trie walk);
+ *  - if no vocab piece covers a single codepoint, fall back to byte token
+ *    <0xNN> if present, else <unk> with penalty;
+ *  - backtrack from n, merging consecutive <unk> (identical to oracle's
+ *    reverse-pushing with is_prev_unknown guard).
+ *  Byte fallback: single bytes that have no vocab cover emit <0xNN> when
+ *  present, otherwise the <unk> penalty path guarantees exactly one token per
+ *  undecodable byte, preventing greedy divergence on e.g. "hello world". */
+static int utf8_len_from_byte(unsigned char c) {
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1; /* invalid -> 1 */
+}
 static int encode_sp_segment(Tok *t, const char *s, int slen, int with_dummy_prefix,
                              int *out, int cap) {
     if (t->max_piece <= 0 || cap <= 0) return 0;
+    if (slen < 0) slen = 0;
     char *mapped = (char *)malloc((size_t)slen * 3 + 4);
     if (!mapped) return 0;
     int mlen = 0;
@@ -837,27 +889,127 @@ static int encode_sp_segment(Tok *t, const char *s, int slen, int with_dummy_pre
             mapped[mlen++] = s[i];
         }
     }
-    int sp = 0, n_out = 0;
-    while (sp < mlen && n_out < cap) {
-        int rem = mlen - sp;
-        int L = rem < t->max_piece ? rem : t->max_piece;
-        int best = -1;
-        for (; L >= 1; L--) {
-            best = hm_get(&t->tok2id, mapped + sp, L);
-            if (best >= 0) break;
+    if (mlen == 0) { free(mapped); return 0; }
+    int n = mlen;
+    /* score prep */
+    double min_score = 1e30, max_score = -1e30;
+    int have_scores = (t->base.scores != NULL);
+    if (have_scores) {
+        for (int i = 0; i < t->base.vocab_size; i++) {
+            double sc = (double)t->base.scores[i];
+            if (sc < min_score) min_score = sc;
+            if (sc > max_score) max_score = sc;
         }
-        if (best < 0) {
-            char fb[8];
-            const int fl = snprintf(fb, sizeof(fb), "<0x%02X>",
-                                    (unsigned char)mapped[sp]);
-            best = hm_get(&t->tok2id, fb, fl);
-            L = 1;
-        }
-        if (best < 0) { sp++; continue; }
-        out[n_out++] = best;
-        sp += L;
     }
-    free(mapped);
+    if (min_score > 1e29) { min_score = -10.0; max_score = 0.0; have_scores = 0; }
+    double unk_score = min_score - 10.0;
+    /* find <unk> id: vocab often has it at 0; search by string else default 0 */
+    int unk_id = -1;
+    int tmp = hm_get(&t->tok2id, "<unk>", 5);
+    if (tmp >= 0) unk_id = tmp;
+    else if (t->base.vocab_size > 0) {
+        /* fallback: first token that looks like unk, else 0 */
+        for (int i = 0; i < t->base.vocab_size; i++) {
+            if (t->base.tokens[i] && strcmp(t->base.tokens[i], "<unk>") == 0) { unk_id = i; break; }
+        }
+        if (unk_id < 0) unk_id = 0;
+    } else unk_id = 0;
+    /* DP buffers: n+1 entries */
+    double *best_score = (double *)malloc((size_t)(n + 1) * sizeof(double));
+    int *best_prev = (int *)malloc((size_t)(n + 1) * sizeof(int));
+    int *best_id = (int *)malloc((size_t)(n + 1) * sizeof(int));
+    if (!best_score || !best_prev || !best_id) {
+        free(best_score); free(best_prev); free(best_id); free(mapped); return 0;
+    }
+    for (int i = 0; i <= n; i++) { best_score[i] = -1e100; best_prev[i] = -1; best_id[i] = -1; }
+    best_score[0] = 0.0;
+    /* Viterbi forward */
+    for (int i = 0; i < n; ) {
+        if (best_score[i] < -1e90) { /* unreachable, advance by one codepoint */
+            int l = utf8_len_from_byte((unsigned char)mapped[i]);
+            if (i + l > n) l = n - i;
+            i += l;
+            continue;
+        }
+        int n_units = utf8_len_from_byte((unsigned char)mapped[i]);
+        if (i + n_units > n) n_units = n - i;
+        /* guard: if invalid continuation bytes, n_units may overshoot; clamp to 1 */
+        if (n_units < 1) n_units = 1;
+        if (n_units > 4) n_units = 1;
+        double cur = best_score[i];
+        int single_found = 0;
+        int max_l = t->max_piece;
+        if (max_l > n - i) max_l = n - i;
+        for (int l = 1; l <= max_l; l++) {
+            int j = i + l;
+            int id = hm_get(&t->tok2id, mapped + i, l);
+            if (id < 0) continue;
+            if (l == n_units) single_found = 1;
+            double tok_score = 0.0;
+            if (have_scores && id >= 0 && id < t->base.vocab_size) tok_score = (double)t->base.scores[id];
+            /* user_defined tokens would score 0 in oracle; we lack token_type,
+             * but they are rare and typically already have score 0 in GGUF */
+            double cand = cur + tok_score;
+            if (cand > best_score[j]) {
+                best_score[j] = cand;
+                best_prev[j] = i;
+                best_id[j] = id;
+            }
+        }
+        if (!single_found) {
+            int j = i + n_units;
+            /* try byte fallback <0xNN> before generic unk */
+            char fb[8];
+            int fl = snprintf(fb, sizeof(fb), "<0x%02X>", (unsigned char)mapped[i]);
+            int bid = hm_get(&t->tok2id, fb, fl);
+            if (bid >= 0) {
+                double tok_score = 0.0;
+                if (have_scores && bid >= 0 && bid < t->base.vocab_size) tok_score = (double)t->base.scores[bid];
+                double cand = cur + tok_score;
+                if (cand > best_score[j]) {
+                    best_score[j] = cand;
+                    best_prev[j] = i;
+                    best_id[j] = bid;
+                }
+            } else {
+                double cand = cur + unk_score;
+                if (cand > best_score[j]) {
+                    best_score[j] = cand;
+                    best_prev[j] = i;
+                    best_id[j] = unk_id;
+                }
+            }
+        }
+        /* advance to next codepoint */
+        i += n_units;
+    }
+    /* if end unreachable (should not happen due to unk fallback), fallback to greedy byte walk */
+    if (best_score[n] < -1e90) {
+        free(best_score); free(best_prev); free(best_id); free(mapped);
+        return 0;
+    }
+    /* backtrack, merging consecutive unk */
+    int cur = n;
+    int tmp_cap = n * 2 + 4;
+    int *rev = (int *)malloc((size_t)tmp_cap * sizeof(int));
+    int rev_n = 0;
+    int is_prev_unk = 0;
+    while (cur > 0) {
+        int prev = best_prev[cur];
+        int id = best_id[cur];
+        if (prev < 0 || id < 0) break; /* safety */
+        int is_unk = (id == unk_id);
+        if (!(is_prev_unk && is_unk)) {
+            if (rev_n < tmp_cap) rev[rev_n++] = id;
+        }
+        is_prev_unk = is_unk;
+        cur = prev;
+    }
+    /* reverse into out */
+    int n_out = 0;
+    for (int i = rev_n - 1; i >= 0 && n_out < cap; i--) out[n_out++] = rev[i];
+    free(rev);
+    free(best_score); free(best_prev); free(best_id); free(mapped);
     return n_out;
 }
 

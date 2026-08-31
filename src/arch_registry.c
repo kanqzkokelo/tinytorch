@@ -58,14 +58,19 @@ static const ArchEntry kArchTable[] = {
     { "smollm",   { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
     { "smollm2",  { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
     { "qwen3", { ROPE_NEOX, ACT_SILU, 0.0f, 0, 0, 1, 1e-6f, 0.0f, 0, 0, 0 } },
+    { "qwen3_moe", { ROPE_NEOX, ACT_SILU, 0.0f, 0, 0, 1, 1e-6f, 0.0f, 0, 0, 0 } },
     /* gemma: NEOX rope, GeGLU(gelu), tied embeddings, no softcap/swa. */
     { "gemma", { ROPE_NEOX, ACT_GELU, 0.0f, 0, 1, 0, 0.0f, 0.0f, 1, 0, 0 } },
+    { "gemma3", { ROPE_NEOX, ACT_GELU, 30.0f, 4096, 1, 0, 0.0f, 0.0f, 1, 0, 0 } },
     /* gemma2: + SWA 4096 default + final-logits softcap 30.0 fallback. */
     { "gemma2", { ROPE_NEOX, ACT_GELU, 30.0f, 4096, 1, 0, 0.0f, 0.0f, 1, 0, 0 } },
     /* gemma4 (E2B/E4B): QK-norms on every layer, attention scale 1.0 (no
      * 1/sqrt hd), plain RMSNorm on V, per-layer token embeddings (MatFormer),
      * per-layer output scales, learned rope_freqs on global layers. */
     { "gemma4", { ROPE_NEOX, ACT_GELU, 30.0f, 0, 1, 1, 1e-6f, 0.0f, 1, 1, 1, 1 } },
+    /* aliases for converted checkpoints that keep hf "tinyllama" name */
+    { "tinyllama", { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
+    { "granite",   { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
 };
 
 const TTraits *tt_traits_lookup(const char *arch) {
@@ -86,7 +91,7 @@ int tt_traits_resolve(const GGUFModel *m, TTraits *out) {
 }
 
 const char *tt_traits_supported(void) {
-    return "qwen2, llama (incl. llama3.x), qwen3, gemma, gemma2, gemma4";
+    return "qwen2, llama (incl. llama3.x), qwen3(+moe), gemma, gemma2/3, gemma4, tinyllama, granite, smollm2, mistral";
 }
 
 /* ---------------------------------------------------------------------
