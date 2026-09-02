@@ -140,6 +140,6 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 ### Known broken (open issues, not blocking gates)
 - ~~**Q8 KV prefill broken at ctx ≥ 1024**~~ **FIXED** in `2c23659`: `BlockQ8_0` 34-byte struct (FP16 scale at offset 0, int8[32] at offset 2) caused misaligned 4-byte loads in `k_prefill_flash_q8_0` → `CUDA_ERROR_MISALIGNED_ADDRESS (716)`. Replaced with safe byte-copy loops. Now: Q8 KV at ctx 1024 = **236.3 tok/s** decode (Q4 KV still slightly better at 250.3).
 - **RESUME.md stale** (still references C1-C4 batched-GEMM/PLE/Split-K/mmap which are all shipped). *Partially fixed in `c5de081` with current-state section.*
-- **Q4 KV m61 parity**: Q4 alone shows NaN in `verify.sh m61` logits — same kind of issue as Q8 but different mode. Hybrid dispatch (Fix1) routes short ctx to FP32 to keep m61 GREEN.
+- **Q4 KV m61 parity**: Q4 alone shows NaN in `verify.sh m61` logits — **not simple 4-byte misalignment** (byte-wise fix tried, doesn't help). Different class: graph-mode divergence from eager. Q4 KV works fine for `bench_llm` (250 tok/s @ ctx 1024) but graph path produces 1-token EOS for chat (quant error on chat distribution, or graph's fixed S=64 wrong for small ctx). Eager path works (7/8/4 tokens correct). Hybrid dispatch (Fix1) routes short ctx to FP32 to keep m61 GREEN.
 - **Future**: pad `BlockQ8_0` to 40 bytes (4-byte aligned qs) to re-enable fast batched prefill path → could push Q8 KV >250 tok/s at ctx 1024.
 
