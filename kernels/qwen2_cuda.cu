@@ -1099,6 +1099,97 @@ __global__ void k_fa2_q4_split(
     myacc[0] = acc[0]; myacc[1] = acc[1]; myacc[2] = acc[2]; myacc[3] = acc[3];
 }
 
+#define BC_FP32 32
+__global__ void k_fa2_fp32_split(
+    const float *__restrict__ q,
+    const float *__restrict__ Kc,
+    const float *__restrict__ Vc,
+    float *__restrict__ p_acc,
+    float *__restrict__ p_m,
+    float *__restrict__ p_l,
+    const int *__restrict__ d_pos,
+    int n_heads, int n_kv_heads, int head_dim,
+    float scale, int window, int S)
+{
+    const int pos = *d_pos;
+    const int s = blockIdx.x;
+    const int kv = blockIdx.y;
+    if (s >= S || kv >= n_kv_heads) return;
+    const int G = n_heads / n_kv_heads;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (warp >= G) return;
+    const int head = kv * G + warp;
+    const int elems = head_dim / 32;
+    const float *qh = q + (long)head * head_dim + lane * elems;
+    float qreg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (elems == 4) {
+        const float4 qv = *(const float4 *)qh;
+        qreg[0]=qv.x; qreg[1]=qv.y; qreg[2]=qv.z; qreg[3]=qv.w;
+    } else if (elems == 2) {
+        const float2 qv = *(const float2 *)qh;
+        qreg[0]=qv.x; qreg[1]=qv.y;
+    } else {
+#pragma unroll
+        for (int i=0;i<4;i++) if(i<elems) qreg[i]=qh[i];
+    }
+    int t_lo = (window > 0 && pos >= window) ? (pos - window + 1) : 0;
+    int nslots = pos - t_lo + 1;
+    int chunk = (nslots + S - 1) / S;
+    int begin = t_lo + s * chunk;
+    int end = min(pos + 1, t_lo + (s + 1) * chunk);
+    if (begin >= end) {
+        if (lane == 0) { p_m[(size_t)s * n_heads + head] = -1e30f; p_l[(size_t)s * n_heads + head] = 0.0f; }
+        float *myacc = p_acc + ((size_t)s * n_heads + head) * head_dim + lane * elems;
+#pragma unroll
+        for (int i=0;i<4;i++) if(i<elems) myacc[i]=0.0f;
+        return;
+    }
+    extern __shared__ float smem_fp32[];
+    float *sK = smem_fp32;
+    float *sV = smem_fp32 + BC_FP32 * head_dim;
+    float m_prev = -1e30f, l_prev = 0.0f;
+    float acc[4] = {0.0f,0.0f,0.0f,0.0f};
+    for (int t_tile = begin; t_tile < end; t_tile += BC_FP32) {
+        int t_tile_end = min(end, t_tile + BC_FP32);
+        int bc_active = t_tile_end - t_tile;
+        int total = bc_active * head_dim;
+        for (int i = tid; i < total; i += blockDim.x) {
+            int tok = i / head_dim;
+            int d = i % head_dim;
+            long g_idx = ((long)(t_tile + tok) * n_kv_heads + kv) * head_dim + d;
+            sK[tok * head_dim + d] = Kc[g_idx];
+            sV[tok * head_dim + d] = Vc[g_idx];
+        }
+        __syncthreads();
+        for (int t_idx = 0; t_idx < bc_active; t_idx++) {
+            const float *k_ptr = sK + t_idx * head_dim + lane * elems;
+            const float *v_ptr = sV + t_idx * head_dim + lane * elems;
+            float dot = 0.0f;
+            if (elems==4) dot = qreg[0]*k_ptr[0] + qreg[1]*k_ptr[1] + qreg[2]*k_ptr[2] + qreg[3]*k_ptr[3];
+            else if (elems==2) dot = qreg[0]*k_ptr[0] + qreg[1]*k_ptr[1];
+            else { for(int i=0;i<elems;i++) dot += qreg[i]*k_ptr[i]; }
+            float score = warp_sum(dot);
+            score = __shfl_sync(0xffffffff, score, 0) * scale;
+            float m_curr = fmaxf(m_prev, score);
+            float p = expf(score - m_curr);
+            float alpha = expf(m_prev - m_curr);
+            l_prev = l_prev * alpha + p;
+            if (elems==4) { acc[0]=acc[0]*alpha + p*v_ptr[0]; acc[1]=acc[1]*alpha + p*v_ptr[1]; acc[2]=acc[2]*alpha + p*v_ptr[2]; acc[3]=acc[3]*alpha + p*v_ptr[3]; }
+            else if (elems==2) { acc[0]=acc[0]*alpha + p*v_ptr[0]; acc[1]=acc[1]*alpha + p*v_ptr[1]; }
+            else { for(int i=0;i<elems;i++) acc[i]=acc[i]*alpha + p*v_ptr[i]; }
+            m_prev = m_curr;
+        }
+        __syncthreads();
+    }
+    if (lane == 0) { p_m[(size_t)s * n_heads + head] = m_prev; p_l[(size_t)s * n_heads + head] = l_prev; }
+    float *myacc = p_acc + ((size_t)s * n_heads + head) * head_dim + lane * elems;
+    if (elems==4) { myacc[0]=acc[0]; myacc[1]=acc[1]; myacc[2]=acc[2]; myacc[3]=acc[3]; }
+    else if (elems==2) { myacc[0]=acc[0]; myacc[1]=acc[1]; }
+    else { for(int i=0;i<elems;i++) myacc[i]=acc[i]; }
+}
+
 __global__ void k_fa2_combine(
     const float *__restrict__ p_acc,
     const float *__restrict__ p_m,
@@ -2668,10 +2759,25 @@ static int forward_layers(Qwen2Engine *e) {
                     e->d_split_pacc, e->d_split_pm, e->d_split_pl,
                     e->d_att, H_l, HDl, S);
             } else {
-                // FP32 split-K: tried S=32 and 64 at N>32768 vs 16 (16:2.16ms, 32:2.10ms, 64:2.09ms at 131k micro paged proxy)
-                // For FP32 at 32k, S=16 gave 0.66ms vs 32 gave 0.64ms, so 32 slightly better. Use 32 for now (64 similar).
-                // Bypass split when ctx<=64: serial faster at very small ctx (L2), so keep threshold 64 (was 128) after test.
-                if (ctx_l > 64) {
+                // FP32 FA2 tiled split-K: BC=32, smem 2*BC*HD*4, S=ceil(ctx/64) chunk=64 O(1) per slice
+                // Bypass tiled when ctx<=32 (L2, serial faster) or HD!=128 (fallback to serial/splitK)
+                if (ctx_l > 32 && HDl == 128) {
+                    int S;
+                    if (e->graph_ready || g_capturing) S = 32;
+                    else { S = (ctx_l + 31) / 32; if (S < 2) S = 2; if (S > 32) S = 32; if (S > e->d_split_S_max) S = e->d_split_S_max; }
+                    dim3 grid_split(S, KV_l);
+                    int threads_split = (H_l / KV_l) * 32;
+                    size_t smem_bytes = 2 * (size_t)BC_FP32 * HDl * sizeof(float);
+                    k_fa2_fp32_split<<<grid_split, threads_split, smem_bytes, e->stream>>>(
+                        e->d_q, Kl_f, Vl_f,
+                        e->d_split_pacc, e->d_split_pm, e->d_split_pl,
+                        e->d_pos,
+                        H_l, KV_l, HDl,
+                        scale_l, swa_l, S);
+                    k_fa2_combine<<<H_l, 32, 0, e->stream>>>(
+                        e->d_split_pacc, e->d_split_pm, e->d_split_pl,
+                        e->d_att, H_l, HDl, S);
+                } else if (ctx_l > 64) {
                     int S = ctx_l / 256;
                     if (S < 2) S = 2;
                     if (S > 32) S = 32;
