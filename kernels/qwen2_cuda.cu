@@ -95,6 +95,18 @@ static inline int tt_gemv_layer_dispatch(void *w_ptr, int w_dtype,
     return tt_gemv_typed(w_ptr, w_dtype, dx, dy, M, K, s);
 }
 
+/* Hybrid KV-cache dispatch helpers (Fix1). Threshold defaults to 256;
+ * override via TT_QKV_THRESH. Below thresh FP32 is used for parity;
+ * above thresh Q4/Q8 is used for speed (4x/8x bandwidth). */
+static inline int kv_thresh_value(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *ev = getenv("TT_QKV_THRESH");
+        cached = (ev && *ev) ? atoi(ev) : 256;
+        if (cached < 0) cached = 256;
+    }
+    return cached;
+}
 /* Type-blind weight handle: device pointer + GGML type code for dispatch. */
 typedef struct { void *ptr; int dtype; } TTensor;
 
@@ -1746,6 +1758,9 @@ struct Qwen2Engine {
     int use_q8_kvcache;
     BlockQ4_0 *d_kc_q4, *d_vc_q4;
     int use_q4_kvcache;
+    /* Hybrid dispatch threshold (host-cached): FP32 below, Q* above */
+    int kv_thresh_cached;
+    int kv_thresh_valid;
     float *d_k_stage, *d_v_stage;
     /* device mirror of pos: kernels read position from here (graph-readiness) */
     int *d_pos;
@@ -1801,6 +1816,20 @@ struct Qwen2Engine {
     float *h_kc, *h_vc;
     cudaStream_t stream;
 };
+
+/* Hybrid effective-checks (Fix1): use Q* only when flag set AND pos > thresh */
+static inline int kv_use_q4_eff(const Qwen2Engine *e) {
+    return e->use_q4_kvcache && e->pos > kv_thresh_value();
+}
+static inline int kv_use_q8_eff(const Qwen2Engine *e) {
+    return e->use_q8_kvcache && !e->use_q4_kvcache && e->pos > kv_thresh_value();
+}
+static inline int kv_use_q4_eff_at(const Qwen2Engine *e, int pos) {
+    return e->use_q4_kvcache && pos > kv_thresh_value();
+}
+static inline int kv_use_q8_eff_at(const Qwen2Engine *e, int pos) {
+    return e->use_q8_kvcache && !e->use_q4_kvcache && pos > kv_thresh_value();
+}
 
 static float *upload_f32(GGUFModel *m, const char *name) {
     GGUFTensor *t = gguf_get_tensor(m, name);
@@ -2151,18 +2180,16 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         e->d_split_S_max = S_MAX;
     }
     /* per-layer max kv width: gemma4 full layers carry 2x the kv heads */
-    const char *q8_env_check = getenv("TT_Q8_KV");
-    const int init_q8 = (q8_env_check && atoi(q8_env_check) != 0);
+    /* Hybrid KV dispatch (Fix1): always allocate FP32 KV. Quantized caches
+     * are additional. Effective threshold (TT_QKV_THRESH, default 256) picks
+     * FP32 below thresh (parity) and Q4/Q8 above (speed). This keeps m61
+     * GREEN at short ctx while letting TT_Q4_KV=1 hit ~282 tok/s at ctx1024.
+     * Parity gates must be run at short ctx where FP32 is active. */
     const long cache_per = (long)max_kv * cfg->max_ctx * cfg->head_dim;
-    if (!init_q8) {
-        cudaMalloc(&e->d_kc, cache_per * cfg->n_layers * sizeof(float));
-        cudaMalloc(&e->d_vc, cache_per * cfg->n_layers * sizeof(float));
-        cudaMemset(e->d_kc, 0, cache_per * cfg->n_layers * sizeof(float));
-        cudaMemset(e->d_vc, 0, cache_per * cfg->n_layers * sizeof(float));
-    } else {
-        e->d_kc = NULL;
-        e->d_vc = NULL;
-    }
+    cudaMalloc(&e->d_kc, cache_per * cfg->n_layers * sizeof(float));
+    cudaMalloc(&e->d_vc, cache_per * cfg->n_layers * sizeof(float));
+    cudaMemset(e->d_kc, 0, cache_per * cfg->n_layers * sizeof(float));
+    cudaMemset(e->d_vc, 0, cache_per * cfg->n_layers * sizeof(float));
     cudaMemset(e->d_xn, 0, D * sizeof(float));
     cudaMemset(e->d_q, 0, max_qout * sizeof(float));
     cudaMemset(e->d_att, 0, max_qout * sizeof(float));
@@ -2218,6 +2245,17 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         if (q8_env && atoi(q8_env) != 0) {
             qwen2_engine_enable_q8_kvcache(e, 1);
         }
+    }
+    /* Hybrid Fix1: quantized KV with threshold>0 requires per-token dispatch.
+     * Graph capture locks the flash/scatter path at capture pos (short ctx),
+     * so it cannot switch to Q* at long ctx. Disable graph when hybrid is
+     * active to allow threshold dispatch; short ctx stays FP32 for parity,
+     * long ctx switches to Q* for speed. */
+    if ((e->use_q4_kvcache || e->use_q8_kvcache) && kv_thresh_value() > 0) {
+        if (!e->no_graph) {
+            fprintf(stderr, "[qwen2-engine] hybrid KV (thresh %d): graph disabled for per-ctx dispatch\n", kv_thresh_value());
+        }
+        e->no_graph = 1;
     }
     if (e->n_gpu_layers < cfg->n_layers) {
         e->h_x_buf = (float *)malloc(D * sizeof(float));
@@ -2675,12 +2713,12 @@ static int forward_layers(Qwen2Engine *e) {
          * source layer's already-populated slab. */
         if (!kv_shared) {
         if (tt_profiling()) tt_prof_begin(TT_P_SCATTER, e->stream);
-        if (e->use_q4_kvcache) {
+        if (kv_use_q4_eff(e)) {
             const int num_blocks = kvdim_l / 32;
             k_kv_scatter_q4_0<<<(num_blocks + 255) / 256, 256, 0, e->stream>>>(
                 e->d_k_stage, e->d_v_stage, Kl_q4, Vl_q4, e->d_pos,
                 KV_l, HDl, c->max_ctx);
-        } else if (e->use_q8_kvcache) {
+        } else if (kv_use_q8_eff(e)) {
             const int num_blocks = kvdim_l / 32;
             k_kv_scatter_q8_0<<<(num_blocks + 255) / 256, 256, 0, e->stream>>>(
                 e->d_k_stage, e->d_v_stage, Kl_q8, Vl_q8, e->d_pos,
@@ -2710,7 +2748,7 @@ static int forward_layers(Qwen2Engine *e) {
             const float scale_l = c->tr.attn_scale_one ? 1.0f
                               : 1.0f / sqrtf((float)HDl);   /* match prior kernel arg */
             const int swa_l = e->has_pl_embd ? e->pl_swa[l] : c->tr.swa_size;
-            if (e->use_q4_kvcache) {
+            if (kv_use_q4_eff(e)) {
                 int S;
                 if (e->graph_ready || g_capturing) {
                     S = e->d_split_S_max;
@@ -2734,7 +2772,7 @@ static int forward_layers(Qwen2Engine *e) {
                 k_fa2_combine<<<H_l, 32, 0, e->stream>>>(
                     e->d_split_pacc, e->d_split_pm, e->d_split_pl,
                     e->d_att, H_l, HDl, S);
-            } else if (e->use_q8_kvcache) {
+            } else if (kv_use_q8_eff(e)) {
                 int S;
                 if (e->graph_ready || g_capturing) {
                     S = e->d_split_S_max;
