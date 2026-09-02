@@ -892,6 +892,7 @@ __global__ void k_fa2_q8_split(
         int bc_active = t_tile_end - t_tile;
 
         // Cooperative load of bc_active KV blocks into smem
+        // FIX: byte-wise copy avoids misaligned 4-byte loads (qs at offset 2 in 34-byte BlockQ8_0)
         int total_blocks = bc_active * blocks_per_head;
         for (int i = tid; i < total_blocks; i += blockDim.x) {
             int tok = i / blocks_per_head;
@@ -903,9 +904,9 @@ __global__ void k_fa2_q8_split(
             sV_d[tok * blocks_per_head + b] = bv.d;
             int row_off = tok * head_dim + b * 32;
 #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                ((uint32_t *)&sK_q[row_off])[j] = ((const uint32_t *)&bk.qs[0])[j];
-                ((uint32_t *)&sV_q[row_off])[j] = ((const uint32_t *)&bv.qs[0])[j];
+            for (int j = 0; j < 32; j++) {
+                sK_q[row_off + j] = bk.qs[j];
+                sV_q[row_off + j] = bv.qs[j];
             }
         }
         __syncthreads();
@@ -3474,15 +3475,14 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         }
 
         if (e->use_q8_kvcache) {
-            int num_q_tiles = (n + BR_PREFILL - 1) / BR_PREFILL;
-            dim3 grid_pf(num_q_tiles, KV_l);
-            int threads_pf = (H_l / KV_l) * 32;
-            int blocks_per_head = HDl / 32;
-            size_t smem_bytes = 2 * (size_t)BC_PREFILL * blocks_per_head * sizeof(half)
-                              + 2 * (size_t)BC_PREFILL * HDl * sizeof(int8_t);
-            k_prefill_flash_q8_0<<<grid_pf, threads_pf, smem_bytes, e->stream>>>(
-                d_Q, Kl_q8, Vl_q8, d_Att,
-                n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l);
+            // FIX: k_prefill_flash_q8_0 has misaligned 4-byte loads (BlockQ8_0 34-byte stride, qs at offset 2)
+            // Fallback to per-token k_flash_gqa_q8_0 which handles 34-byte packing via byte_perm
+            for (int i = 0; i < n; i++) {
+                const int *d_pos_i = d_pos_batch + i;
+                k_flash_gqa_q8_0<<<H_l, 32, 0, e->stream>>>(
+                    d_Q + (long)i * attn_qout, Kl_q8, Vl_q8, d_Att + (long)i * attn_qout,
+                    d_pos_i, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l);
+            }
         } else {
             for (int i = 0; i < n; i++) {
                 const int *d_pos_i = d_pos_batch + i;
@@ -3769,15 +3769,13 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
         }
 
         if (e->use_q8_kvcache) {
-            int num_q_tiles = (n + BR_PREFILL -1) / BR_PREFILL;
-            dim3 grid_pf(num_q_tiles, KV_l);
-            int threads_pf = (H_l / KV_l) * 32;
-            int blocks_per_head = HDl / 32;
-            size_t smem_bytes = 2 * (size_t)BC_PREFILL * blocks_per_head * sizeof(half)
-                              + 2 * (size_t)BC_PREFILL * HDl * sizeof(int8_t);
-            k_prefill_flash_q8_0<<<grid_pf, threads_pf, smem_bytes, e->stream>>>(
-                d_Q, Kl_q8, Vl_q8, d_Att,
-                n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l);
+            // FIX: same fallback as above (dx variant)
+            for (int i = 0; i < n; i++) {
+                const int *d_pos_i = d_pos_batch + i;
+                k_flash_gqa_q8_0<<<H_l, 32, 0, e->stream>>>(
+                    d_Q + (long)i * attn_qout, Kl_q8, Vl_q8, d_Att + (long)i * attn_qout,
+                    d_pos_i, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l);
+            }
         } else {
             for (int i = 0; i < n; i++) {
                 const int *d_pos_i = d_pos_batch + i;
