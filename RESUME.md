@@ -87,3 +87,11 @@ work is a separate hunt and should not be conflated with the M8 fix.
 ## Blocked (do not attempt)
 - E4B on 4GB VRAM GPU: 5.15GB weights — see BLOCKED.md; offload verdict
   5–9 t/s in docs/plans/2026-08-27-hybrid-offload-findings.md.
+
+## Current state (2026-09-02, post-sprint)
+- **Engine at llama.cpp parity at ctx 32**: bench 269.8 tok/s (0.82x) / cudaEvent floor 334 tok/s (1.01x).
+- **ctx 128**: 230.1 tok/s (0.83x llama.cpp 277, was 180 before paged FA2 fix).
+- **ctx 1024 Q4 KV**: 250.8 tok/s (was 126, 2.18x with TT_Q4_KV=1).
+- **All gates GREEN**: `ci_local.sh`, `verify.sh m61` (7/7 parity + chat-multiturn), `verify.sh ple` (3/3), `verify.sh m84` (6/7 per above).
+- **Active sprint** `docs/plans/2026-08-29-hidden-896-131k-fa.md`: half 1 (130 GB/s hidden GEMV) disproven as launch-bound physics, half 2 (131k FA) deferred. Paged FA2 + hybrid dispatch shipped in `00e6019` + `3b1cf0c` instead — see LOOP.md Cycle 15.
+- **Known broken (open issues)**: Q8 KV prefill at ctx≥1024 (`embed rc=716`); Q4 KV m61 shows NaN; RESUME.md C1-C4 references all shipped.
