@@ -137,6 +137,15 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - **Hidden 896 GEMV target (130 GB/s) disproven** as launch-bound physics (subagent `1e9e205f`): K=896 → nb=28 → only 28 blocks on 16-SM RTX 3050; null kernel launch overhead ~5 µs exceeds the 3.47 µs needed for 130 GB/s. Real fix is fused QKV or CUDA graph, not per-shape tuning. Plan updated `docs/plans/2026-08-29-hidden-896-131k-fa.md`.
 - **Verification**: `ci_local.sh`, `verify.sh m61` (now includes chat-multiturn with `build/chat_llm_gpu`), `verify.sh ple` all 100% GREEN.
 
+### Cycle 16: Batched Prefill FlashAttention
+- **Action**: Re-enabled `k_prefill_flash_q8_0` (Q8 path) and added `k_prefill_flash_fp32` (FP32 path) in `kernels/qwen2_cuda.cu`. The batched kernels were written but the dispatch used per-token `k_flash_gqa<<<H_l,32>>>` in an O(n) loop — making prefill attention O(n²) per layer × 24 layers. Commit `4e8842f` swaps to single-launch tiled FA (BR 8/BC 32 FP32, BR ?/BC 64 Q8, smem tiles for K/V). Q8 byte-copy fix from `2c23659` was already in place; the kernel just needed to be re-called.
+- **Performance (qwen2.5-0.5b Q4_0, pp512 434 tokens, 3-run median)**:
+  - FP32 batched: **870 tok/s** (was 267 per-token, **3.2x**)
+  - Q8 batched: **2901 tok/s** (was 290 per-token, **10.8x**)
+  - llama.cpp pp512: 10,056 tok/s (now 12x / 3.5x gap, was 35x for both)
+- **Remaining prefill gap**: GEMM throughput + per-token RoPE/scatter loops.
+- **Verification**: `ci_local.sh` GREEN, `verify.sh m61` PASS (chat-multiturn 3/3), `verify.sh ple` PASS (3/3).
+
 ### Known broken (open issues, not blocking gates)
 - ~~**Q8 KV prefill broken at ctx ≥ 1024**~~ **FIXED** in `2c23659`: `BlockQ8_0` 34-byte struct (FP16 scale at offset 0, int8[32] at offset 2) caused misaligned 4-byte loads in `k_prefill_flash_q8_0` → `CUDA_ERROR_MISALIGNED_ADDRESS (716)`. Replaced with safe byte-copy loops. Now: Q8 KV at ctx 1024 = **236.3 tok/s** decode (Q4 KV still slightly better at 250.3).
 - **RESUME.md stale** (still references C1-C4 batched-GEMM/PLE/Split-K/mmap which are all shipped). *Partially fixed in `c5de081` with current-state section.*
