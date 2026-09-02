@@ -343,6 +343,165 @@ __global__ void k_rope_gptj_ff(float *__restrict__ q, int n_heads, int head_dim,
 }
 
 
+/* Batched RoPE: one launch for all n tokens. Grid: ((HD/2+63)/64, n_heads, n). */
+__global__ void k_rope_batched(float *__restrict__ q, int n_heads, int head_dim,
+                               const int *__restrict__ d_pos_batch, float base,
+                               int n, int stride) {
+    const int tok = blockIdx.z;
+    if (tok >= n) return;
+    const int pos = d_pos_batch[tok];
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    const int h = blockIdx.y;
+    if (h >= n_heads || i >= head_dim / 2) return;
+    float *row = q + (long)tok * stride + (long)h * head_dim;
+    const float freq = powf(base, -2.0f * (float)i / (float)head_dim);
+    const float ang = (float)pos * freq;
+    const float c = cosf(ang), s = sinf(ang);
+    const float v0 = row[i], v1 = row[i + head_dim / 2];
+    row[i] = v0 * c - v1 * s;
+    row[i + head_dim / 2] = v0 * s + v1 * c;
+}
+__global__ void k_rope_ff_batched(float *__restrict__ q, int n_heads, int head_dim,
+                                  const int *__restrict__ d_pos_batch, float base,
+                                  const float *__restrict__ ff, int n, int stride) {
+    const int tok = blockIdx.z;
+    if (tok >= n) return;
+    const int pos = d_pos_batch[tok];
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    const int h = blockIdx.y;
+    if (h >= n_heads || i >= head_dim / 2) return;
+    float *row = q + (long)tok * stride + (long)h * head_dim;
+    const float freq = powf(base, -2.0f * (float)i / (float)head_dim);
+    const float div = ff ? ff[i] : 1.0f;
+    const float ang = (float)pos * freq / div;
+    const float c = cosf(ang), s = sinf(ang);
+    const float v0 = row[i], v1 = row[i + head_dim / 2];
+    row[i] = v0 * c - v1 * s;
+    row[i + head_dim / 2] = v0 * s + v1 * c;
+}
+__global__ void k_rope_gptj_batched(float *__restrict__ q, int n_heads, int head_dim,
+                                    const int *__restrict__ d_pos_batch, float base,
+                                    int n, int stride) {
+    const int tok = blockIdx.z;
+    if (tok >= n) return;
+    const int pos = d_pos_batch[tok];
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    const int h = blockIdx.y;
+    if (h >= n_heads || i >= head_dim / 2) return;
+    float *row = q + (long)tok * stride + (long)h * head_dim;
+    const float freq = powf(base, -2.0f * (float)i / (float)head_dim);
+    const float ang = (float)pos * freq;
+    const float c = cosf(ang), s = sinf(ang);
+    const int i0 = 2*i, i1 = 2*i+1;
+    const float v0 = row[i0], v1 = row[i1];
+    row[i0] = v0 * c - v1 * s;
+    row[i1] = v0 * s + v1 * c;
+}
+__global__ void k_rope_gptj_ff_batched(float *__restrict__ q, int n_heads, int head_dim,
+                                       const int *__restrict__ d_pos_batch, float base,
+                                       const float *__restrict__ ff, int n, int stride) {
+    const int tok = blockIdx.z;
+    if (tok >= n) return;
+    const int pos = d_pos_batch[tok];
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    const int h = blockIdx.y;
+    if (h >= n_heads || i >= head_dim / 2) return;
+    float *row = q + (long)tok * stride + (long)h * head_dim;
+    const float freq = powf(base, -2.0f * (float)i / (float)head_dim);
+    const float div = ff ? ff[i] : 1.0f;
+    const float ang = (float)pos * freq / div;
+    const float c = cosf(ang), s = sinf(ang);
+    const int i0 = 2*i, i1 = 2*i+1;
+    const float v0 = row[i0], v1 = row[i1];
+    row[i0] = v0 * c - v1 * s;
+    row[i1] = v0 * s + v1 * c;
+}
+/* Batched KV scatter kernels */
+__global__ void k_kv_scatter_batched(const float *__restrict__ kst, const float *__restrict__ vst,
+                                     float *__restrict__ Kc, float *__restrict__ Vc,
+                                     const int *__restrict__ d_pos_batch,
+                                     int n_kv_heads, int head_dim, int max_ctx, int n, int kvdim) {
+    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    const long total = (long)n * kvdim;
+    if (idx >= total) return;
+    const int tok = idx / kvdim;
+    const int elem = idx % kvdim;
+    const int slot = d_pos_batch[tok] % max_ctx;
+    Kc[(long)slot * kvdim + elem] = kst[(long)tok * kvdim + elem];
+    Vc[(long)slot * kvdim + elem] = vst[(long)tok * kvdim + elem];
+}
+__global__ void k_kv_scatter_q8_0_batched(const float *__restrict__ kst, const float *__restrict__ vst,
+                                          BlockQ8_0 *__restrict__ Kc, BlockQ8_0 *__restrict__ Vc,
+                                          const int *__restrict__ d_pos_batch,
+                                          int n_kv_heads, int head_dim, int max_ctx, int n) {
+    const int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int blocks_per_slot = (n_kv_heads * head_dim) / 32;
+    const long total_blocks = (long)n * blocks_per_slot;
+    if (block_idx >= total_blocks) return;
+    const int tok = block_idx / blocks_per_slot;
+    const int blk = block_idx % blocks_per_slot;
+    const int slot = d_pos_batch[tok] % max_ctx;
+    const int src_offset = tok * n_kv_heads * head_dim + blk * 32;
+    float k_vals[32], v_vals[32];
+    float max_k = 0.0f, max_v = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) { k_vals[i]=kst[src_offset+i]; v_vals[i]=vst[src_offset+i]; max_k=fmaxf(max_k,fabsf(k_vals[i])); max_v=fmaxf(max_v,fabsf(v_vals[i])); }
+    const float scale_k = (max_k > 0.0f) ? (max_k / 127.0f) : 1.0f;
+    const float inv_k = (max_k > 0.0f) ? (127.0f / max_k) : 0.0f;
+    const float scale_v = (max_v > 0.0f) ? (max_v / 127.0f) : 1.0f;
+    const float inv_v = (max_v > 0.0f) ? (127.0f / max_v) : 0.0f;
+    BlockQ8_0 *k_dest = Kc + (long)slot * blocks_per_slot + blk;
+    BlockQ8_0 *v_dest = Vc + (long)slot * blocks_per_slot + blk;
+    k_dest->d = __float2half(scale_k);
+    v_dest->d = __float2half(scale_v);
+    #pragma unroll
+    for (int i = 0; i < 32; i++) { k_dest->qs[i]=(int8_t)__float2int_rn(k_vals[i]*inv_k); v_dest->qs[i]=(int8_t)__float2int_rn(v_vals[i]*inv_v); }
+}
+/* Batched helpers for prefill */
+__global__ void k_rmsnorm_batched(const float *__restrict__ x, const float *__restrict__ g,
+                                  float *__restrict__ y, int dim, float eps, float woff, int n) {
+    const int row = blockIdx.x;
+    if (row >= n) return;
+    extern __shared__ float s[];
+    const int tid = threadIdx.x;
+    const float *xr = x + (long)row * dim;
+    float *yr = y + (long)row * dim;
+    float ss = 0.0f;
+    for (int i = tid; i < dim; i += blockDim.x) ss += xr[i]*xr[i];
+    ss = warp_sum(ss);
+    if ((tid & 31)==0) s[tid>>5]=ss;
+    __syncthreads();
+    if (tid==0){ float t=0; for(int w=0;w<(blockDim.x+31)/32;w++) t+=s[w]; s[0]=rsqrtf(t/(float)dim+eps); }
+    __syncthreads();
+    const float inv=s[0];
+    if (woff==0.0f){ for(int i=tid;i<dim;i+=blockDim.x) yr[i]=xr[i]*inv*g[i]; }
+    else { for(int i=tid;i<dim;i+=blockDim.x) yr[i]=xr[i]*inv*(woff+g[i]); }
+}
+__global__ void k_add_bias_batched(float *__restrict__ dst, const float *__restrict__ bias, int row_dim, int n) {
+    const int idx = threadIdx.x + blockIdx.x*blockDim.x;
+    const long total=(long)n*row_dim;
+    if(idx>=total) return;
+    dst[idx]+=bias[idx%row_dim];
+}
+__global__ void k_qk_norm_rms_batched(float *__restrict__ x, const float *__restrict__ g,
+                                      int n_heads, int head_dim, float eps, int n, int stride) {
+    const int tok = blockIdx.x / n_heads;
+    const int h = blockIdx.x % n_heads;
+    if (tok>=n) return;
+    extern __shared__ float s[];
+    const int tid=threadIdx.x;
+    float *row = x + (long)tok*stride + (long)h*head_dim;
+    float ss=0;
+    for(int i=tid;i<head_dim;i+=blockDim.x) ss+=row[i]*row[i];
+    ss=warp_sum(ss);
+    if((tid&31)==0) s[tid>>5]=ss;
+    __syncthreads();
+    if(tid==0){ float t=0; for(int w=0;w<(blockDim.x+31)/32;w++) t+=s[w]; s[0]=rsqrtf(t/(float)head_dim+eps); }
+    __syncthreads();
+    const float inv=s[0];
+    for(int i=tid;i<head_dim;i+=blockDim.x) row[i]=row[i]*inv*g[i];
+}
+
 /* M7 task 3: per-head RMSNorm over q/k rows pre-rope (qwen3 trait).
  * One block per head; mean-of-squares over head_dim only.
  * y[h*hd+i] = x[h*hd+i] * rsqrt(mean(x^2)+eps) * gamma[i]. */
@@ -3491,11 +3650,8 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         const int attn_qout = H_l * HDl;
         const int kvdim_l = KV_l * HDl;
 
-        /* 1. RMSNorm before QKV */
-        for (int i = 0; i < n; i++) {
-            k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
-                d_X + (long)i * dim, w->attn_norm, d_Xn + (long)i * dim, dim, c->rms_eps, c->tr.norm_offset);
-        }
+        /* 1. RMSNorm before QKV - batched */
+        k_rmsnorm_batched<<<n, 256, 256*sizeof(float), e->stream>>>(d_X, w->attn_norm, d_Xn, dim, c->rms_eps, c->tr.norm_offset, n);
 
         /* 2. Batched QKV GEMM */
         if (w->q.dtype == TTQ_Q4_0) {
@@ -3514,26 +3670,24 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
             }
         }
 
-        /* Biases & QK norm */
+        /* Biases & QK norm - batched */
         if (w->q_bias) {
-            for (int i = 0; i < n; i++)
-                k_add<<<(attn_qout + 255) / 256, 256, 0, e->stream>>>(d_Q + (long)i * attn_qout, w->q_bias, attn_qout);
+            k_add_bias_batched<<<(n*attn_qout+255)/256,256,0,e->stream>>>(d_Q, w->q_bias, attn_qout, n);
         }
         if (!kv_shared && w->k_bias) {
-            for (int i = 0; i < n; i++)
-                k_add<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(d_K + (long)i * kvdim_l, w->k_bias, kvdim_l);
+            k_add_bias_batched<<<(n*kvdim_l+255)/256,256,0,e->stream>>>(d_K, w->k_bias, kvdim_l, n);
         }
         if (!kv_shared && w->v_bias) {
-            for (int i = 0; i < n; i++)
-                k_add<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(d_V + (long)i * kvdim_l, w->v_bias, kvdim_l);
+            k_add_bias_batched<<<(n*kvdim_l+255)/256,256,0,e->stream>>>(d_V, w->v_bias, kvdim_l, n);
         }
 
         if (c->tr.qk_norm_rms) {
             const int qkthreads = HDl < 256 ? HDl : 256;
-            for (int i = 0; i < n; i++) {
-                k_qk_norm_rms<<<H_l, qkthreads, qkthreads * sizeof(float), e->stream>>>(d_Q + (long)i * attn_qout, w->q_norm, H_l, HDl, c->tr.qk_norm_eps);
+            {
+                size_t smem = qkthreads*sizeof(float);
+                k_qk_norm_rms_batched<<<n*H_l, qkthreads, smem, e->stream>>>(d_Q, w->q_norm, H_l, HDl, c->tr.qk_norm_eps, n, attn_qout);
                 if (!kv_shared)
-                    k_qk_norm_rms<<<KV_l, qkthreads, qkthreads * sizeof(float), e->stream>>>(d_K + (long)i * kvdim_l, w->k_norm, KV_l, HDl, c->tr.qk_norm_eps);
+                    k_qk_norm_rms_batched<<<n*KV_l, qkthreads, smem, e->stream>>>(d_K, w->k_norm, KV_l, HDl, c->tr.qk_norm_eps, n, kvdim_l);
             }
         }
 
@@ -3546,40 +3700,41 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         const float scale_l = c->tr.attn_scale_one ? 1.0f : 1.0f / sqrtf((float)HDl);
         const int swa_l = e->has_pl_embd ? e->pl_swa[l] : c->tr.swa_size;
 
-        dim3 g_q((HDl / 2 + 63) / 64, H_l, 1), b_rope(64, 1, 1);
-        dim3 g_k((HDl / 2 + 63) / 64, KV_l, 1);
-
-        for (int i = 0; i < n; i++) {
-            const int *d_pos_i = d_pos_batch + i;
-
+        // Batched RoPE + scatter: single launch per layer instead of n launches
+        {
             static int no_rope = -1;
             if (no_rope < 0) no_rope = getenv("TT_NO_ROPE") ? 1 : 0;
             if (!no_rope) {
-                void (*rope_ff_fn)(float *, int, int, const int *, float, const float *) =
-                    (c->tr.rope == ROPE_GPTJ) ? k_rope_gptj_ff : k_rope_ff;
-                if (ff_l)
-                    rope_ff_fn<<<g_q, b_rope, 0, e->stream>>>(d_Q + (long)i * attn_qout, H_l, HDl, d_pos_i, base_l, ff_l);
-                else
-                    rope_fn<<<g_q, b_rope, 0, e->stream>>>(d_Q + (long)i * attn_qout, H_l, HDl, d_pos_i, base_l);
-
-                if (!kv_shared) {
-                    if (ff_l)
-                        rope_ff_fn<<<g_k, b_rope, 0, e->stream>>>(d_K + (long)i * kvdim_l, KV_l, HDl, d_pos_i, base_l, ff_l);
-                    else
-                        rope_fn<<<g_k, b_rope, 0, e->stream>>>(d_K + (long)i * kvdim_l, KV_l, HDl, d_pos_i, base_l);
+                dim3 g_qb((HDl / 2 + 63) / 64, H_l, n), b_rope(64, 1, 1);
+                dim3 g_kb((HDl / 2 + 63) / 64, KV_l, n);
+                const int is_gptj = (c->tr.rope == ROPE_GPTJ);
+                if (is_gptj) {
+                    if (ff_l) {
+                        k_rope_gptj_ff_batched<<<g_qb, b_rope, 0, e->stream>>>(d_Q, H_l, HDl, d_pos_batch, base_l, ff_l, n, attn_qout);
+                        if (!kv_shared) k_rope_gptj_ff_batched<<<g_kb, b_rope, 0, e->stream>>>(d_K, KV_l, HDl, d_pos_batch, base_l, ff_l, n, kvdim_l);
+                    } else {
+                        k_rope_gptj_batched<<<g_qb, b_rope, 0, e->stream>>>(d_Q, H_l, HDl, d_pos_batch, base_l, n, attn_qout);
+                        if (!kv_shared) k_rope_gptj_batched<<<g_kb, b_rope, 0, e->stream>>>(d_K, KV_l, HDl, d_pos_batch, base_l, n, kvdim_l);
+                    }
+                } else {
+                    if (ff_l) {
+                        k_rope_ff_batched<<<g_qb, b_rope, 0, e->stream>>>(d_Q, H_l, HDl, d_pos_batch, base_l, ff_l, n, attn_qout);
+                        if (!kv_shared) k_rope_ff_batched<<<g_kb, b_rope, 0, e->stream>>>(d_K, KV_l, HDl, d_pos_batch, base_l, ff_l, n, kvdim_l);
+                    } else {
+                        k_rope_batched<<<g_qb, b_rope, 0, e->stream>>>(d_Q, H_l, HDl, d_pos_batch, base_l, n, attn_qout);
+                        if (!kv_shared) k_rope_batched<<<g_kb, b_rope, 0, e->stream>>>(d_K, KV_l, HDl, d_pos_batch, base_l, n, kvdim_l);
+                    }
                 }
             }
-
             if (!kv_shared) {
                 if (e->use_q8_kvcache) {
-                    const int num_blocks = kvdim_l / 32;
-                    k_kv_scatter_q8_0<<<(num_blocks + 255) / 256, 256, 0, e->stream>>>(
-                        d_K + (long)i * kvdim_l, d_V + (long)i * kvdim_l, Kl_q8, Vl_q8, d_pos_i,
-                        KV_l, HDl, c->max_ctx);
+                    const int blocks_per_slot = kvdim_l / 32;
+                    const long total_blocks = (long)n * blocks_per_slot;
+                    k_kv_scatter_q8_0_batched<<<(total_blocks + 255)/256, 256, 0, e->stream>>>(
+                        d_K, d_V, Kl_q8, Vl_q8, d_pos_batch, KV_l, HDl, c->max_ctx, n);
                 } else {
-                    k_kv_scatter<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(
-                        d_K + (long)i * kvdim_l, d_V + (long)i * kvdim_l, Kl_f, Vl_f, d_pos_i,
-                        KV_l, HDl, c->max_ctx);
+                    k_kv_scatter_batched<<<(n*kvdim_l+255)/256, 256, 0, e->stream>>>(
+                        d_K, d_V, Kl_f, Vl_f, d_pos_batch, KV_l, HDl, c->max_ctx, n, kvdim_l);
                 }
             }
         }
@@ -3614,20 +3769,14 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         }
 
         if (w->post_attn_norm) {
-            for (int i = 0; i < n; i++) {
-                k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
-                    d_Xn + (long)i * dim, w->post_attn_norm, d_Xn + (long)i * dim, dim, c->rms_eps, c->tr.norm_offset);
-            }
+            k_rmsnorm_batched<<<n,256,256*sizeof(float),e->stream>>>(d_Xn, w->post_attn_norm, d_Xn, dim, c->rms_eps, c->tr.norm_offset, n);
         }
 
         /* Residual add: X += Xn */
         k_add<<<(n * dim + 255) / 256, 256, 0, e->stream>>>(d_X, d_Xn, n * dim);
 
-        /* 5. FFN RMSNorm */
-        for (int i = 0; i < n; i++) {
-            k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
-                d_X + (long)i * dim, w->ffn_norm, d_Xn + (long)i * dim, dim, c->rms_eps, c->tr.norm_offset);
-        }
+        /* 5. FFN RMSNorm - batched */
+        k_rmsnorm_batched<<<n,256,256*sizeof(float),e->stream>>>(d_X, w->ffn_norm, d_Xn, dim, c->rms_eps, c->tr.norm_offset, n);
 
         /* 6. Gate & Up GEMM projections */
         const int act_gelu = (c->tr.act == ACT_GELU) ? 1 : 0;
@@ -3654,10 +3803,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         }
 
         if (w->post_ffn_norm) {
-            for (int i = 0; i < n; i++) {
-                k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
-                    d_Xn + (long)i * dim, w->post_ffn_norm, d_Xn + (long)i * dim, dim, c->rms_eps, c->tr.norm_offset);
-            }
+            k_rmsnorm_batched<<<n,256,256*sizeof(float),e->stream>>>(d_Xn, w->post_ffn_norm, d_Xn, dim, c->rms_eps, c->tr.norm_offset, n);
         }
 
         /* Residual add: X += Xn */
@@ -3789,11 +3935,8 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
         const int attn_qout = H_l * HDl;
         const int kvdim_l = KV_l * HDl;
 
-        /* 1. RMSNorm before QKV */
-        for (int i = 0; i < n; i++) {
-            k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
-                d_X + (long)i * dim, w->attn_norm, d_Xn + (long)i * dim, dim, c->rms_eps, c->tr.norm_offset);
-        }
+        /* 1. RMSNorm before QKV - batched */
+        k_rmsnorm_batched<<<n, 256, 256*sizeof(float), e->stream>>>(d_X, w->attn_norm, d_Xn, dim, c->rms_eps, c->tr.norm_offset, n);
 
         /* 2. Batched QKV GEMM */
         if (w->q.dtype == TTQ_Q4_0) {
@@ -3812,25 +3955,24 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
             }
         }
 
+        /* Biases & QK norm - batched */
         if (w->q_bias) {
-            for (int i = 0; i < n; i++)
-                k_add<<<(attn_qout + 255) / 256, 256, 0, e->stream>>>(d_Q + (long)i * attn_qout, w->q_bias, attn_qout);
+            k_add_bias_batched<<<(n*attn_qout+255)/256,256,0,e->stream>>>(d_Q, w->q_bias, attn_qout, n);
         }
         if (!kv_shared && w->k_bias) {
-            for (int i = 0; i < n; i++)
-                k_add<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(d_K + (long)i * kvdim_l, w->k_bias, kvdim_l);
+            k_add_bias_batched<<<(n*kvdim_l+255)/256,256,0,e->stream>>>(d_K, w->k_bias, kvdim_l, n);
         }
         if (!kv_shared && w->v_bias) {
-            for (int i = 0; i < n; i++)
-                k_add<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(d_V + (long)i * kvdim_l, w->v_bias, kvdim_l);
+            k_add_bias_batched<<<(n*kvdim_l+255)/256,256,0,e->stream>>>(d_V, w->v_bias, kvdim_l, n);
         }
 
         if (c->tr.qk_norm_rms) {
             const int qkthreads = HDl < 256 ? HDl : 256;
-            for (int i = 0; i < n; i++) {
-                k_qk_norm_rms<<<H_l, qkthreads, qkthreads * sizeof(float), e->stream>>>(d_Q + (long)i * attn_qout, w->q_norm, H_l, HDl, c->tr.qk_norm_eps);
+            {
+                size_t smem = qkthreads*sizeof(float);
+                k_qk_norm_rms_batched<<<n*H_l, qkthreads, smem, e->stream>>>(d_Q, w->q_norm, H_l, HDl, c->tr.qk_norm_eps, n, attn_qout);
                 if (!kv_shared)
-                    k_qk_norm_rms<<<KV_l, qkthreads, qkthreads * sizeof(float), e->stream>>>(d_K + (long)i * kvdim_l, w->k_norm, KV_l, HDl, c->tr.qk_norm_eps);
+                    k_qk_norm_rms_batched<<<n*KV_l, qkthreads, smem, e->stream>>>(d_K, w->k_norm, KV_l, HDl, c->tr.qk_norm_eps, n, kvdim_l);
             }
         }
 
@@ -3842,40 +3984,41 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
         const float scale_l = c->tr.attn_scale_one ? 1.0f : 1.0f / sqrtf((float)HDl);
         const int swa_l = e->has_pl_embd ? e->pl_swa[l] : c->tr.swa_size;
 
-        dim3 g_q((HDl / 2 + 63) / 64, H_l, 1), b_rope(64, 1, 1);
-        dim3 g_k((HDl / 2 + 63) / 64, KV_l, 1);
-
-        for (int i = 0; i < n; i++) {
-            const int *d_pos_i = d_pos_batch + i;
-
+        // Batched RoPE + scatter: single launch per layer instead of n launches
+        {
             static int no_rope = -1;
             if (no_rope < 0) no_rope = getenv("TT_NO_ROPE") ? 1 : 0;
             if (!no_rope) {
-                void (*rope_ff_fn)(float *, int, int, const int *, float, const float *) =
-                    (c->tr.rope == ROPE_GPTJ) ? k_rope_gptj_ff : k_rope_ff;
-                if (ff_l)
-                    rope_ff_fn<<<g_q, b_rope, 0, e->stream>>>(d_Q + (long)i * attn_qout, H_l, HDl, d_pos_i, base_l, ff_l);
-                else
-                    rope_fn<<<g_q, b_rope, 0, e->stream>>>(d_Q + (long)i * attn_qout, H_l, HDl, d_pos_i, base_l);
-
-                if (!kv_shared) {
-                    if (ff_l)
-                        rope_ff_fn<<<g_k, b_rope, 0, e->stream>>>(d_K + (long)i * kvdim_l, KV_l, HDl, d_pos_i, base_l, ff_l);
-                    else
-                        rope_fn<<<g_k, b_rope, 0, e->stream>>>(d_K + (long)i * kvdim_l, KV_l, HDl, d_pos_i, base_l);
+                dim3 g_qb((HDl / 2 + 63) / 64, H_l, n), b_rope(64, 1, 1);
+                dim3 g_kb((HDl / 2 + 63) / 64, KV_l, n);
+                const int is_gptj = (c->tr.rope == ROPE_GPTJ);
+                if (is_gptj) {
+                    if (ff_l) {
+                        k_rope_gptj_ff_batched<<<g_qb, b_rope, 0, e->stream>>>(d_Q, H_l, HDl, d_pos_batch, base_l, ff_l, n, attn_qout);
+                        if (!kv_shared) k_rope_gptj_ff_batched<<<g_kb, b_rope, 0, e->stream>>>(d_K, KV_l, HDl, d_pos_batch, base_l, ff_l, n, kvdim_l);
+                    } else {
+                        k_rope_gptj_batched<<<g_qb, b_rope, 0, e->stream>>>(d_Q, H_l, HDl, d_pos_batch, base_l, n, attn_qout);
+                        if (!kv_shared) k_rope_gptj_batched<<<g_kb, b_rope, 0, e->stream>>>(d_K, KV_l, HDl, d_pos_batch, base_l, n, kvdim_l);
+                    }
+                } else {
+                    if (ff_l) {
+                        k_rope_ff_batched<<<g_qb, b_rope, 0, e->stream>>>(d_Q, H_l, HDl, d_pos_batch, base_l, ff_l, n, attn_qout);
+                        if (!kv_shared) k_rope_ff_batched<<<g_kb, b_rope, 0, e->stream>>>(d_K, KV_l, HDl, d_pos_batch, base_l, ff_l, n, kvdim_l);
+                    } else {
+                        k_rope_batched<<<g_qb, b_rope, 0, e->stream>>>(d_Q, H_l, HDl, d_pos_batch, base_l, n, attn_qout);
+                        if (!kv_shared) k_rope_batched<<<g_kb, b_rope, 0, e->stream>>>(d_K, KV_l, HDl, d_pos_batch, base_l, n, kvdim_l);
+                    }
                 }
             }
-
             if (!kv_shared) {
                 if (e->use_q8_kvcache) {
-                    const int num_blocks = kvdim_l / 32;
-                    k_kv_scatter_q8_0<<<(num_blocks + 255) / 256, 256, 0, e->stream>>>(
-                        d_K + (long)i * kvdim_l, d_V + (long)i * kvdim_l, Kl_q8, Vl_q8, d_pos_i,
-                        KV_l, HDl, c->max_ctx);
+                    const int blocks_per_slot = kvdim_l / 32;
+                    const long total_blocks = (long)n * blocks_per_slot;
+                    k_kv_scatter_q8_0_batched<<<(total_blocks + 255)/256, 256, 0, e->stream>>>(
+                        d_K, d_V, Kl_q8, Vl_q8, d_pos_batch, KV_l, HDl, c->max_ctx, n);
                 } else {
-                    k_kv_scatter<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(
-                        d_K + (long)i * kvdim_l, d_V + (long)i * kvdim_l, Kl_f, Vl_f, d_pos_i,
-                        KV_l, HDl, c->max_ctx);
+                    k_kv_scatter_batched<<<(n*kvdim_l+255)/256, 256, 0, e->stream>>>(
+                        d_K, d_V, Kl_f, Vl_f, d_pos_batch, KV_l, HDl, c->max_ctx, n, kvdim_l);
                 }
             }
         }
@@ -3910,20 +4053,14 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
         }
 
         if (w->post_attn_norm) {
-            for (int i = 0; i < n; i++) {
-                k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
-                    d_Xn + (long)i * dim, w->post_attn_norm, d_Xn + (long)i * dim, dim, c->rms_eps, c->tr.norm_offset);
-            }
+            k_rmsnorm_batched<<<n,256,256*sizeof(float),e->stream>>>(d_Xn, w->post_attn_norm, d_Xn, dim, c->rms_eps, c->tr.norm_offset, n);
         }
 
         /* Residual add: X += Xn */
         k_add<<<(n * dim + 255) / 256, 256, 0, e->stream>>>(d_X, d_Xn, n * dim);
 
-        /* 5. FFN RMSNorm */
-        for (int i = 0; i < n; i++) {
-            k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
-                d_X + (long)i * dim, w->ffn_norm, d_Xn + (long)i * dim, dim, c->rms_eps, c->tr.norm_offset);
-        }
+        /* 5. FFN RMSNorm - batched */
+        k_rmsnorm_batched<<<n,256,256*sizeof(float),e->stream>>>(d_X, w->ffn_norm, d_Xn, dim, c->rms_eps, c->tr.norm_offset, n);
 
         /* 6. Gate & Up GEMM projections */
         const int act_gelu = (c->tr.act == ACT_GELU) ? 1 : 0;
@@ -3950,10 +4087,7 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
         }
 
         if (w->post_ffn_norm) {
-            for (int i = 0; i < n; i++) {
-                k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
-                    d_Xn + (long)i * dim, w->post_ffn_norm, d_Xn + (long)i * dim, dim, c->rms_eps, c->tr.norm_offset);
-            }
+            k_rmsnorm_batched<<<n,256,256*sizeof(float),e->stream>>>(d_Xn, w->post_ffn_norm, d_Xn, dim, c->rms_eps, c->tr.norm_offset, n);
         }
 
         /* Residual add: X += Xn */
