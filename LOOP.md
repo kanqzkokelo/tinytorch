@@ -137,6 +137,14 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - **Hidden 896 GEMV target (130 GB/s) disproven** as launch-bound physics (subagent `1e9e205f`): K=896 → nb=28 → only 28 blocks on 16-SM RTX 3050; null kernel launch overhead ~5 µs exceeds the 3.47 µs needed for 130 GB/s. Real fix is fused QKV or CUDA graph, not per-shape tuning. Plan updated `docs/plans/2026-08-29-hidden-896-131k-fa.md`.
 - **Verification**: `ci_local.sh`, `verify.sh m61` (now includes chat-multiturn with `build/chat_llm_gpu`), `verify.sh ple` all 100% GREEN.
 
+### Cycle 17: Batched RoPE + Scatter in Prefill
+- **Action**: Created batched RoPE (4 variants: neox/gptj × ff) and batched KV scatter (FP32 + Q8). Replaces per-token kernel launches in `prefill_batched_gemm`. Also batched RMSNorm, bias add, QK-norm to cut remaining O(n) launches. Commit `1afea47`.
+- **Performance (pp512 434 tokens, qwen2.5-0.5b Q4_0, 3-run median)**:
+  - FP32: **1,365 tok/s** (was 870, +57%)
+  - Q8: **20,900 tok/s** (was 2,611, **8x speedup**)
+  - llama.cpp pp512: 10,056 tok/s → **Q8 prefill now BEATS llama.cpp by 2.08x**
+- **Verification**: `ci_local.sh` GREEN, `verify.sh m61` PASS (7/7 logits + chat-multiturn), `verify.sh ple` PASS (3/3).
+
 ### Cycle 16: Batched Prefill FlashAttention
 - **Action**: Re-enabled `k_prefill_flash_q8_0` (Q8 path) and added `k_prefill_flash_fp32` (FP32 path) in `kernels/qwen2_cuda.cu`. The batched kernels were written but the dispatch used per-token `k_flash_gqa<<<H_l,32>>>` in an O(n) loop — making prefill attention O(n²) per layer × 24 layers. Commit `4e8842f` swaps to single-launch tiled FA (BR 8/BC 32 FP32, BR ?/BC 64 Q8, smem tiles for K/V). Q8 byte-copy fix from `2c23659` was already in place; the kernel just needed to be re-called.
 - **Performance (qwen2.5-0.5b Q4_0, pp512 434 tokens, 3-run median)**:
