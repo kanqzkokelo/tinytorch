@@ -4429,6 +4429,19 @@ int qwen2_debug_copy_logits(Qwen2Engine *e, float *host, int n) {
     return ncpy;
 }
 
+/* Fix2: rollback helper for verify_speculative pos-drift bug.
+ * Truncates pos to target_pos and updates device mirror. Rejected KV
+ * slots beyond target remain but are not read (attention window is
+ * 0..pos). Clears pending_tok if it would be dangling. */
+extern "C" void qwen2_engine_rollback(Qwen2Engine *e, int target_pos) {
+    if (!e) return;
+    if (target_pos < 0 || target_pos > e->cfg.max_ctx) return;
+    if (target_pos > e->pos) return; /* only truncate */
+    e->pos = target_pos;
+    cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
+    e->pending_tok = -1;
+}
+
 /* Public single-token "step + logits" used by tests and the spec-verify
  * golden path. Eager-only: it does NOT participate in the graph-replay
  * path and avoids the sampled-tok/D2H sync of qwen2_engine_next(). The

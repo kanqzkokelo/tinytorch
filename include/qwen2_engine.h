@@ -70,6 +70,14 @@ int qwen2_engine_verify_speculative(Qwen2Engine *e,
                                     int n_candidate,
                                     float *out_logits);
 
+/* Fix2: rollback helper for speculative pos-drift bug. Truncates engine
+ * position to target_pos (must be <= current pos) and updates device
+ * mirror *d_pos. KV slots beyond target_pos remain allocated but are
+ * logically freed (attention reads only 0..pos). Caller should use this
+ * after verify_speculative to discard rejected tail tokens so the next
+ * decode is bit-exact vs eager. */
+void qwen2_engine_rollback(Qwen2Engine *e, int target_pos);
+
 /* Debug/profiling hooks.
  * qwen2_debug_replay_step performs exactly the graph-replay body of
  * qwen2_engine_next: H2D next_tok -> graph launch -> D2H sample -> sync,
