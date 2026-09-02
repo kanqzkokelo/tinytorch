@@ -63,7 +63,14 @@ int tt_embed_typed(const void *dW, int dtype, int tok, float *dx, int dim,
                    cudaStream_t stream);
 int tt_logits_dispatch(const void *dW, int dtype, const float *dx,
                        float *dlogits, int vocab, int K, cudaStream_t stream);
-int tt_embed_q4_0(const void *dW, int tok, float *dx, int dim, cudaStream_t stream);
+/* M10+ Batched-4 LM head launcher (q4_0 only). X is [4, K], L is [4, vocab];
+ * candidate-major output (L[c*vocab + v] = X[c*K + :] @ W[v, :]). Used by
+ * the speculative-verify path; requires vocab%4==0 (caller pads). */
+int tt_logits_q4_0_batch4(const void *dW, const float *dX_4xK,
+                          float *dL_4xVocab, int vocab, int K, cudaStream_t stream);
+ int tt_logits_dispatch(const void *dW, int dtype, const float *dx,
+                        float *dlogits, int vocab, int K, cudaStream_t stream);
+ int tt_embed_q4_0(const void *dW, int tok, float *dx, int dim, cudaStream_t stream);
 /* M9.5+ V4 dispatch: routes q4_0 layer GEMVs to 4-rows-per-warp kernel
  * when eligible (M%4==0, K%32==0, nb even), else falls back to V2.
  * Bit-exact vs V2 (V4 == V2 == scalar up to FMA order, which is identical
@@ -1673,14 +1680,17 @@ struct Qwen2Engine {
     float *d_split_pm;            /* [S_MAX * max_heads] */
     float *d_split_pl;            /* [S_MAX * max_heads] */
     int    d_split_S_max;         /* S at workspace alloc time (capacity) */
-    /* TT_SPEC_BATCH: persistent device buffer for the post-final-layer
+    /* TT_SPEC_BATCH: persistent device buffers for the post-final-layer
      * activations of N verify candidates (layout [N, dim]). Lazy-alloc
      * on first verify call that uses TT_SPEC_BATCH>=2. */
-    float *d_x_batch;             /* [d_spec_max_n * dim] device */
+    float *d_x_batch;             /* [d_spec_max_n * dim]   post-layers hidden */
+    float *d_xn_batch;            /* [d_spec_max_n * dim]   post-rmsnorm hidden (LM head input) */
+    float *d_logits_batch;        /* [d_spec_max_n * vocab] per-candidate logits row-major */
     int    d_spec_max_n;          /* allocation cap (>=1) */
-    int    d_spec_n;              /* actual N used last call */
-    /* gemma4 MatFormer per-layer embeddings */
     TTensor pl_model_proj;        /* [n_layers*256, dim] typed */
+    int    d_spec_n;              /* actual N used last call */
+
+    /* gemma4 MatFormer per-layer embeddings */
     float *pl_proj_norm_host;     /* [256] host gamma */
     float *d_pl_tmp;              /* [n_layers*256] staging */
     float *d_ple_row;             /* [n_layers*256] active position's block */
@@ -2140,10 +2150,10 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     e->d_x_batch = NULL;
     e->d_xn_batch = NULL;
     e->d_logits_batch = NULL;
-    e->d_x_batch_n = -1;
-    e->d_xn_batch_n = -1;
-    e->d_logits_batch_n = -1;
+    e->d_spec_n = -1;
+    e->d_spec_max_n = 0;
     return e;
+
 
 }
 
@@ -3817,26 +3827,106 @@ int qwen2_engine_verify_speculative(Qwen2Engine *e,
 
     const long vocab_f = (long)c->vocab;
     const int dim = c->dim;
-    if (n_candidate >= 2 && e->n_gpu_layers == c->n_layers && !e->has_pl_embd && c->tr.softcap_value == 0.0f) {
-        float *h_x_all = (float *)malloc((size_t)n_candidate * dim * sizeof(float));
-        int rc = prefill_batched_gemm(e, h_candidate_tokens, n_candidate, h_x_all);
-        if (rc == 0) {
+
+    /* TT_SPEC_BATCH gate (lazy env read; defaults to 1 = per-row eager).
+     * spec_batch==1  : original per-row advance()+compute_logits_into_d_logits()
+     *                  loop below (correctness path; ~120 tok/s on qwen2.5-0.5b).
+     * spec_batch>=2  : device-resident batched prefill (prefill_batched_gemm_dx)
+     *                  + LM head. When n_candidate==4 AND lm_head is q4_0 with
+     *                  vocab%4==0, the LM head collapses to one
+     *                  tt_logits_q4_0_batch4 launch (single weight pass over all
+     *                  4 candidates). n_candidate<4 still benefits from the
+     *                  device-resident prefill (no H2H round-trip).
+     * For n_candidate<4 the orchestrator is expected to pad to 4 (e.g.
+     * via K+1 always == 4 with TT_DRAFT_K=3); we do NOT auto-pad here because
+     * padding would write duplicate K/V into the cache slots. */
+    static int spec_batch_env = -1;
+    if (spec_batch_env < 0) {
+        const char *env = getenv("TT_SPEC_BATCH");
+        spec_batch_env = (env && atoi(env) >= 1) ? atoi(env) : 1;
+    }
+    const int want_batched = (spec_batch_env >= 2)
+                          && (n_candidate >= 2)
+                          && (e->n_gpu_layers == c->n_layers)
+                          && !e->has_pl_embd
+                          && (c->tr.softcap_value == 0.0f);
+
+    if (want_batched) {
+        /* Lazy-alloc (or grow) the batched speculative workspace:
+         *   d_x_batch       [n_max, dim]    post-final-layer hidden states
+         *   d_xn_batch      [n_max, dim]    post-rmsnorm hidden (LM head input)
+         *   d_logits_batch  [n_max, vocab]  candidate-major logits [c*vocab+v]
+         * Layout for k_logits_q4_0_batch4 is exactly [n_max, dim/vocab] row-major. */
+        const int n_max = n_candidate;
+        if (e->d_spec_max_n < n_max) {
+            if (e->d_x_batch)    { cudaFree(e->d_x_batch);    e->d_x_batch = NULL; }
+            if (e->d_xn_batch)   { cudaFree(e->d_xn_batch);   e->d_xn_batch = NULL; }
+            if (e->d_logits_batch) { cudaFree(e->d_logits_batch); e->d_logits_batch = NULL; }
+            if (cudaMalloc(&e->d_x_batch,    (size_t)n_max * dim * sizeof(float)) != cudaSuccess) return -30;
+            if (cudaMalloc(&e->d_xn_batch,   (size_t)n_max * dim * sizeof(float)) != cudaSuccess) return -31;
+            if (cudaMalloc(&e->d_logits_batch, (size_t)n_max * vocab_f * sizeof(float)) != cudaSuccess) return -32;
+            e->d_spec_max_n = n_max;
+        }
+        e->d_spec_n = n_candidate;
+
+        /* 1) Batched prefill: writes the per-position final hidden states
+         * into d_x_batch (device-resident; no H2H copy back). This advances
+         * e->pos by n_candidate and writes K/V to those cache slots. */
+        int rc = prefill_batched_gemm_dx(e, h_candidate_tokens, n_candidate, e->d_x_batch);
+        if (rc != 0) {
+            /* Prefill refused (mixed dtype / PLE / softcap). Fall back to the
+             * original per-row eager path below. Restore d_pos so the eager
+             * path sees the pre-call position. */
+            e->pos -= n_candidate;
+            cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
+        } else {
+            /* 2) Per-row final rmsnorm into d_xn_batch (LM head input). */
             for (int i = 0; i < n_candidate; i++) {
-                cudaMemcpyAsync(e->d_x, h_x_all + (long)i * dim, dim * sizeof(float), cudaMemcpyHostToDevice, e->stream);
-                compute_logits_into_d_logits(e);
-                cudaMemcpyAsync(out_logits + (long)i * vocab_f,
-                                e->d_logits,
-                                vocab_f * sizeof(float),
-                                cudaMemcpyDeviceToDevice,
-                                e->stream);
+                k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
+                    e->d_x_batch + (long)i * dim,
+                    e->d_out_norm,
+                    e->d_xn_batch + (long)i * dim,
+                    dim, c->rms_eps, c->tr.norm_offset);
             }
-            free(h_x_all);
+
+            /* 3) LM head: batched-4 (single launch) when contract holds;
+             * otherwise per-row tt_logits_dispatch into d_logits_batch. */
+            int use_b4 = (n_candidate == 4)
+                       && (e->d_out_w.dtype == GGUF_TYPE_Q4_0)
+                       && ((vocab_f & 3) == 0)
+                       && (dim % 32 == 0);
+            if (use_b4) {
+                rc = tt_logits_q4_0_batch4(e->d_out_w.ptr,
+                                            e->d_xn_batch,
+                                            e->d_logits_batch,
+                                            (int)vocab_f, dim, e->stream);
+                if (rc != 0) {
+                    /* Contract violation surfaced only at launch time; fall back. */
+                    use_b4 = 0;
+                }
+            }
+
+            if (!use_b4) {
+                for (int i = 0; i < n_candidate; i++) {
+                    tt_logits_dispatch(e->d_out_w.ptr, e->d_out_w.dtype,
+                                       e->d_xn_batch + (long)i * dim,
+                                       e->d_logits_batch + (long)i * vocab_f,
+                                       (int)vocab_f, dim, e->stream);
+                }
+            }
+
+            /* 4) D2D copy the [n_candidate, vocab] logits block to out_logits. */
+            cudaMemcpyAsync(out_logits, e->d_logits_batch,
+                            (size_t)n_candidate * vocab_f * sizeof(float),
+                            cudaMemcpyDeviceToDevice, e->stream);
             cudaStreamSynchronize(e->stream);
             return 0;
         }
-        free(h_x_all);
     }
 
+    /* Fallback path: original per-row advance() + compute_logits_into_d_logits().
+     * Always correct; used for n_candidate==1, off-spec engines (PLE, mixed
+     * dtypes, softcap), and when prefill_batched_gemm_dx refuses. */
     for (int i = 0; i < n_candidate; i++) {
         if (advance(e, h_candidate_tokens[i])) return -10 - i;
         if (compute_logits_into_d_logits(e))   return -20 - i;
