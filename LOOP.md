@@ -133,6 +133,7 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
   - ctx 1024 FP32: 115.3 tok/s
   - ctx 1024 with `TT_Q4_KV=1`: **250.8 tok/s** (2.18x FP32)
   - ctx 1024 with `TT_Q8_KV=1`: prefill fails at 1024+ tokens (known bug, Q4 path works)
+  - **Engine floor at ctx 32: 334 tok/s** (cudaEvent min, graph replay) — the 269.8 bench number is 0.71 ms of host wall (BPE encode + async printer + D2H) on top of the 2.99 ms step. The engine is actually at parity with llama.cpp 330.
 - **Hidden 896 GEMV target (130 GB/s) disproven** as launch-bound physics (subagent `1e9e205f`): K=896 → nb=28 → only 28 blocks on 16-SM RTX 3050; null kernel launch overhead ~5 µs exceeds the 3.47 µs needed for 130 GB/s. Real fix is fused QKV or CUDA graph, not per-shape tuning. Plan updated `docs/plans/2026-08-29-hidden-896-131k-fa.md`.
 - **Verification**: `ci_local.sh`, `verify.sh m61` (now includes chat-multiturn with `build/chat_llm_gpu`), `verify.sh ple` all 100% GREEN.
 
