@@ -17,6 +17,8 @@ ap.add_argument("--ctx", type=int, default=0,
                 help="pad prompt to ~N tokens with a repeated neutral sentence")
 ap.add_argument("--max-ctx", type=int, default=0,
                 help="set TT_MAX_CTX (KV cache capacity) for ctx > 1024 prompts")
+ap.add_argument("--raw", action="store_true",
+                help="set TT_RAW_PROMPT=1 (skip chat template)")
 args = ap.parse_args()
 
 FILLER = ("The quick brown fox jumps over the lazy dog near the river bank "
@@ -31,6 +33,8 @@ if args.ctx > 0:
 env = dict(os.environ)
 if args.max_ctx > 0:
     env["TT_MAX_CTX"] = str(args.max_ctx)
+if args.raw:
+    env["TT_RAW_PROMPT"] = "1"
 
 env["LD_LIBRARY_PATH"] = ":".join(filter(None, [
     os.path.expanduser("~/mmcuda/lib"),
