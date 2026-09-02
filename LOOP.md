@@ -139,10 +139,16 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 
 ### Cycle 17: Batched RoPE + Scatter in Prefill
 - **Action**: Created batched RoPE (4 variants: neox/gptj × ff) and batched KV scatter (FP32 + Q8). Replaces per-token kernel launches in `prefill_batched_gemm`. Also batched RMSNorm, bias add, QK-norm to cut remaining O(n) launches. Commit `1afea47`.
-- **Performance (pp512 434 tokens, qwen2.5-0.5b Q4_0, 3-run median)**:
-  - FP32: **1,365 tok/s** (was 870, +57%)
-  - Q8: **20,900 tok/s** (was 2,611, **8x speedup**)
-  - llama.cpp pp512: 10,056 tok/s → **Q8 prefill now BEATS llama.cpp by 2.08x**
+- **Performance (honest 3-run median, raw `hello*N` prompts, qwen2.5-0.5b Q4_0, audited by `dc8f2dc4`)**:
+  | N (tokens) | FP32 | Q4 KV | Q8 KV | llama.cpp | Q8/llama |
+  |---|---|---|---|---|---|
+  | 32 | 853 | 857 | 1,235 | 2,439 | 0.50x |
+  | 128 | 1,173 | 1,246 | 4,325 | 5,631 | 0.76x |
+  | 256 | 1,235 | 1,232 | 8,790 | 7,231 | 1.21x |
+  | 512 | 1,097 | 1,100 | **16,225** | 7,941 | **2.04x** |
+  | 1024 | 890 | 889 | **FAIL** | 8,619 | — |
+- **Known bug** (audit found): Q8 KV chunked prefill FAILS at N>512 with `embed rc=716 CUDA_ERROR_MISALIGNED_ADDRESS` in the second-chunk path (`CHUNK_SIZE=512` at `qwen2_engine_prefill:4120`). Same class of misalignment as the Q8 fix in `2c23659`; needs the chunked prefill path to use the same byte-copy fix or routed to a working kernel.
+- **Verdict (audit)**: Batched kernels honest, speedups real, no measurement artifacts, no commit-message lies.
 - **Verification**: `ci_local.sh` GREEN, `verify.sh m61` PASS (7/7 logits + chat-multiturn), `verify.sh ple` PASS (3/3).
 
 ### Cycle 16: Batched Prefill FlashAttention
