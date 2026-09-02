@@ -138,7 +138,8 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - **Verification**: `ci_local.sh`, `verify.sh m61` (now includes chat-multiturn with `build/chat_llm_gpu`), `verify.sh ple` all 100% GREEN.
 
 ### Known broken (open issues, not blocking gates)
-- **Q8 KV prefill broken at ctx ≥ 1024** (`TT_Q8_KV=1` + long prompt): `embed rc=716 CUDA_ERROR_MISALIGNED_ADDRESS`. Works at short/mid ctx (≤512). Q4 KV path covers the same use case without the bug. Q8 mode reports `Q8_0 KV cache ENABLED (4x DRAM traffic reduction)` but prefill fails on `tok=151644` (<|im_start|>) with misaligned address 716 from `k_embed_q4_0`. Root cause: likely memory corruption or pointer aliasing in Q8 prefill path. Q4 KV at ctx 1024 = 250.8 tok/s (works), so Q4 path is the recommended long-ctx choice.
-- **RESUME.md stale** (still references C1-C4 batched-GEMM/PLE/Split-K/mmap which are all shipped).
+- ~~**Q8 KV prefill broken at ctx ≥ 1024**~~ **FIXED** in `2c23659`: `BlockQ8_0` 34-byte struct (FP16 scale at offset 0, int8[32] at offset 2) caused misaligned 4-byte loads in `k_prefill_flash_q8_0` → `CUDA_ERROR_MISALIGNED_ADDRESS (716)`. Replaced with safe byte-copy loops. Now: Q8 KV at ctx 1024 = **236.3 tok/s** decode (Q4 KV still slightly better at 250.3).
+- **RESUME.md stale** (still references C1-C4 batched-GEMM/PLE/Split-K/mmap which are all shipped). *Partially fixed in `c5de081` with current-state section.*
 - **Q4 KV m61 parity**: Q4 alone shows NaN in `verify.sh m61` logits — same kind of issue as Q8 but different mode. Hybrid dispatch (Fix1) routes short ctx to FP32 to keep m61 GREEN.
+- **Future**: pad `BlockQ8_0` to 40 bytes (4-byte aligned qs) to re-enable fast batched prefill path → could push Q8 KV >250 tok/s at ctx 1024.
 
