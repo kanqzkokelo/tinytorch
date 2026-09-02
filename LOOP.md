@@ -136,3 +136,8 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - **Hidden 896 GEMV target (130 GB/s) disproven** as launch-bound physics (subagent `1e9e205f`): K=896 → nb=28 → only 28 blocks on 16-SM RTX 3050; null kernel launch overhead ~5 µs exceeds the 3.47 µs needed for 130 GB/s. Real fix is fused QKV or CUDA graph, not per-shape tuning. Plan updated `docs/plans/2026-08-29-hidden-896-131k-fa.md`.
 - **Verification**: `ci_local.sh`, `verify.sh m61` (now includes chat-multiturn with `build/chat_llm_gpu`), `verify.sh ple` all 100% GREEN.
 
+### Known broken (open issues, not blocking gates)
+- **Q8 KV prefill broken at ctx ≥ 1024** (`TT_Q8_KV=1` + long prompt): `embed rc=716 CUDA_ERROR_MISALIGNED_ADDRESS`. Works at short/mid ctx (≤512). Q4 KV path covers the same use case without the bug. Q8 mode reports `Q8_0 KV cache ENABLED (4x DRAM traffic reduction)` but prefill fails on `tok=151644` (<|im_start|>) with misaligned address 716 from `k_embed_q4_0`. Root cause: likely memory corruption or pointer aliasing in Q8 prefill path. Q4 KV at ctx 1024 = 250.8 tok/s (works), so Q4 path is the recommended long-ctx choice.
+- **RESUME.md stale** (still references C1-C4 batched-GEMM/PLE/Split-K/mmap which are all shipped).
+- **Q4 KV m61 parity**: Q4 alone shows NaN in `verify.sh m61` logits — same kind of issue as Q8 but different mode. Hybrid dispatch (Fix1) routes short ctx to FP32 to keep m61 GREEN.
+
