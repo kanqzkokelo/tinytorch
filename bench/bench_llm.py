@@ -15,6 +15,8 @@ ap.add_argument("--tokens", type=int, default=128)
 ap.add_argument("--prompt", default="Explain quantum computing in one sentence.")
 ap.add_argument("--ctx", type=int, default=0,
                 help="pad prompt to ~N tokens with a repeated neutral sentence")
+ap.add_argument("--max-ctx", type=int, default=0,
+                help="set TT_MAX_CTX (KV cache capacity) for ctx > 1024 prompts")
 args = ap.parse_args()
 
 FILLER = ("The quick brown fox jumps over the lazy dog near the river bank "
@@ -27,6 +29,9 @@ if args.ctx > 0:
         prompt = FILLER * reps + "Hi."
 
 env = dict(os.environ)
+if args.max_ctx > 0:
+    env["TT_MAX_CTX"] = str(args.max_ctx)
+
 env["LD_LIBRARY_PATH"] = ":".join(filter(None, [
     os.path.expanduser("~/mmcuda/lib"),
     os.path.expanduser("~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"),

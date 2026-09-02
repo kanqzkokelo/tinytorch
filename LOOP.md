@@ -127,11 +127,12 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 
 ### Cycle 15: Paged FP32 FA-2 Decode + Hybrid KV-Cache Dispatch
 - **Action**: Added `k_fa2_fp32_split` in `kernels/qwen2_cuda.cu` (commit `00e6019`): tiled FA2 with smem K/V tile, online softmax `m/l/acc`, empty-slice early exit `m=-1e30,l=0`, bit-exact vs serial. Added hybrid KV-cache dispatch (commit `3b1cf0c`): FP32 path below `TT_QKV_THRESH` (256) for parity, Q4/Q8 path above threshold for speed (auto-disables CUDA graph because graph locks path at capture). Added `qwen2_engine_rollback(e, target_pos)` (commit `82a63dd`) for `verify_speculative` pos-drift fix: truncates `e->pos` + `d_pos`, clears pending token. Test `tests/test_verify_rollback.c` confirms bit-exact (0 mismatches in 151,936 logits).
-- **Performance (qwen2.5-0.5b Q4_0, RTX 3050 sm_86, 3-run honest median)**:
-  - ctx 32: 271 tok/s (0.82x llama.cpp 330)
-  - ctx 128: **281 tok/s** (1.02x llama.cpp 277, was 180)
-  - ctx 1024 FP32: 214 tok/s
-  - ctx 1024 with `TT_Q8_KV=1`: **258 tok/s** (was 126, 2.05x)
+- **Performance (qwen2.5-0.5b Q4_0, RTX 3050 sm_86, 5-run honest median via `bench/bench_llm.py`)**:
+  - ctx 32: 269.8 tok/s (0.82x llama.cpp 330)
+  - ctx 128: 230.1 tok/s (0.83x llama.cpp 277, was 180)
+  - ctx 1024 FP32: 115.3 tok/s
+  - ctx 1024 with `TT_Q4_KV=1`: **250.8 tok/s** (2.18x FP32)
+  - ctx 1024 with `TT_Q8_KV=1`: prefill fails at 1024+ tokens (known bug, Q4 path works)
 - **Hidden 896 GEMV target (130 GB/s) disproven** as launch-bound physics (subagent `1e9e205f`): K=896 → nb=28 → only 28 blocks on 16-SM RTX 3050; null kernel launch overhead ~5 µs exceeds the 3.47 µs needed for 130 GB/s. Real fix is fused QKV or CUDA graph, not per-shape tuning. Plan updated `docs/plans/2026-08-29-hidden-896-131k-fa.md`.
 - **Verification**: `ci_local.sh`, `verify.sh m61` (now includes chat-multiturn with `build/chat_llm_gpu`), `verify.sh ple` all 100% GREEN.
 
