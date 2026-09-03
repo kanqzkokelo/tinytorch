@@ -137,6 +137,13 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - **Hidden 896 GEMV target (130 GB/s) disproven** as launch-bound physics (subagent `1e9e205f`): K=896 → nb=28 → only 28 blocks on 16-SM RTX 3050; null kernel launch overhead ~5 µs exceeds the 3.47 µs needed for 130 GB/s. Real fix is fused QKV or CUDA graph, not per-shape tuning. Plan updated `docs/plans/2026-08-29-hidden-896-131k-fa.md`.
 - **Verification**: `ci_local.sh`, `verify.sh m61` (now includes chat-multiturn with `build/chat_llm_gpu`), `verify.sh ple` all 100% GREEN.
 
+### Cycle 19: Cache Coherence — Backfill + Dual-Write + Build Fixes
+- **Backfill** (`52c2764`, verified KEEP): `k_kv_backfill_q4_0`/`k_kv_backfill_q8_0` quantize FP32 slabs `[0..pos)` at enable; shared-KV skip mirrors scatter; missing Q4 decode alias fixed. Test `tests/test_qcache_backfill.c` (new): kernel-vs-scatter bit-exact, Q4 late-vs-early bitwise equal, Q8 late-vs-FP32 diff 0.73 argmax equal (no-backfill fails diff 17.5 as predicted). Q4 NaN + Q8 716 proven pre-existing (early-enable path same failure).
+- **Dual-write** (`474d6d6`, verified KEEP): decode scatter always FP32 + ptr-gated Q4/Q8 (threshold-independent); Q8 prefill dual-writes FP32+Q8 both fns. Q8 THRESH=32 crossing now coherent English (was numeric mush). Q4-mush proven pre-existing broken decode kernels (THRESH=0 garbage at baseline).
+- **Build rot fixed** (`5e7b8fb`, `7c5ef43`, `0965261`): 4 test/bench targets missing `cpu_backend.c` link (only worked via stale prebuilts); added Makefile targets + fixed links. All rebuild via `make` and pass.
+- **Final pp512 (434 tok, inline 3-run)**: FP32 ~1650, Q4 ~1644, Q8 ~25276. vs llama.cpp 7941: Q8 **3.2x**.
+- **Verification**: `ci_local` GREEN, `m61` 7/7 + chat PASS, `test_qcache_backfill` PASS throughout.
+
 ### Cycle 18: Prefill Parity — Arena + float4 + Q4 Wiring + Guards
 - **Task 1** (`c34198d`): persistent activation arena in `Qwen2Engine` — 20 `cudaMalloc`/`cudaFree` per prefill eliminated for n≤512 (reviewer PASS, gates GREEN).
 - **Task 2** (`6a7cffa`): `k_prefill_flash_fp32` vectorized with `float4` 128-bit loads, `BC_PREFILL_FP32` 32→64 + `cudaFuncSetAttribute` — pp512 FP32 1364→1662 tok/s (+21.8%), bit-exact, reviewer PASS.
