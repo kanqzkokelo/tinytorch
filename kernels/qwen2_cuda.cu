@@ -4152,7 +4152,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
                     const long total_blocks = (long)n * blocks_per_slot;
                     k_kv_scatter_q4_0_batched<<<(total_blocks + 255)/256, 256, 0, e->stream>>>(
                         d_K, d_V, Kl_q4, Vl_q4, d_pos_batch, KV_l, HDl, c->max_ctx, n);
-                } else if (e->use_q8_kvcache) {
+                } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8) {
                     const int blocks_per_slot = kvdim_l / 32;
                     const long total_blocks = (long)n * blocks_per_slot;
                     k_kv_scatter_q8_0_batched<<<(total_blocks + 255)/256, 256, 0, e->stream>>>(
@@ -4174,7 +4174,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
             k_prefill_flash_fp32<<<grid_fp, threads_fp, smem_bytes_fp, e->stream>>>(
                 d_Q, Kl_f, Vl_f, d_Att,
                 n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l);
-        } else if (e->use_q8_kvcache) {
+        } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8) {
             int num_q_tiles = (n + BR_PREFILL - 1) / BR_PREFILL;
             dim3 grid_pf(num_q_tiles, KV_l);
             int threads_pf = (H_l / KV_l) * 32;
@@ -4481,7 +4481,7 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
                     const long total_blocks = (long)n * blocks_per_slot;
                     k_kv_scatter_q4_0_batched<<<(total_blocks + 255)/256, 256, 0, e->stream>>>(
                         d_K, d_V, Kl_q4, Vl_q4, d_pos_batch, KV_l, HDl, c->max_ctx, n);
-                } else if (e->use_q8_kvcache) {
+                } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8) {
                     const int blocks_per_slot = kvdim_l / 32;
                     const long total_blocks = (long)n * blocks_per_slot;
                     k_kv_scatter_q8_0_batched<<<(total_blocks + 255)/256, 256, 0, e->stream>>>(
@@ -4503,7 +4503,7 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
             k_prefill_flash_fp32<<<grid_fp, threads_fp, smem_bytes_fp, e->stream>>>(
                 d_Q, Kl_f, Vl_f, d_Att,
                 n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l);
-        } else if (e->use_q8_kvcache) {
+        } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8) {
             int num_q_tiles = (n + BR_PREFILL - 1) / BR_PREFILL;
             dim3 grid_pf(num_q_tiles, KV_l);
             int threads_pf = (H_l / KV_l) * 32;
