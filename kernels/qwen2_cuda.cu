@@ -5430,6 +5430,17 @@ extern "C" void qwen2_engine_enable_q8_kvcache(Qwen2Engine *e, int enable) {
                 (e->pos > 0 && e->d_kc_q8 && !getenv("TT_NO_BACKFILL")) ? (e->pos < e->cfg.max_ctx ? e->pos : e->cfg.max_ctx) : 0);
     }
     e->use_q8_kvcache = enable;
+    /* Late flag flip vs graph capture: replay bakes the flash/scatter path
+     * chosen at capture, so a post-capture flip is silently ignored by
+     * replay (stale path). Invalidate -> eager forever (always coherent). */
+    if (e->graph_exec) {
+        cudaGraphExecDestroy(e->graph_exec);
+        e->graph_exec = NULL;
+        e->graph_ready = 0;
+        e->no_graph = 1;
+        e->pending_tok = -1;
+        fprintf(stderr, "[qwen2-engine] Q8 flag flipped post-capture: graph dropped, eager mode\n");
+    }
 }
 
 extern "C" void qwen2_engine_enable_q4_kvcache(Qwen2Engine *e, int enable) {
@@ -5486,6 +5497,15 @@ extern "C" void qwen2_engine_enable_q4_kvcache(Qwen2Engine *e, int enable) {
                 (e->pos > 0 && e->d_kc_q4 && !getenv("TT_NO_BACKFILL")) ? (e->pos < e->cfg.max_ctx ? e->pos : e->cfg.max_ctx) : 0);
     }
     e->use_q4_kvcache = enable;
+    /* Late flag flip vs graph capture: see Q8 path above. */
+    if (e->graph_exec) {
+        cudaGraphExecDestroy(e->graph_exec);
+        e->graph_exec = NULL;
+        e->graph_ready = 0;
+        e->no_graph = 1;
+        e->pending_tok = -1;
+        fprintf(stderr, "[qwen2-engine] Q4 flag flipped post-capture: graph dropped, eager mode\n");
+    }
 }
 
 void qwen2_engine_set_sampling(Qwen2Engine *e, float temp, int topk,
