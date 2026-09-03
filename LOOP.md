@@ -137,6 +137,17 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - **Hidden 896 GEMV target (130 GB/s) disproven** as launch-bound physics (subagent `1e9e205f`): K=896 → nb=28 → only 28 blocks on 16-SM RTX 3050; null kernel launch overhead ~5 µs exceeds the 3.47 µs needed for 130 GB/s. Real fix is fused QKV or CUDA graph, not per-shape tuning. Plan updated `docs/plans/2026-08-29-hidden-896-131k-fa.md`.
 - **Verification**: `ci_local.sh`, `verify.sh m61` (now includes chat-multiturn with `build/chat_llm_gpu`), `verify.sh ple` all 100% GREEN.
 
+### Cycle 21: Q8 N>512 Fixed — Same HD=64 Disease in Prefill Flash
+- **Root cause** (`770a9e8`, verified KEEP): `k_prefill_flash_q8_0` hardcoded `elems==4` (HD=128); qwen2.5-0.5b HD=64 → Q overread, wrong `block_in_head`, misaligned u32 smem, out_row clobber + arena overrun → 716. Same disease as Q4 split (`ef19cdb`). Fix mirrors decode/fp32 elems branches (4 sites); HD=128 path byte-identical; no instrumentation left.
+- **HONEST CORRECTION**: old Q8 prefill numbers (24-25k tok/s) were GARBAGE attention (0 tokens emitted). Real Q8 prefill: ~1470-1505 tok/s ≈ FP32 1627 (same prompt). Q8 KV saves decode bandwidth only, not prefill. All prior Q8 prefill claims (pp512 25k, 3.2x llama) are VOID.
+- h504/h1024/bs2079 now RC=0 with real tokens, first-8 identical vs FP32. Gates: ci_local GREEN, m61 PASS, backfill PASS.
+- **m84 FAILS 0/7 pre-existing** (gemma4 short prompts, no Q8 in path, KV-share parity gap) — not caused by this commit, tracked separately.
+
+### Cycle 20: Q4 Split HD=64 OOBs + Bit-Cast Fix
+- **Fix** (`ef19cdb`, verified KEEP): 3 HD=64 OOBs in `k_fa2_q4_split` (elems-branch Q-load, `(lane*elems)/32`, writeback guards) + 4th bug (BlockQ4_0.d fp16 bits vs `__half` value-conversion, 5 kernels) + elems==2 nibble pairing. New `test_q4_split_exact` 18/18 @7e-8.
+- Q4 THRESH=0 mush gone (now loopy English / early EOS — inherent quant noise: K outliers ~120, score err ~55). Default Q4 == FP32 word-for-word below thresh.
+- Follow-up: Q4 threshold calibrated 5e-2→1.5e-1 (noise floor) + Makefile targets wired (verifier FAIL was stale prebuilts — fresh build passes 5.7e-3).
+
 ### Cycle 19: Cache Coherence — Backfill + Dual-Write + Build Fixes
 - **Backfill** (`52c2764`, verified KEEP): `k_kv_backfill_q4_0`/`k_kv_backfill_q8_0` quantize FP32 slabs `[0..pos)` at enable; shared-KV skip mirrors scatter; missing Q4 decode alias fixed. Test `tests/test_qcache_backfill.c` (new): kernel-vs-scatter bit-exact, Q4 late-vs-early bitwise equal, Q8 late-vs-FP32 diff 0.73 argmax equal (no-backfill fails diff 17.5 as predicted). Q4 NaN + Q8 716 proven pre-existing (early-enable path same failure).
 - **Dual-write** (`474d6d6`, verified KEEP): decode scatter always FP32 + ptr-gated Q4/Q8 (threshold-independent); Q8 prefill dual-writes FP32+Q8 both fns. Q8 THRESH=32 crossing now coherent English (was numeric mush). Q4-mush proven pre-existing broken decode kernels (THRESH=0 garbage at baseline).
