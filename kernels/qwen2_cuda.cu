@@ -2641,18 +2641,25 @@ struct Qwen2Engine {
     cudaStream_t stream;
 };
 
-/* Hybrid effective-checks (Fix1): use Q* only when flag set AND pos > thresh */
+/* Hybrid effective-checks (Fix1): use Q* only when flag set AND pos > thresh.
+ * TT_NO_BACKFILL=1 is a test-only hatch: backfill skipped, Q slabs [0..pos)
+ * stay zeroed -> force FP32 flash so zeroed slabs are never read above thresh. */
+static inline int kv_no_backfill(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("TT_NO_BACKFILL") ? 1 : 0;
+    return cached;
+}
 static inline int kv_use_q4_eff(const Qwen2Engine *e) {
-    return e->use_q4_kvcache && e->pos > kv_thresh_value();
+    return e->use_q4_kvcache && e->pos > kv_thresh_value() && !kv_no_backfill();
 }
 static inline int kv_use_q8_eff(const Qwen2Engine *e) {
-    return e->use_q8_kvcache && !e->use_q4_kvcache && e->pos > kv_thresh_value();
+    return e->use_q8_kvcache && !e->use_q4_kvcache && e->pos > kv_thresh_value() && !kv_no_backfill();
 }
 static inline int kv_use_q4_eff_at(const Qwen2Engine *e, int pos) {
-    return e->use_q4_kvcache && pos > kv_thresh_value();
+    return e->use_q4_kvcache && pos > kv_thresh_value() && !kv_no_backfill();
 }
 static inline int kv_use_q8_eff_at(const Qwen2Engine *e, int pos) {
-    return e->use_q8_kvcache && !e->use_q4_kvcache && pos > kv_thresh_value();
+    return e->use_q8_kvcache && !e->use_q4_kvcache && pos > kv_thresh_value() && !kv_no_backfill();
 }
 
 static float *upload_f32(GGUFModel *m, const char *name) {
