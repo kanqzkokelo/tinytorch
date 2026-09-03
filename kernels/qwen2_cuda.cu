@@ -2079,6 +2079,10 @@ struct Qwen2Engine {
     int ple_cache_tok;            /* last token id dequantized into ple_pe */
     float *ple_pe;                /* cached scaled per-layer token embed row */
     float *d_rope_freqs;          /* [256] partial-rope factors (device) */
+    /* Task 1: persistent prefill arena (eliminate 20 cudaMalloc/Free per prefill) */
+    float *d_pf_X, *d_pf_Xn, *d_pf_Q, *d_pf_K, *d_pf_V, *d_pf_Att, *d_pf_H, *d_pf_G, *d_pf_U;
+    int *d_pf_pos_batch;
+    size_t pf_arena_max_n;
     int pos;
     int n_gpu_layers;
     float *h_x_buf, *h_xn_buf, *h_q_buf, *h_att_buf, *h_h_buf, *h_g_buf, *h_u_buf, *h_out_buf;
@@ -2551,6 +2555,42 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     e->d_logits_batch = NULL;
     e->d_spec_n = -1;
     e->d_spec_max_n = 0;
+    /* Task 1: persistent prefill arena (512 tokens or max_ctx if smaller) */
+    {
+        size_t pf_max_n = 512;
+        if ((size_t)cfg->max_ctx < pf_max_n) pf_max_n = (size_t)cfg->max_ctx;
+        e->pf_arena_max_n = pf_max_n;
+        e->d_pf_X = e->d_pf_Xn = e->d_pf_Q = e->d_pf_K = e->d_pf_V = NULL;
+        e->d_pf_Att = e->d_pf_H = e->d_pf_G = e->d_pf_U = NULL;
+        e->d_pf_pos_batch = NULL;
+        /* Recompute maxima for sizing (matches prefill_batched_gemm logic) */
+        int pf_max_qout = cfg->n_heads * cfg->head_dim;
+        int pf_max_kvdim = cfg->n_kv_heads * cfg->head_dim;
+        int pf_hidden = cfg->hidden_dim;
+        for (int l = 0; l < cfg->n_layers; l++) {
+            int H_l = e->pl_heads[l] > 0 ? e->pl_heads[l] : cfg->n_heads;
+            int KV_l = e->pl_kv[l] > 0 ? e->pl_kv[l] : cfg->n_kv_heads;
+            int HDl = e->pl_hd[l] > 0 ? e->pl_hd[l] : cfg->head_dim;
+            if (H_l * HDl > pf_max_qout) pf_max_qout = H_l * HDl;
+            if (KV_l * HDl > pf_max_kvdim) pf_max_kvdim = KV_l * HDl;
+            int FF_l = e->pl_ffn[l] > 0 ? e->pl_ffn[l] : cfg->hidden_dim;
+            if (FF_l > pf_hidden) pf_hidden = FF_l;
+        }
+        cudaMalloc(&e->d_pf_X, pf_max_n * (size_t)cfg->dim * sizeof(float));
+        cudaMalloc(&e->d_pf_Xn, pf_max_n * (size_t)cfg->dim * sizeof(float));
+        cudaMalloc(&e->d_pf_Q, pf_max_n * (size_t)pf_max_qout * sizeof(float));
+        cudaMalloc(&e->d_pf_K, pf_max_n * (size_t)pf_max_kvdim * sizeof(float));
+        cudaMalloc(&e->d_pf_V, pf_max_n * (size_t)pf_max_kvdim * sizeof(float));
+        cudaMalloc(&e->d_pf_Att, pf_max_n * (size_t)pf_max_qout * sizeof(float));
+        cudaMalloc(&e->d_pf_H, pf_max_n * (size_t)pf_hidden * sizeof(float));
+        cudaMalloc(&e->d_pf_G, pf_max_n * (size_t)pf_hidden * sizeof(float));
+        cudaMalloc(&e->d_pf_U, pf_max_n * (size_t)pf_hidden * sizeof(float));
+        cudaMalloc(&e->d_pf_pos_batch, pf_max_n * sizeof(int));
+        if (!e->d_pf_X || !e->d_pf_Xn || !e->d_pf_Q || !e->d_pf_K || !e->d_pf_V ||
+            !e->d_pf_Att || !e->d_pf_H || !e->d_pf_G || !e->d_pf_U || !e->d_pf_pos_batch) {
+            fprintf(stderr, "[qwen2-engine] pf arena alloc failed (pf_max_n=%zu)\n", pf_max_n);
+        }
+    }
     return e;
 
 
@@ -2586,6 +2626,16 @@ void qwen2_engine_free(Qwen2Engine *e) {
     if (e->ple_pe) free(e->ple_pe);
     if (e->pl_proj_norm_host) free(e->pl_proj_norm_host);
     cudaFree(e->d_next_tok);
+    if (e->d_pf_X) cudaFree(e->d_pf_X);
+    if (e->d_pf_Xn) cudaFree(e->d_pf_Xn);
+    if (e->d_pf_Q) cudaFree(e->d_pf_Q);
+    if (e->d_pf_K) cudaFree(e->d_pf_K);
+    if (e->d_pf_V) cudaFree(e->d_pf_V);
+    if (e->d_pf_Att) cudaFree(e->d_pf_Att);
+    if (e->d_pf_H) cudaFree(e->d_pf_H);
+    if (e->d_pf_G) cudaFree(e->d_pf_G);
+    if (e->d_pf_U) cudaFree(e->d_pf_U);
+    if (e->d_pf_pos_batch) cudaFree(e->d_pf_pos_batch);
     if (e->d_split_pl)   cudaFree(e->d_split_pl);
     if (e->d_x_batch)    cudaFree(e->d_x_batch);
     /* NOTE: per-weight cudaFree calls are intentionally not tracked here; they are
@@ -3583,13 +3633,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         cache_layer_q8 = mx_q8 * c->max_ctx;
     }
 
-    float *d_X = NULL, *d_Xn = NULL, *d_Q = NULL, *d_K = NULL, *d_V = NULL;
-    float *d_Att = NULL, *d_H = NULL, *d_G = NULL, *d_U = NULL;
-    int *d_pos_batch = NULL;
-
-    if (cudaMalloc(&d_X, (size_t)n * dim * sizeof(float)) != cudaSuccess) return -3;
-    if (cudaMalloc(&d_Xn, (size_t)n * dim * sizeof(float)) != cudaSuccess) return -4;
-
+    /* Task 1: persistent arena reuse for n <= pf_arena_max_n */
     int max_qout = c->n_heads * HD;
     int max_kvdim = c->n_kv_heads * HD;
     for (int l = 0; l < c->n_layers; l++) {
@@ -3599,15 +3643,25 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         if (H_l * HDl > max_qout) max_qout = H_l * HDl;
         if (KV_l * HDl > max_kvdim) max_kvdim = KV_l * HDl;
     }
-
-    if (cudaMalloc(&d_Q, (size_t)n * max_qout * sizeof(float)) != cudaSuccess) return -5;
-    if (cudaMalloc(&d_K, (size_t)n * max_kvdim * sizeof(float)) != cudaSuccess) return -6;
-    if (cudaMalloc(&d_V, (size_t)n * max_kvdim * sizeof(float)) != cudaSuccess) return -7;
-    if (cudaMalloc(&d_Att, (size_t)n * max_qout * sizeof(float)) != cudaSuccess) return -8;
-    if (cudaMalloc(&d_H, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) return -9;
-    if (cudaMalloc(&d_G, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) return -10;
-    if (cudaMalloc(&d_U, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) return -11;
-    if (cudaMalloc(&d_pos_batch, (size_t)n * sizeof(int)) != cudaSuccess) return -12;
+    int use_arena = (e->pf_arena_max_n >= (size_t)n && e->d_pf_X && e->d_pf_Xn && e->d_pf_Q && e->d_pf_K && e->d_pf_V && e->d_pf_Att && e->d_pf_H && e->d_pf_G && e->d_pf_U && e->d_pf_pos_batch);
+    float *d_X = NULL, *d_Xn = NULL, *d_Q = NULL, *d_K = NULL, *d_V = NULL;
+    float *d_Att = NULL, *d_H = NULL, *d_G = NULL, *d_U = NULL;
+    int *d_pos_batch = NULL;
+    if (use_arena) {
+        d_X = e->d_pf_X; d_Xn = e->d_pf_Xn; d_Q = e->d_pf_Q; d_K = e->d_pf_K; d_V = e->d_pf_V;
+        d_Att = e->d_pf_Att; d_H = e->d_pf_H; d_G = e->d_pf_G; d_U = e->d_pf_U; d_pos_batch = e->d_pf_pos_batch;
+    } else {
+        if (cudaMalloc(&d_X, (size_t)n * dim * sizeof(float)) != cudaSuccess) return -3;
+        if (cudaMalloc(&d_Xn, (size_t)n * dim * sizeof(float)) != cudaSuccess) { cudaFree(d_X); return -4; }
+        if (cudaMalloc(&d_Q, (size_t)n * max_qout * sizeof(float)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); return -5; }
+        if (cudaMalloc(&d_K, (size_t)n * max_kvdim * sizeof(float)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); return -6; }
+        if (cudaMalloc(&d_V, (size_t)n * max_kvdim * sizeof(float)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); return -7; }
+        if (cudaMalloc(&d_Att, (size_t)n * max_qout * sizeof(float)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); return -8; }
+        if (cudaMalloc(&d_H, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); return -9; }
+        if (cudaMalloc(&d_G, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); cudaFree(d_H); return -10; }
+        if (cudaMalloc(&d_U, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); cudaFree(d_H); cudaFree(d_G); return -11; }
+        if (cudaMalloc(&d_pos_batch, (size_t)n * sizeof(int)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); cudaFree(d_H); cudaFree(d_G); cudaFree(d_U); return -12; }
+    }
 
     int *h_pos_batch = (int *)malloc((size_t)n * sizeof(int));
     if (!h_pos_batch) return -13;
@@ -3821,8 +3875,10 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
 
     cudaStreamSynchronize(e->stream);
 
-    cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V);
-    cudaFree(d_Att); cudaFree(d_H); cudaFree(d_G); cudaFree(d_U); cudaFree(d_pos_batch);
+    if (!use_arena) {
+        cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V);
+        cudaFree(d_Att); cudaFree(d_H); cudaFree(d_G); cudaFree(d_U); cudaFree(d_pos_batch);
+    }
 
     return 0;
 }
@@ -3870,13 +3926,6 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
         cache_layer_q8 = mx_q8 * c->max_ctx;
     }
 
-    float *d_X = d_x_out;            /* caller-supplied; no cudaMalloc */
-    float *d_Xn = NULL, *d_Q = NULL, *d_K = NULL, *d_V = NULL;
-    float *d_Att = NULL, *d_H = NULL, *d_G = NULL, *d_U = NULL;
-    int *d_pos_batch = NULL;
-
-    if (cudaMalloc(&d_Xn, (size_t)n * dim * sizeof(float)) != cudaSuccess) return -4;
-
     int max_qout = c->n_heads * HD;
     int max_kvdim = c->n_kv_heads * HD;
     for (int l = 0; l < c->n_layers; l++) {
@@ -3886,15 +3935,25 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
         if (H_l * HDl > max_qout) max_qout = H_l * HDl;
         if (KV_l * HDl > max_kvdim) max_kvdim = KV_l * HDl;
     }
-
-    if (cudaMalloc(&d_Q, (size_t)n * max_qout * sizeof(float)) != cudaSuccess) return -5;
-    if (cudaMalloc(&d_K, (size_t)n * max_kvdim * sizeof(float)) != cudaSuccess) return -6;
-    if (cudaMalloc(&d_V, (size_t)n * max_kvdim * sizeof(float)) != cudaSuccess) return -7;
-    if (cudaMalloc(&d_Att, (size_t)n * max_qout * sizeof(float)) != cudaSuccess) return -8;
-    if (cudaMalloc(&d_H, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) return -9;
-    if (cudaMalloc(&d_G, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) return -10;
-    if (cudaMalloc(&d_U, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) return -11;
-    if (cudaMalloc(&d_pos_batch, (size_t)n * sizeof(int)) != cudaSuccess) return -12;
+    int use_arena = (e->pf_arena_max_n >= (size_t)n && e->d_pf_Xn && e->d_pf_Q && e->d_pf_K && e->d_pf_V && e->d_pf_Att && e->d_pf_H && e->d_pf_G && e->d_pf_U && e->d_pf_pos_batch);
+    float *d_X = d_x_out;            /* caller-supplied; no cudaMalloc */
+    float *d_Xn = NULL, *d_Q = NULL, *d_K = NULL, *d_V = NULL;
+    float *d_Att = NULL, *d_H = NULL, *d_G = NULL, *d_U = NULL;
+    int *d_pos_batch = NULL;
+    if (use_arena) {
+        d_Xn = e->d_pf_Xn; d_Q = e->d_pf_Q; d_K = e->d_pf_K; d_V = e->d_pf_V;
+        d_Att = e->d_pf_Att; d_H = e->d_pf_H; d_G = e->d_pf_G; d_U = e->d_pf_U; d_pos_batch = e->d_pf_pos_batch;
+    } else {
+        if (cudaMalloc(&d_Xn, (size_t)n * dim * sizeof(float)) != cudaSuccess) return -4;
+        if (cudaMalloc(&d_Q, (size_t)n * max_qout * sizeof(float)) != cudaSuccess) { cudaFree(d_Xn); return -5; }
+        if (cudaMalloc(&d_K, (size_t)n * max_kvdim * sizeof(float)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); return -6; }
+        if (cudaMalloc(&d_V, (size_t)n * max_kvdim * sizeof(float)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); return -7; }
+        if (cudaMalloc(&d_Att, (size_t)n * max_qout * sizeof(float)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); return -8; }
+        if (cudaMalloc(&d_H, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); return -9; }
+        if (cudaMalloc(&d_G, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); cudaFree(d_H); return -10; }
+        if (cudaMalloc(&d_U, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); cudaFree(d_H); cudaFree(d_G); return -11; }
+        if (cudaMalloc(&d_pos_batch, (size_t)n * sizeof(int)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); cudaFree(d_H); cudaFree(d_G); cudaFree(d_U); return -12; }
+    }
 
     int *h_pos_batch = (int *)malloc((size_t)n * sizeof(int));
     if (!h_pos_batch) return -13;
@@ -4098,8 +4157,10 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
     cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
     /* Final hidden state for every position lives in d_X = d_x_out. */
 
-    cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V);
-    cudaFree(d_Att); cudaFree(d_H); cudaFree(d_G); cudaFree(d_U); cudaFree(d_pos_batch);
+    if (!use_arena) {
+        cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V);
+        cudaFree(d_Att); cudaFree(d_H); cudaFree(d_G); cudaFree(d_U); cudaFree(d_pos_batch);
+    }
 
     return 0;
 }
