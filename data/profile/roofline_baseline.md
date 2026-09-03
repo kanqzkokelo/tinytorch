@@ -11,3 +11,8 @@
 - Kernel bit-right in isolation (maxe 0.04 vs CPU); noise real end-to-end (argmax 709 vs 612, corr 0.77).
 - Root cause: regime latency-bound (~3 TFLOPS eff), not tensor-bound — s8 2x rate irrelevant, quant overhead dominates.
 - Lesson: cut traffic/syncs (fusion, tiles), not dtype. Proceed Task 3.
+
+## Task 3 outcome: FAILED, reverted (no commit)
+- Fused pp759: 2113/2114/2100 (median 2113) vs baseline 2228/2262/2264 (-6.6%, needed +10%).
+- Greedy-identical: Y. Reason: expf/tanh ALU added to X-load in latency-bound regime costs more than d_H traffic saves.
+- Lesson: in latency-bound regime only FEWER launches/syncs win — no extra ALU. Task 4: tiles + gate/up single-launch (same math, one X read, half the launches).
