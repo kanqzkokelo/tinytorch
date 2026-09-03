@@ -3498,19 +3498,21 @@ static int forward_layers(Qwen2Engine *e) {
          * source layer's already-populated slab. */
         if (!kv_shared) {
         if (tt_profiling()) tt_prof_begin(TT_P_SCATTER, e->stream);
-        if (kv_use_q4_eff(e)) {
+        /* Dual-write: always FP32, plus Q4/Q8 when allocated (ptr-gated,
+         * threshold-independent). Decode flash read stays threshold-gated. */
+        k_kv_scatter<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(
+            e->d_k_stage, e->d_v_stage, Kl_f, Vl_f, e->d_pos,
+            KV_l, HDl, c->max_ctx);
+        if (Kl_q4 && Vl_q4) {
             const int num_blocks = kvdim_l / 32;
             k_kv_scatter_q4_0<<<(num_blocks + 255) / 256, 256, 0, e->stream>>>(
                 e->d_k_stage, e->d_v_stage, Kl_q4, Vl_q4, e->d_pos,
                 KV_l, HDl, c->max_ctx);
-        } else if (kv_use_q8_eff(e)) {
+        }
+        if (Kl_q8 && Vl_q8) {
             const int num_blocks = kvdim_l / 32;
             k_kv_scatter_q8_0<<<(num_blocks + 255) / 256, 256, 0, e->stream>>>(
                 e->d_k_stage, e->d_v_stage, Kl_q8, Vl_q8, e->d_pos,
-                KV_l, HDl, c->max_ctx);
-        } else {
-            k_kv_scatter<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(
-                e->d_k_stage, e->d_v_stage, Kl_f, Vl_f, e->d_pos,
                 KV_l, HDl, c->max_ctx);
         }
         if (tt_profiling()) tt_prof_end(TT_P_SCATTER, e->stream);
@@ -4289,6 +4291,10 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
                     k_kv_scatter_q4_0_batched<<<(total_blocks + 255)/256, 256, 0, e->stream>>>(
                         d_K, d_V, Kl_q4, Vl_q4, d_pos_batch, KV_l, HDl, c->max_ctx, n);
                 } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8) {
+                    /* Dual-write FP32 + Q8 (mirror Q4 path): hybrid decode
+                     * below thresh reads FP32, so it must be populated. */
+                    k_kv_scatter_batched<<<(n*kvdim_l+255)/256, 256, 0, e->stream>>>(
+                        d_K, d_V, Kl_f, Vl_f, d_pos_batch, KV_l, HDl, c->max_ctx, n, kvdim_l);
                     const int blocks_per_slot = kvdim_l / 32;
                     const long total_blocks = (long)n * blocks_per_slot;
                     k_kv_scatter_q8_0_batched<<<(total_blocks + 255)/256, 256, 0, e->stream>>>(
@@ -4644,6 +4650,10 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
                     k_kv_scatter_q4_0_batched<<<(total_blocks + 255)/256, 256, 0, e->stream>>>(
                         d_K, d_V, Kl_q4, Vl_q4, d_pos_batch, KV_l, HDl, c->max_ctx, n);
                 } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8) {
+                    /* Dual-write FP32 + Q8 (mirror Q4 path): hybrid decode
+                     * below thresh reads FP32, so it must be populated. */
+                    k_kv_scatter_batched<<<(n*kvdim_l+255)/256, 256, 0, e->stream>>>(
+                        d_K, d_V, Kl_f, Vl_f, d_pos_batch, KV_l, HDl, c->max_ctx, n, kvdim_l);
                     const int blocks_per_slot = kvdim_l / 32;
                     const long total_blocks = (long)n * blocks_per_slot;
                     k_kv_scatter_q8_0_batched<<<(total_blocks + 255)/256, 256, 0, e->stream>>>(
