@@ -1480,6 +1480,7 @@ __global__ void k_fa2_combine(
 #define BR_PREFILL 8
 #define BC_PREFILL 64
 
+#if 0 /* Q4 prefill flash: parked pending k_fa2_q4_split decode HD=64 fix */
 template <int ELEMS>
 __global__ void k_prefill_flash_q4_0(
     const float     *__restrict__ Q,
@@ -1666,6 +1667,7 @@ __global__ void k_prefill_flash_q4_0(
         }
     }
 }
+#endif
 
 __global__ void k_prefill_flash_q8_0(
     const float     *__restrict__ Q,
@@ -2931,6 +2933,15 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
             cudaFuncSetAttribute(k_prefill_flash_fp32,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)max_smem_fp32);
         }
+        {
+            int max_bph = max_hd / 32;
+            size_t max_smem_q8 = 2 * (size_t)BC_PREFILL * max_bph * sizeof(half)
+                               + 2 * (size_t)BC_PREFILL * max_hd * sizeof(int8_t);
+            if (max_smem_q8 > 48 * 1024) {
+                cudaFuncSetAttribute(k_prefill_flash_q8_0,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)max_smem_q8);
+            }
+        }
     }
     return e;
 
@@ -3977,12 +3988,15 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
     /* Task 1: persistent arena reuse for n <= pf_arena_max_n */
     int max_qout = c->n_heads * HD;
     int max_kvdim = c->n_kv_heads * HD;
+    int max_ff = hidden_dim;
     for (int l = 0; l < c->n_layers; l++) {
         int H_l = e->pl_heads[l] > 0 ? e->pl_heads[l] : c->n_heads;
         int KV_l = e->pl_kv[l] > 0 ? e->pl_kv[l] : c->n_kv_heads;
         int HDl = e->pl_hd[l] > 0 ? e->pl_hd[l] : HD;
         if (H_l * HDl > max_qout) max_qout = H_l * HDl;
         if (KV_l * HDl > max_kvdim) max_kvdim = KV_l * HDl;
+        int FFx = e->pl_ffn[l] > 0 ? e->pl_ffn[l] : hidden_dim;
+        if (FFx > max_ff) max_ff = FFx;
     }
     int use_arena = (e->pf_arena_max_n >= (size_t)n && e->d_pf_X && e->d_pf_Xn && e->d_pf_Q && e->d_pf_K && e->d_pf_V && e->d_pf_Att && e->d_pf_H && e->d_pf_G && e->d_pf_U && e->d_pf_pos_batch);
     float *d_X = NULL, *d_Xn = NULL, *d_Q = NULL, *d_K = NULL, *d_V = NULL;
@@ -3998,9 +4012,9 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         if (cudaMalloc(&d_K, (size_t)n * max_kvdim * sizeof(float)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); return -6; }
         if (cudaMalloc(&d_V, (size_t)n * max_kvdim * sizeof(float)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); return -7; }
         if (cudaMalloc(&d_Att, (size_t)n * max_qout * sizeof(float)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); return -8; }
-        if (cudaMalloc(&d_H, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); return -9; }
-        if (cudaMalloc(&d_G, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); cudaFree(d_H); return -10; }
-        if (cudaMalloc(&d_U, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); cudaFree(d_H); cudaFree(d_G); return -11; }
+        if (cudaMalloc(&d_H, (size_t)n * max_ff * sizeof(float)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); return -9; }
+        if (cudaMalloc(&d_G, (size_t)n * max_ff * sizeof(float)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); cudaFree(d_H); return -10; }
+        if (cudaMalloc(&d_U, (size_t)n * max_ff * sizeof(float)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); cudaFree(d_H); cudaFree(d_G); return -11; }
         if (cudaMalloc(&d_pos_batch, (size_t)n * sizeof(int)) != cudaSuccess) { cudaFree(d_X); cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); cudaFree(d_H); cudaFree(d_G); cudaFree(d_U); return -12; }
     }
 
@@ -4024,6 +4038,15 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         if (smem_fp32_attr > 48 * 1024) {
             cudaFuncSetAttribute(k_prefill_flash_fp32,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_fp32_attr);
+        }
+        {
+            int pf_bph = pf_max_hd / 32;
+            size_t smem_q8_attr = 2 * (size_t)BC_PREFILL * pf_bph * sizeof(half)
+                                + 2 * (size_t)BC_PREFILL * pf_max_hd * sizeof(int8_t);
+            if (smem_q8_attr > 48 * 1024) {
+                cudaFuncSetAttribute(k_prefill_flash_q8_0,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_q8_attr);
+            }
         }
     }
 
@@ -4166,7 +4189,21 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
 
         /* P0-1: prefill flash always on FP32 (bit-exact output at every ctx).
          * Q4 cache stays populated for decode above thresh. P0-2: ptr guard. */
-        if (e->use_q4_kvcache && Kl_q4 && Vl_q4) {
+        if (HDl > 128) {
+            /* Tiled prefill flash regs/smem sized for elems<=4 (HD<=128);
+             * fall back to per-token serial path for this layer only. */
+            if (e->use_q8_kvcache && Kl_q8 && Vl_q8 && !(e->use_q4_kvcache && Kl_q4 && Vl_q4)) {
+                for (int qi = 0; qi < n; qi++)
+                    k_flash_gqa_q8_0<<<H_l, 32, 0, e->stream>>>(
+                        d_Q + (long)qi * attn_qout, Kl_q8, Vl_q8, d_Att + (long)qi * attn_qout,
+                        d_pos_batch + qi, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l);
+            } else {
+                for (int qi = 0; qi < n; qi++)
+                    k_flash_gqa<<<H_l, 32, 0, e->stream>>>(
+                        d_Q + (long)qi * attn_qout, Kl_f, Vl_f, d_Att + (long)qi * attn_qout,
+                        d_pos_batch + qi, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l);
+            }
+        } else if (e->use_q4_kvcache && Kl_q4 && Vl_q4) {
             int num_q_tiles = (n + BR_PREFILL - 1) / BR_PREFILL;
             dim3 grid_fp(num_q_tiles, KV_l);
             int threads_fp = (H_l / KV_l) * 32;
@@ -4309,12 +4346,15 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
 
     int max_qout = c->n_heads * HD;
     int max_kvdim = c->n_kv_heads * HD;
+    int max_ff = hidden_dim;
     for (int l = 0; l < c->n_layers; l++) {
         int H_l = e->pl_heads[l] > 0 ? e->pl_heads[l] : c->n_heads;
         int KV_l = e->pl_kv[l] > 0 ? e->pl_kv[l] : c->n_kv_heads;
         int HDl = e->pl_hd[l] > 0 ? e->pl_hd[l] : HD;
         if (H_l * HDl > max_qout) max_qout = H_l * HDl;
         if (KV_l * HDl > max_kvdim) max_kvdim = KV_l * HDl;
+        int FFx = e->pl_ffn[l] > 0 ? e->pl_ffn[l] : hidden_dim;
+        if (FFx > max_ff) max_ff = FFx;
     }
     int use_arena = (e->pf_arena_max_n >= (size_t)n && e->d_pf_Xn && e->d_pf_Q && e->d_pf_K && e->d_pf_V && e->d_pf_Att && e->d_pf_H && e->d_pf_G && e->d_pf_U && e->d_pf_pos_batch);
     float *d_X = d_x_out;            /* caller-supplied; no cudaMalloc */
@@ -4330,9 +4370,9 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
         if (cudaMalloc(&d_K, (size_t)n * max_kvdim * sizeof(float)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); return -6; }
         if (cudaMalloc(&d_V, (size_t)n * max_kvdim * sizeof(float)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); return -7; }
         if (cudaMalloc(&d_Att, (size_t)n * max_qout * sizeof(float)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); return -8; }
-        if (cudaMalloc(&d_H, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); return -9; }
-        if (cudaMalloc(&d_G, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); cudaFree(d_H); return -10; }
-        if (cudaMalloc(&d_U, (size_t)n * hidden_dim * sizeof(float)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); cudaFree(d_H); cudaFree(d_G); return -11; }
+        if (cudaMalloc(&d_H, (size_t)n * max_ff * sizeof(float)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); return -9; }
+        if (cudaMalloc(&d_G, (size_t)n * max_ff * sizeof(float)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); cudaFree(d_H); return -10; }
+        if (cudaMalloc(&d_U, (size_t)n * max_ff * sizeof(float)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); cudaFree(d_H); cudaFree(d_G); return -11; }
         if (cudaMalloc(&d_pos_batch, (size_t)n * sizeof(int)) != cudaSuccess) { cudaFree(d_Xn); cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_Att); cudaFree(d_H); cudaFree(d_G); cudaFree(d_U); return -12; }
     }
 
@@ -4354,6 +4394,15 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
         if (smem_fp32_attr > 48 * 1024) {
             cudaFuncSetAttribute(k_prefill_flash_fp32,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_fp32_attr);
+        }
+        {
+            int pf_bph = pf_max_hd / 32;
+            size_t smem_q8_attr = 2 * (size_t)BC_PREFILL * pf_bph * sizeof(half)
+                                + 2 * (size_t)BC_PREFILL * pf_max_hd * sizeof(int8_t);
+            if (smem_q8_attr > 48 * 1024) {
+                cudaFuncSetAttribute(k_prefill_flash_q8_0,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_q8_attr);
+            }
         }
     }
 
@@ -4495,7 +4544,21 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
 
         /* P0-1: prefill flash always on FP32 (bit-exact output at every ctx).
          * Q4 cache stays populated for decode above thresh. P0-2: ptr guard. */
-        if (e->use_q4_kvcache && Kl_q4 && Vl_q4) {
+        if (HDl > 128) {
+            /* Tiled prefill flash regs/smem sized for elems<=4 (HD<=128);
+             * fall back to per-token serial path for this layer only. */
+            if (e->use_q8_kvcache && Kl_q8 && Vl_q8 && !(e->use_q4_kvcache && Kl_q4 && Vl_q4)) {
+                for (int qi = 0; qi < n; qi++)
+                    k_flash_gqa_q8_0<<<H_l, 32, 0, e->stream>>>(
+                        d_Q + (long)qi * attn_qout, Kl_q8, Vl_q8, d_Att + (long)qi * attn_qout,
+                        d_pos_batch + qi, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l);
+            } else {
+                for (int qi = 0; qi < n; qi++)
+                    k_flash_gqa<<<H_l, 32, 0, e->stream>>>(
+                        d_Q + (long)qi * attn_qout, Kl_f, Vl_f, d_Att + (long)qi * attn_qout,
+                        d_pos_batch + qi, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l);
+            }
+        } else if (e->use_q4_kvcache && Kl_q4 && Vl_q4) {
             int num_q_tiles = (n + BR_PREFILL - 1) / BR_PREFILL;
             dim3 grid_fp(num_q_tiles, KV_l);
             int threads_fp = (H_l / KV_l) * 32;
