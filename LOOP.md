@@ -137,6 +137,14 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - **Hidden 896 GEMV target (130 GB/s) disproven** as launch-bound physics (subagent `1e9e205f`): K=896 → nb=28 → only 28 blocks on 16-SM RTX 3050; null kernel launch overhead ~5 µs exceeds the 3.47 µs needed for 130 GB/s. Real fix is fused QKV or CUDA graph, not per-shape tuning. Plan updated `docs/plans/2026-08-29-hidden-896-131k-fa.md`.
 - **Verification**: `ci_local.sh`, `verify.sh m61` (now includes chat-multiturn with `build/chat_llm_gpu`), `verify.sh ple` all 100% GREEN.
 
+### Cycle 25: Roofline Chase — Wall Found at Q4 Dequant ALU
+- Baseline locked: FP32 1419, WMMA 2274, GEMM 68.6% (pp759).
+- T2 INT8 WMMA FAILED/reverted: o+mlp 152→287ms (quant overhead > tensor savings), argmax flips. Regime latency-bound not tensor-bound.
+- T3 SwiGLU-fuse FAILED/reverted: -6.6% (expf/tanh ALU > d_H traffic saved). Greedy-identical but slower.
+- T4 gate+up dual-launch FAILED/reverted: 0% delta (launches 0.25ms of 335ms; SM 100% bursts). Split-K skipped (occupancy fine).
+- Wall: per-MAC Q4 dequant ALU starves MMA (~3 TFLOPS eff of ~50 ceiling). Only LUT-dequant or prefill-FP16-copy can move GEMM now. Flash (~150ms) now equals GEMM — next target.
+- Prefill stands 2.3k (WMMA, 0.3x llama 8k). 100x dead on this GPU; realistic ceiling ~4-6x via dequant-LUT + flash work.
+
 ### Cycle 24: Final Honest Matrix (3-Hour Loop Closeout)
 - Decode FP32: ctx32 272 / ctx128 231 / ctx512 116 / ctx1024 115.5 (needs --max-ctx 2048; default ctx1024 FAILS `f32 upload missing` = KV capacity, known).
 - Prefill pp759: FP32 1372 / WMMA 2272 (+66%) / Q8 1474 — all emit 8 real tokens. (Old 25k Q8 figure was garbage attention, VOID.)

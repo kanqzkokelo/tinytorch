@@ -16,3 +16,9 @@
 - Fused pp759: 2113/2114/2100 (median 2113) vs baseline 2228/2262/2264 (-6.6%, needed +10%).
 - Greedy-identical: Y. Reason: expf/tanh ALU added to X-load in latency-bound regime costs more than d_H traffic saves.
 - Lesson: in latency-bound regime only FEWER launches/syncs win — no extra ALU. Task 4: tiles + gate/up single-launch (same math, one X read, half the launches).
+
+## Task 4 outcome: FAILED, reverted (no commit)
+- Dual pp759: 2373/2372/2361 (med 2372) vs base 2202/2378/2378 (med 2378). Delta 0%. o+mlp 154.9→151.0ms (noise).
+- Greedy-identical Y. SM hits 100% in bursts; launches ~0.25ms of ~335ms; X-read halving (65MB) irrelevant vs GBs of W traffic.
+- Wall identified: per-MAC Q4 dequant ALU (shifts/masks/int→half per element) starves MMA — neither dtype-rate (T2), traffic-fusion (T3), nor launch-count (T4) moves it.
+- Next: LUT-based 2-nibble dequant, or prefill-only FP16 weight copy (1GB fits), or pivot to flash-attention (~150ms, now ~equal to GEMM post-WMMA).
