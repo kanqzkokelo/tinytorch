@@ -138,11 +138,15 @@ int main(void) {
             if (err > max_abs_err_splitk) max_abs_err_splitk = err;
         }
 
+        /* Q4_0 quant noise floor: measured 5.2e-2 (N1024) .. 9.8e-2 (N512) on
+         * outlier-heavy K (scale d~17). Threshold 1.5e-1 catches OOB/garbage
+         * (orders of magnitude larger) without failing on inherent noise.
+         * Q8 twin uses 1e-2; Q4 noise is ~5-10x. See ef19cdb audit. */
         printf("N = %4d | max_abs_err (standard): %11.4e | max_abs_err (split-k S=%d): %11.4e | nan/inf: %d | %s\n",
                N, max_abs_err, S, max_abs_err_splitk, nan_inf_count,
-               (max_abs_err < 5e-2f && max_abs_err_splitk < 5e-2f && nan_inf_count == 0) ? "PASS" : "FAIL");
+               (max_abs_err < 1.5e-1f && max_abs_err_splitk < 1.5e-1f && nan_inf_count == 0) ? "PASS" : "FAIL");
 
-        if (max_abs_err >= 5e-2f || max_abs_err_splitk >= 5e-2f || nan_inf_count > 0) {
+        if (max_abs_err >= 1.5e-1f || max_abs_err_splitk >= 1.5e-1f || nan_inf_count > 0) {
             total_failures++;
         }
     }
