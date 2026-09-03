@@ -880,6 +880,88 @@ __global__ void k_kv_scatter_q4_0(
     }
 }
 
+/* Late-enable backfill (P1-2 fix): quantize FP32 cache slots [0..n_slots)
+ * into the Q cache. Same per-block quantization as the single-token scatter
+ * kernels, but the source is the FP32 cache slab (layout [slot][kvdim]) and
+ * the slot index is explicit (no d_pos). Launched once per layer at enable
+ * time; shared-KV layers are skipped by the caller (they alias the source
+ * slab, mirroring the forward scatter path). */
+__global__ void k_kv_backfill_q8_0(
+    const float *__restrict__ Kf,
+    const float *__restrict__ Vf,
+    BlockQ8_0   *__restrict__ Kc,
+    BlockQ8_0   *__restrict__ Vc,
+    int n_slots, int kvdim) {
+    const int nb = kvdim / 32;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_slots * nb) return;
+    const int slot = idx / nb;
+    const int bi = idx % nb;
+    const float *ks = Kf + (long)slot * kvdim + bi * 32;
+    const float *vs = Vf + (long)slot * kvdim + bi * 32;
+    float max_k = 0.0f, max_v = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        max_k = fmaxf(max_k, fabsf(ks[i]));
+        max_v = fmaxf(max_v, fabsf(vs[i]));
+    }
+    const float scale_k = (max_k > 0.0f) ? (max_k / 127.0f) : 1.0f;
+    const float inv_k   = (max_k > 0.0f) ? (127.0f / max_k) : 0.0f;
+    const float scale_v = (max_v > 0.0f) ? (max_v / 127.0f) : 1.0f;
+    const float inv_v   = (max_v > 0.0f) ? (127.0f / max_v) : 0.0f;
+    BlockQ8_0 *kd = Kc + (long)slot * nb + bi;
+    BlockQ8_0 *vd = Vc + (long)slot * nb + bi;
+    kd->d = __float2half(scale_k);
+    vd->d = __float2half(scale_v);
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        kd->qs[i] = (int8_t)__float2int_rn(ks[i] * inv_k);
+        vd->qs[i] = (int8_t)__float2int_rn(vs[i] * inv_v);
+    }
+}
+
+__global__ void k_kv_backfill_q4_0(
+    const float *__restrict__ Kf,
+    const float *__restrict__ Vf,
+    BlockQ4_0   *__restrict__ Kc,
+    BlockQ4_0   *__restrict__ Vc,
+    int n_slots, int kvdim) {
+    const int nb = kvdim / 32;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_slots * nb) return;
+    const int slot = idx / nb;
+    const int bi = idx % nb;
+    const float *ks = Kf + (long)slot * kvdim + bi * 32;
+    const float *vs = Vf + (long)slot * kvdim + bi * 32;
+    float max_k = 0.0f, max_v = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        max_k = fmaxf(max_k, fabsf(ks[i]));
+        max_v = fmaxf(max_v, fabsf(vs[i]));
+    }
+    const float scale_k = (max_k > 0.0f) ? (max_k / 7.0f) : 1.0f;
+    const float inv_k   = (max_k > 0.0f) ? (7.0f / max_k) : 0.0f;
+    const float scale_v = (max_v > 0.0f) ? (max_v / 7.0f) : 1.0f;
+    const float inv_v   = (max_v > 0.0f) ? (7.0f / max_v) : 0.0f;
+    BlockQ4_0 *kd = Kc + (long)slot * nb + bi;
+    BlockQ4_0 *vd = Vc + (long)slot * nb + bi;
+    kd->d = __float2half(scale_k);
+    vd->d = __float2half(scale_v);
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        int q0_k = __float2int_rn(ks[j] * inv_k) + 8;
+        int q1_k = __float2int_rn(ks[j + 16] * inv_k) + 8;
+        q0_k = max(0, min(15, q0_k));
+        q1_k = max(0, min(15, q1_k));
+        kd->qs[j] = (uint8_t)((q0_k & 0x0F) | ((q1_k & 0x0F) << 4));
+        int q0_v = __float2int_rn(vs[j] * inv_v) + 8;
+        int q1_v = __float2int_rn(vs[j + 16] * inv_v) + 8;
+        q0_v = max(0, min(15, q0_v));
+        q1_v = max(0, min(15, q1_v));
+        vd->qs[j] = (uint8_t)((q0_v & 0x0F) | ((q1_v & 0x0F) << 4));
+    }
+}
+
 /* Flash GQA kernel reading Q8_0 KV cache, dequantizing on-the-fly in registers */
 __global__ void k_flash_gqa_q8_0(
     const float     *__restrict__ q,
@@ -2031,6 +2113,33 @@ extern "C" int tt_kv_scatter_q8_0(const float *kst, const float *vst, void *Kc_q
     const int num_blocks = (n_kv_heads * head_dim) / 32;
     k_kv_scatter_q8_0<<<(num_blocks + 255) / 256, 256, 0, stream>>>(
         kst, vst, (BlockQ8_0 *)Kc_q8, (BlockQ8_0 *)Vc_q8, d_pos, n_kv_heads, head_dim, max_ctx);
+    return 0;
+}
+
+extern "C" int tt_kv_scatter_q4_0(const float *kst, const float *vst, void *Kc_q4, void *Vc_q4,
+                                  const int *d_pos, int n_kv_heads, int head_dim, int max_ctx, cudaStream_t stream) {
+    const int num_blocks = (n_kv_heads * head_dim) / 32;
+    k_kv_scatter_q4_0<<<(num_blocks + 255) / 256, 256, 0, stream>>>(
+        kst, vst, (BlockQ4_0 *)Kc_q4, (BlockQ4_0 *)Vc_q4, d_pos, n_kv_heads, head_dim, max_ctx);
+    return 0;
+}
+
+/* Test hooks for the late-enable backfill (P1-2): quantize FP32 cache slabs
+ * [0..n_slots) into Q caches in one launch. Bit-identical to per-slot
+ * tt_kv_scatter_q{4,8}_0 given the same FP32 slot contents. */
+extern "C" int tt_kv_backfill_q8_0(const float *Kf, const float *Vf, void *Kc_q8, void *Vc_q8,
+                                     int n_slots, int kvdim, cudaStream_t stream) {
+    long total = (long)n_slots * (kvdim / 32);
+    k_kv_backfill_q8_0<<<(total + 255) / 256, 256, 0, stream>>>(
+        Kf, Vf, (BlockQ8_0 *)Kc_q8, (BlockQ8_0 *)Vc_q8, n_slots, kvdim);
+    return 0;
+}
+
+extern "C" int tt_kv_backfill_q4_0(const float *Kf, const float *Vf, void *Kc_q4, void *Vc_q4,
+                                     int n_slots, int kvdim, cudaStream_t stream) {
+    long total = (long)n_slots * (kvdim / 32);
+    k_kv_backfill_q4_0<<<(total + 255) / 256, 256, 0, stream>>>(
+        Kf, Vf, (BlockQ4_0 *)Kc_q4, (BlockQ4_0 *)Vc_q4, n_slots, kvdim);
     return 0;
 }
 
@@ -3275,6 +3384,10 @@ static int forward_layers(Qwen2Engine *e) {
             if (e->d_kc_q8) {
                 Kl_q8 = e->d_kc_q8 + (long)e->pl_src[l] * cache_layer_q8;
                 Vl_q8 = e->d_vc_q8 + (long)e->pl_src[l] * cache_layer_q8;
+            }
+            if (e->d_kc_q4) {
+                Kl_q4 = e->d_kc_q4 + (long)e->pl_src[l] * cache_layer_q8;
+                Vl_q4 = e->d_vc_q4 + (long)e->pl_src[l] * cache_layer_q8;
             }
         }
         if (trace) fprintf(stderr, "[FWD] L%d enter\n", l);
@@ -5147,7 +5260,41 @@ extern "C" void qwen2_engine_enable_q8_kvcache(Qwen2Engine *e, int enable) {
             cudaMalloc(&e->d_vc_q8, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ8_0));
             cudaMemset(e->d_vc_q8, 0, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ8_0));
         }
-        fprintf(stderr, "[qwen2-engine] Q8_0 KV cache ENABLED (4x DRAM traffic reduction)\n");
+        /* Late-enable backfill (P1-2): FP32 decoding may have populated slots
+         * [0..pos) before this call; the memset above left those Q8 slots
+         * zeroed, which attention would read as silent wrong output above
+         * threshold. Quantize existing FP32 slabs into Q8 (one-time cost).
+         * Shared-KV layers skip: they alias the source slab, mirroring the
+         * forward scatter path. */
+        if (e->pos > 0 && e->d_kc && e->d_vc && e->d_kc_q8 && e->d_vc_q8 && !getenv("TT_NO_BACKFILL")) {
+            long cache_layer = (long)e->cfg.n_kv_heads * e->cfg.max_ctx * e->cfg.head_dim;
+            if (e->pl_hd[0] > 0) {
+                long mx = 0;
+                for (int l = 0; l < e->cfg.n_layers; l++) {
+                    long w = (long)e->pl_kv[l] * e->pl_hd[l];
+                    if (w > mx) mx = w;
+                }
+                cache_layer = mx * e->cfg.max_ctx;
+            }
+            int n_slots = e->pos < e->cfg.max_ctx ? e->pos : e->cfg.max_ctx;
+            for (int l = 0; l < e->cfg.n_layers; l++) {
+                if (e->has_pl_embd && e->pl_src[l] >= 0) continue;
+                int KV_l = e->pl_kv[l] > 0 ? e->pl_kv[l] : e->cfg.n_kv_heads;
+                int HDl = e->pl_hd[l] > 0 ? e->pl_hd[l] : e->cfg.head_dim;
+                int kvdim = KV_l * HDl;
+                if (kvdim % 32 != 0) continue;
+                long total = (long)n_slots * (kvdim / 32);
+                k_kv_backfill_q8_0<<<(total + 255) / 256, 256, 0, e->stream>>>(
+                    e->d_kc + (long)l * cache_layer,
+                    e->d_vc + (long)l * cache_layer,
+                    e->d_kc_q8 + (long)l * cache_per_blocks,
+                    e->d_vc_q8 + (long)l * cache_per_blocks,
+                    n_slots, kvdim);
+            }
+            cudaStreamSynchronize(e->stream);
+        }
+        fprintf(stderr, "[qwen2-engine] Q8_0 KV cache ENABLED (4x DRAM traffic reduction), backfilled %d slots\n",
+                (e->pos > 0 && e->d_kc_q8 && !getenv("TT_NO_BACKFILL")) ? (e->pos < e->cfg.max_ctx ? e->pos : e->cfg.max_ctx) : 0);
     }
     e->use_q8_kvcache = enable;
 }
@@ -5174,7 +5321,36 @@ extern "C" void qwen2_engine_enable_q4_kvcache(Qwen2Engine *e, int enable) {
             cudaMalloc(&e->d_vc_q4, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ4_0));
             cudaMemset(e->d_vc_q4, 0, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ4_0));
         }
-        fprintf(stderr, "[qwen2-engine] Q4_0 KV cache ENABLED (8x DRAM traffic reduction vs FP32)\n");
+        /* Late-enable backfill (P1-2): see Q8 path above. */
+        if (e->pos > 0 && e->d_kc && e->d_vc && e->d_kc_q4 && e->d_vc_q4 && !getenv("TT_NO_BACKFILL")) {
+            long cache_layer = (long)e->cfg.n_kv_heads * e->cfg.max_ctx * e->cfg.head_dim;
+            if (e->pl_hd[0] > 0) {
+                long mx = 0;
+                for (int l = 0; l < e->cfg.n_layers; l++) {
+                    long w = (long)e->pl_kv[l] * e->pl_hd[l];
+                    if (w > mx) mx = w;
+                }
+                cache_layer = mx * e->cfg.max_ctx;
+            }
+            int n_slots = e->pos < e->cfg.max_ctx ? e->pos : e->cfg.max_ctx;
+            for (int l = 0; l < e->cfg.n_layers; l++) {
+                if (e->has_pl_embd && e->pl_src[l] >= 0) continue;
+                int KV_l = e->pl_kv[l] > 0 ? e->pl_kv[l] : e->cfg.n_kv_heads;
+                int HDl = e->pl_hd[l] > 0 ? e->pl_hd[l] : e->cfg.head_dim;
+                int kvdim = KV_l * HDl;
+                if (kvdim % 32 != 0) continue;
+                long total = (long)n_slots * (kvdim / 32);
+                k_kv_backfill_q4_0<<<(total + 255) / 256, 256, 0, e->stream>>>(
+                    e->d_kc + (long)l * cache_layer,
+                    e->d_vc + (long)l * cache_layer,
+                    e->d_kc_q4 + (long)l * cache_per_blocks,
+                    e->d_vc_q4 + (long)l * cache_per_blocks,
+                    n_slots, kvdim);
+            }
+            cudaStreamSynchronize(e->stream);
+        }
+        fprintf(stderr, "[qwen2-engine] Q4_0 KV cache ENABLED (8x DRAM traffic reduction vs FP32), backfilled %d slots\n",
+                (e->pos > 0 && e->d_kc_q4 && !getenv("TT_NO_BACKFILL")) ? (e->pos < e->cfg.max_ctx ? e->pos : e->cfg.max_ctx) : 0);
     }
     e->use_q4_kvcache = enable;
 }
