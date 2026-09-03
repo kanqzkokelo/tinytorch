@@ -137,6 +137,14 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - **Hidden 896 GEMV target (130 GB/s) disproven** as launch-bound physics (subagent `1e9e205f`): K=896 → nb=28 → only 28 blocks on 16-SM RTX 3050; null kernel launch overhead ~5 µs exceeds the 3.47 µs needed for 130 GB/s. Real fix is fused QKV or CUDA graph, not per-shape tuning. Plan updated `docs/plans/2026-08-29-hidden-896-131k-fa.md`.
 - **Verification**: `ci_local.sh`, `verify.sh m61` (now includes chat-multiturn with `build/chat_llm_gpu`), `verify.sh ple` all 100% GREEN.
 
+### Cycle 18: Prefill Parity — Arena + float4 + Q4 Wiring + Guards
+- **Task 1** (`c34198d`): persistent activation arena in `Qwen2Engine` — 20 `cudaMalloc`/`cudaFree` per prefill eliminated for n≤512 (reviewer PASS, gates GREEN).
+- **Task 2** (`6a7cffa`): `k_prefill_flash_fp32` vectorized with `float4` 128-bit loads, `BC_PREFILL_FP32` 32→64 + `cudaFuncSetAttribute` — pp512 FP32 1364→1662 tok/s (+21.8%), bit-exact, reviewer PASS.
+- **Task 3** (`ac5d62f`, verified KEEP): Q4 prefill wiring — `k_kv_scatter_q4_0_batched` + `k_prefill_flash_q4_0<ELEMS>` added; fault-hunt found 2 P0s (raw-flag vs threshold-gate incoherence; pointer-vs-flag NULL crash) → fixed via dual-write FP32+Q4 + FP32 flash (bit-exact prefill) + `Kl_q4&&Vl_q4` guards. Q4 flash kernel retained unlaunched (speedup blocked on `k_fa2_q4_split` decode HD=64 fix — future work).
+- **Guard fix** (`cd3fcdf`): same NULL-guard class applied to 4 raw Q8 gates (`Kl_q8&&Vl_q8`), falls through to FP32 when NULL.
+- **Final pp512 (434 tok, inline 3-run, qwen2.5-0.5b Q4_0)**: FP32 ~1643, Q4 ~1644 (= FP32 by construction), Q8 ~25476. vs llama.cpp 7941: Q8 **3.2x**.
+- **Verification**: `ci_local` GREEN, `m61` 7/7 + chat PASS, `ple` PASS (standard path; ple gemma-E2B env failure pre-existing, unrelated).
+
 ### Cycle 17: Batched RoPE + Scatter in Prefill
 - **Action**: Created batched RoPE (4 variants: neox/gptj × ff) and batched KV scatter (FP32 + Q8). Replaces per-token kernel launches in `prefill_batched_gemm`. Also batched RMSNorm, bias add, QK-norm to cut remaining O(n) launches. Commit `1afea47`.
 - **Performance (honest 3-run median, raw `hello*N` prompts, qwen2.5-0.5b Q4_0, audited by `dc8f2dc4`)**:
