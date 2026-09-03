@@ -137,6 +137,13 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - **Hidden 896 GEMV target (130 GB/s) disproven** as launch-bound physics (subagent `1e9e205f`): K=896 → nb=28 → only 28 blocks on 16-SM RTX 3050; null kernel launch overhead ~5 µs exceeds the 3.47 µs needed for 130 GB/s. Real fix is fused QKV or CUDA graph, not per-shape tuning. Plan updated `docs/plans/2026-08-29-hidden-896-131k-fa.md`.
 - **Verification**: `ci_local.sh`, `verify.sh m61` (now includes chat-multiturn with `build/chat_llm_gpu`), `verify.sh ple` all 100% GREEN.
 
+### Cycle 22: Graph/Hybrid Coherence P1 Cluster — All 4 Fixed
+- `a27424a` NO_BACKFILL: hatch now forces FP32 flash above threshold (`kv_use_q*_eff` return 0). Backfill test PASS both modes.
+- `4519522` graph S: replay baked S=64/32 always vs eager S=(ctx+63)/64 (ctx50: 64 vs 2; ctx512: 64 vs 8). Capture now bakes eager formula (`split_S_q`, `split_S_fp32` clamped). m61 graph/eager-identical PASS.
+- `9ec11d9` late-enable: Q4/Q8 flip post-capture now destroys `graph_exec`, clears ready/pending, `no_graph=1`. Late-Q4 stream matches pure-eager prefix exactly.
+- `3d7daa9` rollback: destroys exec + `no_graph=1`. Rollback bit-exact (max_abs 0.0), rollback-after-capture decodes valid.
+- All verified KEEP (kernels-only, no drive-bys). Gates green throughout.
+
 ### Cycle 21: Q8 N>512 Fixed — Same HD=64 Disease in Prefill Flash
 - **Root cause** (`770a9e8`, verified KEEP): `k_prefill_flash_q8_0` hardcoded `elems==4` (HD=128); qwen2.5-0.5b HD=64 → Q overread, wrong `block_in_head`, misaligned u32 smem, out_row clobber + arena overrun → 716. Same disease as Q4 split (`ef19cdb`). Fix mirrors decode/fp32 elems branches (4 sites); HD=128 path byte-identical; no instrumentation left.
 - **HONEST CORRECTION**: old Q8 prefill numbers (24-25k tok/s) were GARBAGE attention (0 tokens emitted). Real Q8 prefill: ~1470-1505 tok/s ≈ FP32 1627 (same prompt). Q8 KV saves decode bandwidth only, not prefill. All prior Q8 prefill claims (pp512 25k, 3.2x llama) are VOID.
