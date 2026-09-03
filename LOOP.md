@@ -145,6 +145,10 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - Wall: per-MAC Q4 dequant ALU starves MMA (~3 TFLOPS eff of ~50 ceiling). Only LUT-dequant or prefill-FP16-copy can move GEMM now. Flash (~150ms) now equals GEMM — next target.
 - Prefill stands 2.3k (WMMA, 0.3x llama 8k). 100x dead on this GPU; realistic ceiling ~4-6x via dequant-LUT + flash work.
 
+## 10k push: combo BANKED at 4.1-4.6k (Cycle 26)
+- `415b357` (verified KEEP): FP32 shadow (1365MB) + cuBLAS GEMM + fast flash. Hot median 4092-4633 (clock variance; 682MHz cold→1965MHz hot, can't lock w/o sudo — always warm up 2 runs). Greedy-identical, maxdiff 0.0128. Graceful OOM fallback (`[cublas-pre] ABORT`, drops shadows). Kernels-only +189/-14. Gates green.
+- Path 2.3k→4.6k banked (2x). Remaining to 10k: flash 54ms @1.4 TFLOPS needs FA2-class rewrite (~5x → ~10ms). GEMM at 5.5 TFLOPS cuBLAS is done.
+
 ## 10k push: cuBLAS GEMM done (+47%) but reverted — flash is the wall
 - FP16 shadow (~700MB, fits) + cuBLAS (dlopen, no Makefile): 2377→3485 tok/s steady-state. Correct approach, killed dequant wall.
 - Reverted: (a) acceptance was 6k — flash fp32 146ms of 222ms caps GEMM-free at 4.6k; (b) pp759 parity FAIL (half-rounding flips first token over long ctx; short prompts OK).
