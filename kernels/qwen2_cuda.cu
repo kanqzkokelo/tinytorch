@@ -490,8 +490,9 @@ __global__ void k_kv_scatter_q4_0_batched(const float *__restrict__ kst, const f
     const float inv_v   = (max_v > 0.0f) ? (7.0f / max_v) : 0.0f;
     BlockQ4_0 *k_dest = Kc + (long)slot * blocks_per_slot + blk;
     BlockQ4_0 *v_dest = Vc + (long)slot * blocks_per_slot + blk;
-    k_dest->d = __float2half(scale_k);
-    v_dest->d = __float2half(scale_v);
+    // d is raw fp16 bits (uint16_t): store bit pattern, not value-convert
+    k_dest->d = __half_as_ushort(__float2half(scale_k));
+    v_dest->d = __half_as_ushort(__float2half(scale_v));
     #pragma unroll
     for (int j = 0; j < 16; j++) {
         int q0_k = __float2int_rn(k_vals[j] * inv_k) + 8;
@@ -861,8 +862,9 @@ __global__ void k_kv_scatter_q4_0(
     BlockQ4_0 *k_dest = Kc + (long)slot * num_blocks_per_slot + block_idx;
     BlockQ4_0 *v_dest = Vc + (long)slot * num_blocks_per_slot + block_idx;
 
-    k_dest->d = __float2half(scale_k);
-    v_dest->d = __float2half(scale_v);
+    // d is raw fp16 bits (uint16_t): store bit pattern, not value-convert
+    k_dest->d = __half_as_ushort(__float2half(scale_k));
+    v_dest->d = __half_as_ushort(__float2half(scale_v));
 
     #pragma unroll
     for (int j = 0; j < 16; j++) {
@@ -945,8 +947,9 @@ __global__ void k_kv_backfill_q4_0(
     const float inv_v   = (max_v > 0.0f) ? (7.0f / max_v) : 0.0f;
     BlockQ4_0 *kd = Kc + (long)slot * nb + bi;
     BlockQ4_0 *vd = Vc + (long)slot * nb + bi;
-    kd->d = __float2half(scale_k);
-    vd->d = __float2half(scale_v);
+    // d is raw fp16 bits (uint16_t): store bit pattern, not value-convert
+    kd->d = __half_as_ushort(__float2half(scale_k));
+    vd->d = __half_as_ushort(__float2half(scale_v));
     #pragma unroll
     for (int j = 0; j < 16; j++) {
         int q0_k = __float2int_rn(ks[j] * inv_k) + 8;
@@ -1296,8 +1299,23 @@ __global__ void k_fa2_q4_split(
     const int head = kv * G + warp;
 
     const int elems = head_dim / 32;
-    const float4 q_vec = *(const float4 *)(q + (long)head * head_dim + lane * 4);
-    float q0 = q_vec.x, q1 = q_vec.y, q2 = q_vec.z, q3 = q_vec.w;
+
+    // Load Q vector directly into registers for this head & lane
+    // (elems-branch: HD=128 -> float4, HD=64 -> float2; else scalar)
+    const float *qh = q + (long)head * head_dim + lane * elems;
+    float qreg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (elems == 4) {
+        const float4 q_vec = *(const float4 *)qh;
+        qreg[0] = q_vec.x; qreg[1] = q_vec.y; qreg[2] = q_vec.z; qreg[3] = q_vec.w;
+    } else if (elems == 2) {
+        const float2 q_vec = *(const float2 *)qh;
+        qreg[0] = q_vec.x; qreg[1] = q_vec.y;
+    } else {
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            if (i < elems) qreg[i] = qh[i];
+        }
+    }
 
     int t_lo = (window > 0 && pos >= window) ? (pos - window + 1) : 0;
     int nslots = pos - t_lo + 1;
@@ -1311,7 +1329,10 @@ __global__ void k_fa2_q4_split(
             p_l[(size_t)s * n_heads + head] = 0.0f;
         }
         float *myacc = p_acc + ((size_t)s * n_heads + head) * head_dim + lane * elems;
-        myacc[0] = 0.0f; myacc[1] = 0.0f; myacc[2] = 0.0f; myacc[3] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            if (i < elems) myacc[i] = 0.0f;
+        }
         return;
     }
 
@@ -1327,7 +1348,9 @@ __global__ void k_fa2_q4_split(
     float l_prev = 0.0f;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    const int block_in_head = lane >> 3;
+    // elems-scaled block index: HD=128 -> lane>>3, HD=64 -> lane>>4
+    const int block_in_head = (lane * elems) / 32;
+    // HD=128 fast-path mapping: 8 lanes/block, 4 nibbles/lane
     const int sub = lane & 7;
     const bool is_high = (sub >= 4);
     const int byte_offset = (sub & 3) * 4;
@@ -1344,8 +1367,9 @@ __global__ void k_fa2_q4_split(
             long g_idx = ((long)(t_tile + tok) * n_kv_heads + kv) * blocks_per_head + b;
             const BlockQ4_0 bk = Kc_q4[g_idx];
             const BlockQ4_0 bv = Vc_q4[g_idx];
-            sK_d[tok * blocks_per_head + b] = bk.d;
-            sV_d[tok * blocks_per_head + b] = bv.d;
+            // d is raw fp16 bits: reinterpret, not value-convert
+            sK_d[tok * blocks_per_head + b] = __ushort_as_half(bk.d);
+            sV_d[tok * blocks_per_head + b] = __ushort_as_half(bv.d);
 
             int row_off = tok * (head_dim / 2) + b * 16;
 #pragma unroll
@@ -1360,22 +1384,39 @@ __global__ void k_fa2_q4_split(
             const float dk = __half2float(sK_d[t_idx * blocks_per_head + block_in_head]);
             const float dv = __half2float(sV_d[t_idx * blocks_per_head + block_in_head]);
 
-            const uint32_t k_u32 = *(const uint32_t *)&sK_q[t_idx * (head_dim / 2) + block_in_head * 16 + byte_offset];
-            const uint32_t v_u32 = *(const uint32_t *)&sV_q[t_idx * (head_dim / 2) + block_in_head * 16 + byte_offset];
+            float kval[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float vval[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (elems == 2) {
+                // Q4_0 packing: byte j holds vals j (low) and j+16 (high).
+                // Lane covers 2 consecutive vals vbase..vbase+1 of its block.
+                const size_t krow = (size_t)t_idx * (head_dim / 2) + block_in_head * 16;
+                const int vbase = (lane & 15) * 2;
+                const uint8_t k_b0 = sK_q[krow + ((vbase    ) & 15)];
+                const uint8_t k_b1 = sK_q[krow + ((vbase + 1) & 15)];
+                const uint8_t v_b0 = sV_q[krow + ((vbase    ) & 15)];
+                const uint8_t v_b1 = sV_q[krow + ((vbase + 1) & 15)];
+                kval[0] = (float)(((int)((k_b0 >> ((vbase      >= 16) ? 4 : 0)) & 0x0F)) - 8);
+                kval[1] = (float)(((int)((k_b1 >> ((vbase + 1 >= 16) ? 4 : 0)) & 0x0F)) - 8);
+                vval[0] = (float)(((int)((v_b0 >> ((vbase      >= 16) ? 4 : 0)) & 0x0F)) - 8);
+                vval[1] = (float)(((int)((v_b1 >> ((vbase + 1 >= 16) ? 4 : 0)) & 0x0F)) - 8);
+            } else {
+                const uint32_t k_u32 = *(const uint32_t *)&sK_q[t_idx * (head_dim / 2) + block_in_head * 16 + byte_offset];
+                const uint32_t v_u32 = *(const uint32_t *)&sV_q[t_idx * (head_dim / 2) + block_in_head * 16 + byte_offset];
 
-            uint32_t k_shifted = k_u32 >> shift;
-            const float k0 = (float)((int)((k_shifted      ) & 0x0F) - 8);
-            const float k1 = (float)((int)((k_shifted >>  8) & 0x0F) - 8);
-            const float k2 = (float)((int)((k_shifted >> 16) & 0x0F) - 8);
-            const float k3 = (float)((int)((k_shifted >> 24) & 0x0F) - 8);
+                uint32_t k_shifted = k_u32 >> shift;
+                kval[0] = (float)((int)((k_shifted      ) & 0x0F) - 8);
+                kval[1] = (float)((int)((k_shifted >>  8) & 0x0F) - 8);
+                kval[2] = (float)((int)((k_shifted >> 16) & 0x0F) - 8);
+                kval[3] = (float)((int)((k_shifted >> 24) & 0x0F) - 8);
 
-            uint32_t v_shifted = v_u32 >> shift;
-            const float v0 = (float)((int)((v_shifted      ) & 0x0F) - 8);
-            const float v1 = (float)((int)((v_shifted >>  8) & 0x0F) - 8);
-            const float v2 = (float)((int)((v_shifted >> 16) & 0x0F) - 8);
-            const float v3 = (float)((int)((v_shifted >> 24) & 0x0F) - 8);
+                uint32_t v_shifted = v_u32 >> shift;
+                vval[0] = (float)((int)((v_shifted      ) & 0x0F) - 8);
+                vval[1] = (float)((int)((v_shifted >>  8) & 0x0F) - 8);
+                vval[2] = (float)((int)((v_shifted >> 16) & 0x0F) - 8);
+                vval[3] = (float)((int)((v_shifted >> 24) & 0x0F) - 8);
+            }
 
-            float dot_partial = (q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3) * dk;
+            float dot_partial = (qreg[0] * kval[0] + qreg[1] * kval[1] + qreg[2] * kval[2] + qreg[3] * kval[3]) * dk;
             float score = warp_sum(dot_partial);
             score = __shfl_sync(0xffffffff, score, 0) * scale;
 
@@ -1385,10 +1426,10 @@ __global__ void k_fa2_q4_split(
             l_prev = l_prev * alpha + p;
 
             float pdv = p * dv;
-            acc[0] = acc[0] * alpha + pdv * v0;
-            acc[1] = acc[1] * alpha + pdv * v1;
-            acc[2] = acc[2] * alpha + pdv * v2;
-            acc[3] = acc[3] * alpha + pdv * v3;
+            acc[0] = acc[0] * alpha + pdv * vval[0];
+            acc[1] = acc[1] * alpha + pdv * vval[1];
+            acc[2] = acc[2] * alpha + pdv * vval[2];
+            acc[3] = acc[3] * alpha + pdv * vval[3];
 
             m_prev = m_curr;
         }
@@ -1400,7 +1441,10 @@ __global__ void k_fa2_q4_split(
         p_l[(size_t)s * n_heads + head] = l_prev;
     }
     float *myacc = p_acc + ((size_t)s * n_heads + head) * head_dim + lane * elems;
-    myacc[0] = acc[0]; myacc[1] = acc[1]; myacc[2] = acc[2]; myacc[3] = acc[3];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        if (i < elems) myacc[i] = acc[i];
+    }
 }
 
 #define BC_FP32 32
@@ -1651,8 +1695,9 @@ __global__ void k_prefill_flash_q4_0(
             const long g_idx = ((long)(s_start + tok) * n_kv_heads + kv) * blocks_per_head + b;
             const BlockQ4_0 bk = Kc[g_idx];
             const BlockQ4_0 bv = Vc[g_idx];
-            sK_d[tok * blocks_per_head + b] = bk.d;
-            sV_d[tok * blocks_per_head + b] = bv.d;
+            // d is raw fp16 bits: reinterpret, not value-convert
+            sK_d[tok * blocks_per_head + b] = __ushort_as_half(bk.d);
+            sV_d[tok * blocks_per_head + b] = __ushort_as_half(bv.d);
             const int row_off = tok * (head_dim / 2) + b * 16;
 #pragma unroll
             for (int j = 0; j < 8; j++) {
@@ -2163,6 +2208,26 @@ extern "C" int tt_flash_gqa_q8_0_splitk(const float *q, const void *Kc_q8, const
                       + 2 * (size_t)BC_SPLIT * head_dim * sizeof(int8_t);
     k_fa2_q8_split<<<grid_split, threads_split, smem_bytes, stream>>>(
         q, (const BlockQ8_0 *)Kc_q8, (const BlockQ8_0 *)Vc_q8,
+        p_acc, p_m, p_l,
+        d_pos, n_heads, n_kv_heads, head_dim,
+        scale, window, S);
+    k_fa2_combine<<<n_heads, 32, 0, stream>>>(
+        p_acc, p_m, p_l,
+        out, n_heads, head_dim, S);
+    return 0;
+}
+
+extern "C" int tt_flash_gqa_q4_0_splitk(const float *q, const void *Kc_q4, const void *Vc_q4,
+                                        float *p_acc, float *p_m, float *p_l, float *out,
+                                        const int *d_pos, int n_heads, int n_kv_heads, int head_dim,
+                                        float scale, int window, int S, cudaStream_t stream) {
+    dim3 grid_split(S, n_kv_heads);
+    int threads_split = (n_heads / n_kv_heads) * 32;
+    int blocks_per_head = head_dim / 32;
+    size_t smem_bytes = 2 * (size_t)BC_SPLIT * blocks_per_head * sizeof(half)
+                      + 2 * (size_t)BC_SPLIT * (head_dim / 2) * sizeof(uint8_t);
+    k_fa2_q4_split<<<grid_split, threads_split, smem_bytes, stream>>>(
+        q, (const BlockQ4_0 *)Kc_q4, (const BlockQ4_0 *)Vc_q4,
         p_acc, p_m, p_l,
         d_pos, n_heads, n_kv_heads, head_dim,
         scale, window, S);
