@@ -2183,6 +2183,200 @@ __global__ void k_prefill_flash_fp32(
     }
 }
 
+/* TT_FLASH_FP16 restructured FP32 flash: identical math, thread-per-row
+ * schedule. Template params T_ (threads/row) and E_ (dims/thread, const so
+ * q/acc stay in registers). Each lane owns one q-row chunk; K/V rows
+ * broadcast from smem so no warp shuffle is needed. Two-pass per-K-block
+ * softmax (pass1 rowmax + single rescale, pass2 single expf per pair).
+ * Same Q/Kc/Vc/Att layout and causal/window semantics as fp32 kernel. */
+#define BC_FP16 64
+template <int T_, int E_>
+__global__ void k_prefill_flash_fp16_t(
+    const float *__restrict__ Q,
+    const float *__restrict__ Kc,
+    const float *__restrict__ Vc,
+    float       *__restrict__ Att,
+    int n, int ctx, int e_pos,
+    int n_heads, int n_kv_heads, int head_dim,
+    float scale, int window)
+{
+    const int G = n_heads / n_kv_heads;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int kv = blockIdx.y;
+    const int q_tile = blockIdx.x;
+    const int head = kv * G + warp;
+    if (warp >= G) return;
+    const int BR = 32 / T_;
+    const int sub = lane % T_;
+    const int ri = lane / T_;
+    const int qrow = q_tile * BR + ri;
+    const bool active = (qrow < n);
+    const int max_kv = active ? (e_pos + qrow) : -1;
+    const int row_min = (window > 0 && active && (e_pos + qrow + 1 > window))
+        ? (e_pos + qrow + 1 - window) : 0;
+    extern __shared__ float smem_fp16[];
+    float *sK = smem_fp16;
+    float *sV = sK + BC_FP16 * head_dim;
+    float q[E_];
+    float acc[E_];
+#pragma unroll
+    for (int e = 0; e < E_; e++) { q[e] = 0.0f; acc[e] = 0.0f; }
+    if (active) {
+        const float *qr = Q + (long)qrow * (n_heads * head_dim)
+                        + (long)head * head_dim + (long)sub * E_;
+        const float4 *qr4 = reinterpret_cast<const float4*>(qr);
+#pragma unroll
+        for (int i = 0; i < E_ / 4; i++) {
+            float4 v = qr4[i];
+            q[i*4+0]=v.x; q[i*4+1]=v.y; q[i*4+2]=v.z; q[i*4+3]=v.w;
+        }
+    }
+    float m = -1e30f;
+    float l = 0.0f;
+    const int S = (ctx + BC_FP16 - 1) / BC_FP16;
+    const int hd4 = head_dim >> 2;
+    const bool is_vec4 = ((head_dim & 3) == 0);
+    const float4 *Kc4 = reinterpret_cast<const float4*>(Kc);
+    const float4 *Vc4 = reinterpret_cast<const float4*>(Vc);
+    float4 *sK4 = reinterpret_cast<float4*>(sK);
+    float4 *sV4 = reinterpret_cast<float4*>(sV);
+    for (int s = 0; s < S; s++) {
+        const int s_start = s * BC_FP16;
+        const int s_end_excl = (s_start + BC_FP16 < ctx) ? (s_start + BC_FP16) : ctx;
+        const int bc_active = s_end_excl - s_start;
+        if (bc_active <= 0) continue;
+        const int total = bc_active * head_dim;
+        if (is_vec4) {
+            const int total_vec4 = total >> 2;
+            const int hd4_shift = (hd4 == 16) ? 4 : ((hd4 == 32) ? 5 : 0);
+            if (hd4_shift) {
+                const int mask = (1 << hd4_shift) - 1;
+                for (int i = tid; i < total_vec4; i += blockDim.x) {
+                    const int tok = i >> hd4_shift;
+                    const int d4 = i & mask;
+                    const long g_idx = ((long)(s_start + tok) * n_kv_heads + kv) * hd4 + d4;
+                    sK4[i] = Kc4[g_idx];
+                    sV4[i] = Vc4[g_idx];
+                }
+            } else {
+                for (int i = tid; i < total_vec4; i += blockDim.x) {
+                    const int tok = i / hd4;
+                    const int d4 = i % hd4;
+                    const long g_idx = ((long)(s_start + tok) * n_kv_heads + kv) * hd4 + d4;
+                    sK4[i] = Kc4[g_idx];
+                    sV4[i] = Vc4[g_idx];
+                }
+            }
+        } else {
+            for (int i = tid; i < total; i += blockDim.x) {
+                const int tok = i / head_dim;
+                const int d = i % head_dim;
+                const long g_idx = ((long)(s_start + tok) * n_kv_heads + kv) * head_dim + d;
+                sK[tok * head_dim + d] = Kc[g_idx];
+                sV[tok * head_dim + d] = Vc[g_idx];
+            }
+        }
+        __syncthreads();
+        float bmax = -1e30f;
+        for (int t = s_start; t < s_end_excl; t++) {
+            const bool ok = active && (t >= row_min) && (t <= max_kv);
+            float d = 0.0f;
+            if (ok) {
+                const float *krow = sK + (t - s_start) * head_dim + sub * E_;
+#pragma unroll
+                for (int e = 0; e < E_; e++) d += q[e] * krow[e];
+            }
+            if (T_ >= 2) d += __shfl_xor_sync(0xffffffff, d, 1);
+            if (T_ >= 4) d += __shfl_xor_sync(0xffffffff, d, 2);
+            if (ok) { float sc = d * scale; if (sc > bmax) bmax = sc; }
+        }
+        const float m_new = fmaxf(m, bmax);
+        const float a = expf(m - m_new);
+#pragma unroll
+        for (int e = 0; e < E_; e++) acc[e] *= a;
+        l *= a;
+        const float beta = expf(bmax - m_new);
+        float bsum = 0.0f;
+        for (int t = s_start; t < s_end_excl; t++) {
+            const bool ok = active && (t >= row_min) && (t <= max_kv);
+            float d = 0.0f;
+            if (ok) {
+                const float *krow = sK + (t - s_start) * head_dim + sub * E_;
+#pragma unroll
+                for (int e = 0; e < E_; e++) d += q[e] * krow[e];
+            }
+            if (T_ >= 2) d += __shfl_xor_sync(0xffffffff, d, 1);
+            if (T_ >= 4) d += __shfl_xor_sync(0xffffffff, d, 2);
+            if (ok) {
+                const float p = expf(d * scale - bmax) * beta;
+                bsum += p;
+                const float *vrow = sV + (t - s_start) * head_dim + sub * E_;
+#pragma unroll
+                for (int e = 0; e < E_; e++) acc[e] += p * vrow[e];
+            }
+        }
+        l += bsum;
+        m = m_new;
+        __syncthreads();
+    }
+    if (active) {
+        const float inv = 1.0f / l;
+        float *out = Att + (long)qrow * (n_heads * head_dim)
+                   + (long)head * head_dim + (long)sub * E_;
+        float4 *out4 = reinterpret_cast<float4*>(out);
+        float4 *acc4 = reinterpret_cast<float4*>(acc);
+#pragma unroll
+        for (int i = 0; i < E_ / 4; i++) {
+            float4 v = acc4[i];
+            out4[i] = make_float4(v.x*inv, v.y*inv, v.z*inv, v.w*inv);
+        }
+    }
+}
+
+/* TT_FLASH_FP16 dispatch: flag off or uncommon HD keeps legacy fp32 kernel. */
+static inline int tt_flash_fp16_on(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("TT_FLASH_FP16") ? 1 : 0;
+    return v;
+}
+static void launch_prefill_flash(const float *Q, const float *Kf, const float *Vf,
+    float *Att, int n, int ctx, int e_pos, int H, int KV, int HD,
+    float scale, int swa, cudaStream_t stream) {
+    int use_fp16 = tt_flash_fp16_on() && (HD == 64 || HD == 128 || HD == 32);
+    if (use_fp16) {
+        static int attr = 0;
+        if (!attr) {
+            attr = 1;
+            cudaFuncSetAttribute(k_prefill_flash_fp16_t<2, 64>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                (int)(2 * (size_t)BC_FP16 * 128 * sizeof(float)));
+        }
+        const int threads = (H / KV) * 32;
+        const size_t smem = 2 * (size_t)BC_FP16 * HD * sizeof(float);
+        if (HD == 64) {
+            dim3 grid((n + 31) / 32, KV);
+            k_prefill_flash_fp16_t<1, 64><<<grid, threads, smem, stream>>>(
+                Q, Kf, Vf, Att, n, ctx, e_pos, H, KV, HD, scale, swa);
+        } else if (HD == 128) {
+            dim3 grid((n + 15) / 16, KV);
+            k_prefill_flash_fp16_t<2, 64><<<grid, threads, smem, stream>>>(
+                Q, Kf, Vf, Att, n, ctx, e_pos, H, KV, HD, scale, swa);
+        } else {
+            dim3 grid((n + 31) / 32, KV);
+            k_prefill_flash_fp16_t<1, 32><<<grid, threads, smem, stream>>>(
+                Q, Kf, Vf, Att, n, ctx, e_pos, H, KV, HD, scale, swa);
+        }
+    } else {
+        dim3 grid((n + BR_PREFILL - 1) / BR_PREFILL, KV);
+        const int threads = (H / KV) * 32;
+        const size_t smem = 2 * (size_t)BC_PREFILL_FP32 * HD * sizeof(float);
+        k_prefill_flash_fp32<<<grid, threads, smem, stream>>>(
+            Q, Kf, Vf, Att, n, ctx, e_pos, H, KV, HD, scale, swa);
+    }
+}
+
 extern "C" int tt_kv_scatter(const float *kst, const float *vst, float *Kc, float *Vc,
                              const int *d_pos, int n_kv_heads, int head_dim, int max_ctx, cudaStream_t stream) {
     const int kvdim = n_kv_heads * head_dim;
@@ -4456,13 +4650,8 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
                         d_pos_batch + qi, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l);
             }
         } else if (e->use_q4_kvcache && Kl_q4 && Vl_q4) {
-            int num_q_tiles = (n + BR_PREFILL - 1) / BR_PREFILL;
-            dim3 grid_fp(num_q_tiles, KV_l);
-            int threads_fp = (H_l / KV_l) * 32;
-            size_t smem_bytes_fp = 2 * (size_t)BC_PREFILL_FP32 * HDl * sizeof(float);
-            k_prefill_flash_fp32<<<grid_fp, threads_fp, smem_bytes_fp, e->stream>>>(
-                d_Q, Kl_f, Vl_f, d_Att,
-                n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l);
+            launch_prefill_flash(d_Q, Kl_f, Vl_f, d_Att,
+                n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l, e->stream);
         } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8) {
             int num_q_tiles = (n + BR_PREFILL - 1) / BR_PREFILL;
             dim3 grid_pf(num_q_tiles, KV_l);
@@ -4474,13 +4663,8 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
                 d_Q, Kl_q8, Vl_q8, d_Att,
                 n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l);
         } else {
-            int num_q_tiles = (n + BR_PREFILL - 1) / BR_PREFILL;
-            dim3 grid_fp(num_q_tiles, KV_l);
-            int threads_fp = (H_l / KV_l) * 32;
-            size_t smem_bytes_fp = 2 * (size_t)BC_PREFILL_FP32 * HDl * sizeof(float);
-            k_prefill_flash_fp32<<<grid_fp, threads_fp, smem_bytes_fp, e->stream>>>(
-                d_Q, Kl_f, Vl_f, d_Att,
-                n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l);
+            launch_prefill_flash(d_Q, Kl_f, Vl_f, d_Att,
+                n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l, e->stream);
         }
         if (tt_profiling()) tt_prof_end(TT_P_FLASH, e->stream);
 
@@ -4824,13 +5008,8 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
                         d_pos_batch + qi, H_l, KV_l, HDl, c->max_ctx, scale_l, swa_l);
             }
         } else if (e->use_q4_kvcache && Kl_q4 && Vl_q4) {
-            int num_q_tiles = (n + BR_PREFILL - 1) / BR_PREFILL;
-            dim3 grid_fp(num_q_tiles, KV_l);
-            int threads_fp = (H_l / KV_l) * 32;
-            size_t smem_bytes_fp = 2 * (size_t)BC_PREFILL_FP32 * HDl * sizeof(float);
-            k_prefill_flash_fp32<<<grid_fp, threads_fp, smem_bytes_fp, e->stream>>>(
-                d_Q, Kl_f, Vl_f, d_Att,
-                n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l);
+            launch_prefill_flash(d_Q, Kl_f, Vl_f, d_Att,
+                n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l, e->stream);
         } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8) {
             int num_q_tiles = (n + BR_PREFILL - 1) / BR_PREFILL;
             dim3 grid_pf(num_q_tiles, KV_l);
@@ -4842,13 +5021,8 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
                 d_Q, Kl_q8, Vl_q8, d_Att,
                 n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l);
         } else {
-            int num_q_tiles = (n + BR_PREFILL - 1) / BR_PREFILL;
-            dim3 grid_fp(num_q_tiles, KV_l);
-            int threads_fp = (H_l / KV_l) * 32;
-            size_t smem_bytes_fp = 2 * (size_t)BC_PREFILL_FP32 * HDl * sizeof(float);
-            k_prefill_flash_fp32<<<grid_fp, threads_fp, smem_bytes_fp, e->stream>>>(
-                d_Q, Kl_f, Vl_f, d_Att,
-                n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l);
+            launch_prefill_flash(d_Q, Kl_f, Vl_f, d_Att,
+                n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l, e->stream);
         }
 
         /* 4. O projection */
