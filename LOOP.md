@@ -145,6 +145,11 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - Wall: per-MAC Q4 dequant ALU starves MMA (~3 TFLOPS eff of ~50 ceiling). Only LUT-dequant or prefill-FP16-copy can move GEMM now. Flash (~150ms) now equals GEMM — next target.
 - Prefill stands 2.3k (WMMA, 0.3x llama 8k). 100x dead on this GPU; realistic ceiling ~4-6x via dequant-LUT + flash work.
 
+## 10k push: cuBLAS GEMM done (+47%) but reverted — flash is the wall
+- FP16 shadow (~700MB, fits) + cuBLAS (dlopen, no Makefile): 2377→3485 tok/s steady-state. Correct approach, killed dequant wall.
+- Reverted: (a) acceptance was 6k — flash fp32 146ms of 222ms caps GEMM-free at 4.6k; (b) pp759 parity FAIL (half-rounding flips first token over long ctx; short prompts OK).
+- Order of battle: fast FP16 flash kernel FIRST (need 146→≤50ms), then revisit shadow (fp32 or per-channel scale for parity). Q8-flash shortcut tested: 127 vs 146ms, no help.
+
 ### Cycle 24: Final Honest Matrix (3-Hour Loop Closeout)
 - Decode FP32: ctx32 272 / ctx128 231 / ctx512 116 / ctx1024 115.5 (needs --max-ctx 2048; default ctx1024 FAILS `f32 upload missing` = KV capacity, known).
 - Prefill pp759: FP32 1372 / WMMA 2272 (+66%) / Q8 1474 — all emit 8 real tokens. (Old 25k Q8 figure was garbage attention, VOID.)
