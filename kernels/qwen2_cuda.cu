@@ -5561,6 +5561,16 @@ extern "C" void qwen2_engine_rollback(Qwen2Engine *e, int target_pos) {
     e->pos = target_pos;
     cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
     e->pending_tok = -1;
+    /* Rollback vs graph capture: replay bakes capture-time S/path and its
+     * pos_inc assumes uninterrupted forward progress; a rewind leaves
+     * graph_exec stale. Destroy -> eager forever (always coherent). */
+    if (e->graph_exec) {
+        cudaGraphExecDestroy(e->graph_exec);
+        e->graph_exec = NULL;
+        e->graph_ready = 0;
+        e->no_graph = 1;
+        fprintf(stderr, "[qwen2-engine] rollback to %d: graph dropped, eager mode\n", target_pos);
+    }
 }
 
 /* Public single-token "step + logits" used by tests and the spec-verify
