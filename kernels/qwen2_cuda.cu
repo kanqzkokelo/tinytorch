@@ -2661,6 +2661,26 @@ static inline int kv_use_q4_eff_at(const Qwen2Engine *e, int pos) {
 static inline int kv_use_q8_eff_at(const Qwen2Engine *e, int pos) {
     return e->use_q8_kvcache && !e->use_q4_kvcache && pos > kv_thresh_value() && !kv_no_backfill();
 }
+/* Decode split-K S formulas (shared eager + graph-capture). Capture bakes
+ * the formula's value at the capture ctx; replay stays valid at any ctx
+ * because every split kernel derives [begin,end) from live *d_pos and the
+ * combine skips empty splits (l<=0). Divergence fixed here: replay S was
+ * S_max/32 at every ctx (ctx50: 64 vs eager 2; ctx512: 64 vs 8; ctx4096:
+ * 64 vs 64 match), now baked from the same formula eager uses. */
+static inline int split_S_q(int ctx, int smax) {
+    int S = (ctx + 63) / 64;
+    if (S < 2) S = 2;
+    if (S > 64) S = 64;
+    if (S > smax) S = smax;
+    return S;
+}
+static inline int split_S_fp32(int ctx, int smax) {
+    int S = (ctx + 31) / 32;
+    if (S < 2) S = 2;
+    if (S > 32) S = 32;
+    if (S > smax) S = smax;
+    return S;
+}
 
 static float *upload_f32(GGUFModel *m, const char *name) {
     GGUFTensor *t = gguf_get_tensor(m, name);
@@ -3654,15 +3674,8 @@ static int forward_layers(Qwen2Engine *e) {
                               : 1.0f / sqrtf((float)HDl);   /* match prior kernel arg */
             const int swa_l = e->has_pl_embd ? e->pl_swa[l] : c->tr.swa_size;
             if (kv_use_q4_eff(e)) {
-                int S;
-                if (e->graph_ready || g_capturing) {
-                    S = e->d_split_S_max;
-                } else {
-                    S = (ctx_l + 63) / 64;
-                    if (S < 2) S = 2;
-                    if (S > 64) S = 64;
-                    if (S > e->d_split_S_max) S = e->d_split_S_max;
-                }
+                /* capture bakes eager S at capture ctx (see split_S_q) */
+                int S = split_S_q(ctx_l, e->d_split_S_max);
                 dim3 grid_split(S, KV_l);
                 int threads_split = (H_l / KV_l) * 32;
                 int blocks_per_head = HDl / 32;
@@ -3678,15 +3691,8 @@ static int forward_layers(Qwen2Engine *e) {
                     e->d_split_pacc, e->d_split_pm, e->d_split_pl,
                     e->d_att, H_l, HDl, S);
             } else if (kv_use_q8_eff(e)) {
-                int S;
-                if (e->graph_ready || g_capturing) {
-                    S = e->d_split_S_max;
-                } else {
-                    S = (ctx_l + 63) / 64;
-                    if (S < 2) S = 2;
-                    if (S > 64) S = 64;
-                    if (S > e->d_split_S_max) S = e->d_split_S_max;
-                }
+                /* capture bakes eager S at capture ctx (see split_S_q) */
+                int S = split_S_q(ctx_l, e->d_split_S_max);
                 dim3 grid_split(S, KV_l);
                 int threads_split = (H_l / KV_l) * 32;
                 int blocks_per_head = HDl / 32;
@@ -3705,9 +3711,8 @@ static int forward_layers(Qwen2Engine *e) {
                 // FP32 FA2 tiled split-K: BC=32, smem 2*BC*HD*4, S=ceil(ctx/64) chunk=64 O(1) per slice
                 // Bypass tiled when ctx<=32 (L2, serial faster) or HD!=128 (fallback to serial/splitK)
                 if (ctx_l > 32 && HDl == 128) {
-                    int S;
-                    if (e->graph_ready || g_capturing) S = 32;
-                    else { S = (ctx_l + 31) / 32; if (S < 2) S = 2; if (S > 32) S = 32; if (S > e->d_split_S_max) S = e->d_split_S_max; }
+                    /* capture bakes eager S at capture ctx (see split_S_fp32) */
+                    int S = split_S_fp32(ctx_l, e->d_split_S_max);
                     dim3 grid_split(S, KV_l);
                     int threads_split = (H_l / KV_l) * 32;
                     size_t smem_bytes = 2 * (size_t)BC_FP32 * HDl * sizeof(float);
