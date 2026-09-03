@@ -139,6 +139,12 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
+__device__ __forceinline__ float warp_sum_all(float v) {
+#pragma unroll
+    for (int off = 16; off > 0; off /= 2) v += __shfl_xor_sync(0xffffffff, v, off);
+    return v;
+}
+
 /* y = x / sqrt(mean(x^2) + eps) * (woff + gamma) ; one block per row.
  * woff is the gemma-style norm offset; converted gemma GGUFs bake the
  * (1+w) into the stored weights (oracle convert_hf_to_gguf.py:4730), so it
@@ -1570,7 +1576,7 @@ __global__ void k_prefill_flash_q8_0(
     }
 }
 
-#define BC_PREFILL_FP32 32
+#define BC_PREFILL_FP32 64
 __global__ void k_prefill_flash_fp32(
     const float *__restrict__ Q,
     const float *__restrict__ Kc,
@@ -1610,58 +1616,144 @@ __global__ void k_prefill_flash_fp32(
         acc[r][0]=0.0f; acc[r][1]=0.0f; acc[r][2]=0.0f; acc[r][3]=0.0f;
         if (active[r]) {
             const float *qr = Q + (long)qrow * (n_heads * head_dim) + (long)head * head_dim + lane * elems;
-            qreg[r][0]=qr[0]; qreg[r][1]=(elems>1?qr[1]:0); qreg[r][2]=(elems>2?qr[2]:0); qreg[r][3]=(elems>3?qr[3]:0);
-            if (elems==2) { qreg[r][2]=0; qreg[r][3]=0; }
-            if (elems==1) { qreg[r][1]=0; qreg[r][2]=0; qreg[r][3]=0; }
+            if (elems == 4) {
+                float4 q4 = *reinterpret_cast<const float4*>(qr);
+                qreg[r][0] = q4.x; qreg[r][1] = q4.y; qreg[r][2] = q4.z; qreg[r][3] = q4.w;
+            } else if (elems == 2) {
+                float2 q2 = *reinterpret_cast<const float2*>(qr);
+                qreg[r][0] = q2.x; qreg[r][1] = q2.y; qreg[r][2] = 0.0f; qreg[r][3] = 0.0f;
+            } else {
+                qreg[r][0]=qr[0]; qreg[r][1]=(elems>1?qr[1]:0); qreg[r][2]=(elems>2?qr[2]:0); qreg[r][3]=(elems>3?qr[3]:0);
+                if (elems==1) { qreg[r][1]=0; qreg[r][2]=0; qreg[r][3]=0; }
+            }
         } else { qreg[r][0]=0; qreg[r][1]=0; qreg[r][2]=0; qreg[r][3]=0; }
     }
     const int S = (ctx + BC_PREFILL_FP32 - 1) / BC_PREFILL_FP32;
+    const int hd4 = head_dim >> 2;
+    const bool is_vec4 = ((head_dim & 3) == 0);
+    const float4 *Kc4 = reinterpret_cast<const float4*>(Kc);
+    const float4 *Vc4 = reinterpret_cast<const float4*>(Vc);
+    float4 *sK4 = reinterpret_cast<float4*>(sK);
+    float4 *sV4 = reinterpret_cast<float4*>(sV);
+
     for (int s = 0; s < S; s++) {
         const int s_start = s * BC_PREFILL_FP32;
         const int s_end_excl = (s_start + BC_PREFILL_FP32 < ctx) ? (s_start + BC_PREFILL_FP32) : ctx;
         const int bc_active = s_end_excl - s_start;
         if (bc_active <= 0) continue;
         const int total = bc_active * head_dim;
-        for (int i = tid; i < total; i += blockDim.x) {
-            const int tok = i / head_dim;
-            const int d = i % head_dim;
-            const long g_idx = ((long)(s_start + tok) * n_kv_heads + kv) * head_dim + d;
-            sK[tok * head_dim + d] = Kc[g_idx];
-            sV[tok * head_dim + d] = Vc[g_idx];
+
+        if (is_vec4) {
+            const int total_vec4 = total >> 2;
+            const int hd4_shift = (hd4 == 16) ? 4 : ((hd4 == 32) ? 5 : 0);
+            if (hd4_shift) {
+                const int mask = (1 << hd4_shift) - 1;
+                for (int i = tid; i < total_vec4; i += blockDim.x) {
+                    const int tok = i >> hd4_shift;
+                    const int d4 = i & mask;
+                    const long g_idx = ((long)(s_start + tok) * n_kv_heads + kv) * hd4 + d4;
+                    sK4[i] = Kc4[g_idx];
+                    sV4[i] = Vc4[g_idx];
+                }
+            } else {
+                for (int i = tid; i < total_vec4; i += blockDim.x) {
+                    const int tok = i / hd4;
+                    const int d4 = i % hd4;
+                    const long g_idx = ((long)(s_start + tok) * n_kv_heads + kv) * hd4 + d4;
+                    sK4[i] = Kc4[g_idx];
+                    sV4[i] = Vc4[g_idx];
+                }
+            }
+        } else {
+            for (int i = tid; i < total; i += blockDim.x) {
+                const int tok = i / head_dim;
+                const int d = i % head_dim;
+                const long g_idx = ((long)(s_start + tok) * n_kv_heads + kv) * head_dim + d;
+                sK[tok * head_dim + d] = Kc[g_idx];
+                sV[tok * head_dim + d] = Vc[g_idx];
+            }
         }
         __syncthreads();
-        for (int t = s_start; t < s_end_excl; t++) {
-            const int t_in_tile = t - s_start;
-            const float *k_ptr = sK + t_in_tile * head_dim + lane * elems;
-            const float *v_ptr = sV + t_in_tile * head_dim + lane * elems;
-            float k0 = k_ptr[0];
-            float k1 = (elems>1?k_ptr[1]:0);
-            float k2 = (elems>2?k_ptr[2]:0);
-            float k3 = (elems>3?k_ptr[3]:0);
-            float v0 = v_ptr[0];
-            float v1 = (elems>1?v_ptr[1]:0);
-            float v2 = (elems>2?v_ptr[2]:0);
-            float v3 = (elems>3?v_ptr[3]:0);
+
+        if (elems == 2) {
+            const float *k_base = sK + lane * 2;
+            const float *v_base = sV + lane * 2;
+            for (int t = s_start; t < s_end_excl; t++) {
+                const int t_in_tile = t - s_start;
+                const float2 kv2 = *reinterpret_cast<const float2*>(k_base + t_in_tile * head_dim);
+                const float2 vv2 = *reinterpret_cast<const float2*>(v_base + t_in_tile * head_dim);
+                const float k0 = kv2.x, k1 = kv2.y;
+                const float v0 = vv2.x, v1 = vv2.y;
 #pragma unroll
-            for (int r = 0; r < BR_PREFILL; r++) {
-                if (!active[r] || t < row_min_t[r] || t > max_kv[r]) continue;
-                float dot_partial = 0.0f;
-                if (elems==4) dot_partial = qreg[r][0]*k0 + qreg[r][1]*k1 + qreg[r][2]*k2 + qreg[r][3]*k3;
-                else if (elems==2) dot_partial = qreg[r][0]*k0 + qreg[r][1]*k1;
-                else if (elems==1) dot_partial = qreg[r][0]*k0;
-                else { for(int ei=0;ei<elems;ei++) dot_partial += qreg[r][ei] * (ei==0?k0:(ei==1?k1:(ei==2?k2:k3))); }
-                float score = warp_sum(dot_partial);
-                score = __shfl_sync(0xffffffff, score, 0) * scale;
-                float m_curr = fmaxf(m_state[r], score);
-                float p = expf(score - m_curr);
-                float alpha = expf(m_state[r] - m_curr);
-                l_state[r] = l_state[r] * alpha + p;
-                float pdv_alpha = alpha;
-                acc[r][0] = acc[r][0] * pdv_alpha + p * v0;
-                acc[r][1] = acc[r][1] * pdv_alpha + p * v1;
-                acc[r][2] = acc[r][2] * pdv_alpha + p * v2;
-                acc[r][3] = acc[r][3] * pdv_alpha + p * v3;
-                m_state[r] = m_curr;
+                for (int r = 0; r < BR_PREFILL; r++) {
+                    if (!active[r] || t < row_min_t[r] || t > max_kv[r]) continue;
+                    float dot_partial = qreg[r][0] * k0 + qreg[r][1] * k1;
+                    float score = warp_sum_all(dot_partial) * scale;
+                    float m_curr = fmaxf(m_state[r], score);
+                    float p = expf(score - m_curr);
+                    float alpha = expf(m_state[r] - m_curr);
+                    l_state[r] = l_state[r] * alpha + p;
+                    acc[r][0] = acc[r][0] * alpha + p * v0;
+                    acc[r][1] = acc[r][1] * alpha + p * v1;
+                    m_state[r] = m_curr;
+                }
+            }
+        } else if (elems == 4) {
+            const float *k_base = sK + lane * 4;
+            const float *v_base = sV + lane * 4;
+            for (int t = s_start; t < s_end_excl; t++) {
+                const int t_in_tile = t - s_start;
+                const float4 kv4 = *reinterpret_cast<const float4*>(k_base + t_in_tile * head_dim);
+                const float4 vv4 = *reinterpret_cast<const float4*>(v_base + t_in_tile * head_dim);
+                const float k0 = kv4.x, k1 = kv4.y, k2 = kv4.z, k3 = kv4.w;
+                const float v0 = vv4.x, v1 = vv4.y, v2 = vv4.z, v3 = vv4.w;
+#pragma unroll
+                for (int r = 0; r < BR_PREFILL; r++) {
+                    if (!active[r] || t < row_min_t[r] || t > max_kv[r]) continue;
+                    float dot_partial = qreg[r][0] * k0 + qreg[r][1] * k1 + qreg[r][2] * k2 + qreg[r][3] * k3;
+                    float score = warp_sum_all(dot_partial) * scale;
+                    float m_curr = fmaxf(m_state[r], score);
+                    float p = expf(score - m_curr);
+                    float alpha = expf(m_state[r] - m_curr);
+                    l_state[r] = l_state[r] * alpha + p;
+                    acc[r][0] = acc[r][0] * alpha + p * v0;
+                    acc[r][1] = acc[r][1] * alpha + p * v1;
+                    acc[r][2] = acc[r][2] * alpha + p * v2;
+                    acc[r][3] = acc[r][3] * alpha + p * v3;
+                    m_state[r] = m_curr;
+                }
+            }
+        } else {
+            for (int t = s_start; t < s_end_excl; t++) {
+                const int t_in_tile = t - s_start;
+                const float *k_ptr = sK + t_in_tile * head_dim + lane * elems;
+                const float *v_ptr = sV + t_in_tile * head_dim + lane * elems;
+                float k0 = k_ptr[0];
+                float k1 = (elems>1?k_ptr[1]:0);
+                float k2 = (elems>2?k_ptr[2]:0);
+                float k3 = (elems>3?k_ptr[3]:0);
+                float v0 = v_ptr[0];
+                float v1 = (elems>1?v_ptr[1]:0);
+                float v2 = (elems>2?v_ptr[2]:0);
+                float v3 = (elems>3?v_ptr[3]:0);
+#pragma unroll
+                for (int r = 0; r < BR_PREFILL; r++) {
+                    if (!active[r] || t < row_min_t[r] || t > max_kv[r]) continue;
+                    float dot_partial = 0.0f;
+                    if (elems==1) dot_partial = qreg[r][0]*k0;
+                    else { for(int ei=0;ei<elems;ei++) dot_partial += qreg[r][ei] * (ei==0?k0:(ei==1?k1:(ei==2?k2:k3))); }
+                    float score = warp_sum(dot_partial);
+                    score = __shfl_sync(0xffffffff, score, 0) * scale;
+                    float m_curr = fmaxf(m_state[r], score);
+                    float p = expf(score - m_curr);
+                    float alpha = expf(m_state[r] - m_curr);
+                    l_state[r] = l_state[r] * alpha + p;
+                    acc[r][0] = acc[r][0] * alpha + p * v0;
+                    acc[r][1] = acc[r][1] * alpha + p * v1;
+                    acc[r][2] = acc[r][2] * alpha + p * v2;
+                    acc[r][3] = acc[r][3] * alpha + p * v3;
+                    m_state[r] = m_curr;
+                }
             }
         }
         __syncthreads();
@@ -1672,10 +1764,15 @@ __global__ void k_prefill_flash_fp32(
             const int qrow = q_tile * BR_PREFILL + r;
             float inv_l = 1.0f / l_state[r];
             float *out_row = Att + (long)qrow * (n_heads * head_dim) + (long)head * head_dim + lane * elems;
-            if (elems==4) { out_row[0]=acc[r][0]*inv_l; out_row[1]=acc[r][1]*inv_l; out_row[2]=acc[r][2]*inv_l; out_row[3]=acc[r][3]*inv_l; }
-            else if (elems==2) { out_row[0]=acc[r][0]*inv_l; out_row[1]=acc[r][1]*inv_l; }
-            else if (elems==1) { out_row[0]=acc[r][0]*inv_l; }
-            else { for(int ei=0;ei<elems;ei++) out_row[ei]=acc[r][ei]*inv_l; }
+            if (elems==4) {
+                *reinterpret_cast<float4*>(out_row) = make_float4(acc[r][0]*inv_l, acc[r][1]*inv_l, acc[r][2]*inv_l, acc[r][3]*inv_l);
+            } else if (elems==2) {
+                *reinterpret_cast<float2*>(out_row) = make_float2(acc[r][0]*inv_l, acc[r][1]*inv_l);
+            } else if (elems==1) {
+                out_row[0]=acc[r][0]*inv_l;
+            } else {
+                for(int ei=0;ei<elems;ei++) out_row[ei]=acc[r][ei]*inv_l;
+            }
         }
     }
 }
@@ -2589,6 +2686,19 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         if (!e->d_pf_X || !e->d_pf_Xn || !e->d_pf_Q || !e->d_pf_K || !e->d_pf_V ||
             !e->d_pf_Att || !e->d_pf_H || !e->d_pf_G || !e->d_pf_U || !e->d_pf_pos_batch) {
             fprintf(stderr, "[qwen2-engine] pf arena alloc failed (pf_max_n=%zu)\n", pf_max_n);
+        }
+    }
+    /* If FP32 prefill flash shared memory exceeds default 48KB, opt in to dynamic shmem */
+    {
+        int max_hd = cfg->head_dim;
+        for (int l = 0; l < cfg->n_layers; l++) {
+            int HDl = e->pl_hd[l] > 0 ? e->pl_hd[l] : cfg->head_dim;
+            if (HDl > max_hd) max_hd = HDl;
+        }
+        size_t max_smem_fp32 = 2 * (size_t)BC_PREFILL_FP32 * max_hd * sizeof(float);
+        if (max_smem_fp32 > 48 * 1024) {
+            cudaFuncSetAttribute(k_prefill_flash_fp32,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)max_smem_fp32);
         }
     }
     return e;
@@ -3672,6 +3782,20 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
     cudaMemcpy(d_pos_batch, h_pos_batch, (size_t)n * sizeof(int), cudaMemcpyHostToDevice);
     free(h_pos_batch);
 
+    /* Opt in to dynamic shmem for FP32 prefill flash if needed */
+    {
+        int pf_max_hd = HD;
+        for (int l = 0; l < c->n_layers; l++) {
+            int HDl = e->pl_hd[l] > 0 ? e->pl_hd[l] : HD;
+            if (HDl > pf_max_hd) pf_max_hd = HDl;
+        }
+        size_t smem_fp32_attr = 2 * (size_t)BC_PREFILL_FP32 * pf_max_hd * sizeof(float);
+        if (smem_fp32_attr > 48 * 1024) {
+            cudaFuncSetAttribute(k_prefill_flash_fp32,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_fp32_attr);
+        }
+    }
+
     for (int i = 0; i < n; i++) {
         tt_embed_typed(e->d_embd.ptr, e->d_embd.dtype, toks[i],
                        d_X + (long)i * dim, dim, e->stream);
@@ -3961,6 +4085,20 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
     for (int i = 0; i < n; i++) h_pos_batch[i] = pos0 + i;
     cudaMemcpy(d_pos_batch, h_pos_batch, (size_t)n * sizeof(int), cudaMemcpyHostToDevice);
     free(h_pos_batch);
+
+    /* Opt in to dynamic shmem for FP32 prefill flash if needed */
+    {
+        int pf_max_hd = HD;
+        for (int l = 0; l < c->n_layers; l++) {
+            int HDl = e->pl_hd[l] > 0 ? e->pl_hd[l] : HD;
+            if (HDl > pf_max_hd) pf_max_hd = HDl;
+        }
+        size_t smem_fp32_attr = 2 * (size_t)BC_PREFILL_FP32 * pf_max_hd * sizeof(float);
+        if (smem_fp32_attr > 48 * 1024) {
+            cudaFuncSetAttribute(k_prefill_flash_fp32,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_fp32_attr);
+        }
+    }
 
     for (int i = 0; i < n; i++) {
         tt_embed_typed(e->d_embd.ptr, e->d_embd.dtype, toks[i],
