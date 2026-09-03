@@ -137,6 +137,11 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - **Hidden 896 GEMV target (130 GB/s) disproven** as launch-bound physics (subagent `1e9e205f`): K=896 → nb=28 → only 28 blocks on 16-SM RTX 3050; null kernel launch overhead ~5 µs exceeds the 3.47 µs needed for 130 GB/s. Real fix is fused QKV or CUDA graph, not per-shape tuning. Plan updated `docs/plans/2026-08-29-hidden-896-131k-fa.md`.
 - **Verification**: `ci_local.sh`, `verify.sh m61` (now includes chat-multiturn with `build/chat_llm_gpu`), `verify.sh ple` all 100% GREEN.
 
+### Cycle 23: FP32 Prefill 2x via WMMA (GEMM Was 78%)
+- Wired dead profiler: 14 stage brackets in `prefill_batched_gemm` + reset/report in `run_llm_gpu` (all env-gated, no-env path branch-only). Breakdown pp434: GEMM 78% (qkv 15-18ms, o+mlp 183-212ms), flash 21%, norm 0.6%.
+- `1fa048e` (verified KEEP): `TT_USE_WMMA_PRE=1` routes prefill GEMMs n≥64 to `k_gemm_wmma_q4_0_prefill` (+5 lines, default OFF). pp434: ~1411-1649 → 2788-2807 tok/s (**+70-95%**). Greedy first-8 identical; backfill PASS both modes; ci_local GREEN, m61 PASS.
+- vs llama.cpp pp512 7941: FP32 1643 → WMMA 2800 = 0.35x (was 0.2x). Remaining: flash 21% + o+mlp WMMA coverage.
+
 ### Cycle 22: Graph/Hybrid Coherence P1 Cluster — All 4 Fixed
 - `a27424a` NO_BACKFILL: hatch now forces FP32 flash above threshold (`kv_use_q*_eff` return 0). Backfill test PASS both modes.
 - `4519522` graph S: replay baked S=64/32 always vs eager S=(ctx+63)/64 (ctx50: 64 vs 2; ctx512: 64 vs 8). Capture now bakes eager formula (`split_S_q`, `split_S_fp32` clamped). m61 graph/eager-identical PASS.
