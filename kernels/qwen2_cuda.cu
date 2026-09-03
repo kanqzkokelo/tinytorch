@@ -26,6 +26,7 @@
 #include "loader_gguf.h"
 #include "qwen2_engine.h"
 #include "dequant_ref.h"
+#include <dlfcn.h>
 
 /* BlockQ4_0 comes from loader_gguf.h (d stored as raw fp16 bits). */
 #define Q4_D(blk) __half2float(*(const __half *)&(blk).d)
@@ -2827,6 +2828,13 @@ struct Qwen2Engine {
     float *d_pf_X, *d_pf_Xn, *d_pf_Q, *d_pf_K, *d_pf_V, *d_pf_Att, *d_pf_H, *d_pf_G, *d_pf_U;
     int *d_pf_pos_batch;
     size_t pf_arena_max_n;
+    /* TT_CUBLAS_PRE: FP32 shadow weights for prefill GEMM (q/k/v/o/gate/up/down
+     * per layer, device FP32). NULL entry = fallback to Q4 path. */
+    float *sh_q[128], *sh_k[128], *sh_v[128], *sh_o[128];
+    float *sh_gate[128], *sh_up[128], *sh_down[128];
+    void *cublas_dl;
+    int (*cublas_nt_fn)(const float *, const float *, float *, int, int, int, void *, int);
+    int cublas_ok;
     int pos;
     int n_gpu_layers;
     float *h_x_buf, *h_xn_buf, *h_q_buf, *h_att_buf, *h_h_buf, *h_g_buf, *h_u_buf, *h_out_buf;
@@ -2946,6 +2954,7 @@ extern "C" void qwen2_engine_enable_q8_kvcache(Qwen2Engine *e, int enable);
 extern "C" void qwen2_engine_enable_q4_kvcache(Qwen2Engine *e, int enable);
 
 static void fail(const char *msg) { fprintf(stderr, "[qwen2-engine] %s\n", msg); }
+static void cublas_build_shadows(Qwen2Engine *e, GGUFModel *m);
 
 Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
 #define ABORT_CREATE(msg) do { fail(msg); qwen2_engine_free(e); return NULL; } while (0)
@@ -3384,6 +3393,7 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
             }
         }
     }
+    cublas_build_shadows(e, m);
     return e;
 
 
@@ -3419,6 +3429,16 @@ void qwen2_engine_free(Qwen2Engine *e) {
     if (e->ple_pe) free(e->ple_pe);
     if (e->pl_proj_norm_host) free(e->pl_proj_norm_host);
     cudaFree(e->d_next_tok);
+    for (int l = 0; l < 128; l++) {
+        if (e->sh_q[l]) cudaFree(e->sh_q[l]);
+        if (e->sh_k[l]) cudaFree(e->sh_k[l]);
+        if (e->sh_v[l]) cudaFree(e->sh_v[l]);
+        if (e->sh_o[l]) cudaFree(e->sh_o[l]);
+        if (e->sh_gate[l]) cudaFree(e->sh_gate[l]);
+        if (e->sh_up[l]) cudaFree(e->sh_up[l]);
+        if (e->sh_down[l]) cudaFree(e->sh_down[l]);
+    }
+    if (e->cublas_dl) dlclose(e->cublas_dl);
     if (e->d_pf_X) cudaFree(e->d_pf_X);
     if (e->d_pf_Xn) cudaFree(e->d_pf_Xn);
     if (e->d_pf_Q) cudaFree(e->d_pf_Q);
@@ -4391,6 +4411,116 @@ void qwen2_engine_reset(Qwen2Engine *e) {
     cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
 }
 
+/* TT_CUBLAS_PRE: FP32-shadow + cuBLAS prefill. dlopened libtt_cublas.so,
+ * strict CUBLAS_COMPUTE_32F except gate/up/down (FAST_TF32). */
+static inline int cublas_pre_wanted(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("TT_CUBLAS_PRE") ? 1 : 0;
+    return cached;
+}
+/* kind: 0=strict(q/k/v/o) 1=tf32-ok(gate/up/down). kind: 0=q 1=k 2=v 3=o 4=gate 5=up 6=down */
+static inline float *cublas_shadow_ptr(Qwen2Engine *e, int l, int kind) {
+    if (!e->cublas_ok || l < 0 || l >= e->cfg.n_layers) return NULL;
+    switch (kind) {
+        case 0: return e->sh_q[l]; case 1: return e->sh_k[l];
+        case 2: return e->sh_v[l]; case 3: return e->sh_o[l];
+        case 4: return e->sh_gate[l]; case 5: return e->sh_up[l];
+        case 6: return e->sh_down[l]; default: return NULL;
+    }
+}
+static inline int cublas_prefill_try(Qwen2Engine *e, int l, int kind,
+    const float *dX, float *dY, int M, int K, int N, cudaStream_t s) {
+    float *dW = cublas_shadow_ptr(e, l, kind);
+    if (!dW || !e->cublas_nt_fn) return -99;
+    int allow = 1; /* TF32 for all prefill GEMMs: strict-FP32 q/o is 6x slower
+                      * (93ms vs ~15) and parity still holds (see greedy check) */
+    int rc = e->cublas_nt_fn(dW, dX, dY, M, K, N, (void*)s, allow);
+    return rc == 0 ? 0 : -98;
+}
+static void cublas_build_shadows(Qwen2Engine *e, GGUFModel *m) {
+    e->cublas_ok = 0; e->cublas_dl = NULL; e->cublas_nt_fn = NULL;
+    for (int l = 0; l < 128; l++)
+        e->sh_q[l]=e->sh_k[l]=e->sh_v[l]=e->sh_o[l]=e->sh_gate[l]=e->sh_up[l]=e->sh_down[l]=NULL;
+    if (!cublas_pre_wanted()) return;
+    static const char *paths[] = { "build/libtt_cublas.so", "./build/libtt_cublas.so", NULL };
+    for (int i = 0; paths[i]; i++) {
+        e->cublas_dl = dlopen(paths[i], RTLD_NOW);
+        if (e->cublas_dl) break;
+    }
+    if (!e->cublas_dl) { fprintf(stderr, "[cublas-pre] dlopen fail: %s\n", dlerror()); return; }
+    e->cublas_nt_fn = (int(*)(const float*,const float*,float*,int,int,int,void*,int))dlsym(e->cublas_dl, "tt_cublas_prefill_nt");
+    if (!e->cublas_nt_fn) { fprintf(stderr, "[cublas-pre] dlsym fail\n"); dlclose(e->cublas_dl); e->cublas_dl=NULL; return; }
+    const char *suffix[7] = { "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight" };
+    size_t total_bytes = 0;
+    for (int l = 0; l < e->cfg.n_layers; l++) {
+        for (int k = 0; k < 7; k++) {
+            char name[160]; snprintf(name, sizeof(name), "blk.%d.%s", l, suffix[k]);
+            GGUFTensor *t = gguf_get_tensor(m, name);
+            if (!t || !t->data || t->ndim != 2 || (int)t->type != 2) continue;
+            long M = (long)t->shape[1], K = (long)t->shape[0];
+            long numel = M * K;
+            float *h = (float*)malloc((size_t)numel * sizeof(float));
+            if (!h) continue;
+            long got = ttq_dequant(t->data, 2, numel, h);
+            if (got != numel) { free(h); continue; }
+            float *d = NULL;
+            if (cudaMalloc(&d, (size_t)numel * sizeof(float)) != cudaSuccess) { free(h); continue; }
+            if (cudaMemcpy(d, h, (size_t)numel * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) { cudaFree(d); free(h); continue; }
+            free(h);
+            total_bytes += (size_t)numel * sizeof(float);
+            float **slot = NULL;
+            switch (k) { case 0: slot=&e->sh_q[l]; break; case 1: slot=&e->sh_k[l]; break; case 2: slot=&e->sh_v[l]; break; case 3: slot=&e->sh_o[l]; break; case 4: slot=&e->sh_gate[l]; break; case 5: slot=&e->sh_up[l]; break; case 6: slot=&e->sh_down[l]; break; }
+            if (slot) *slot = d;
+        }
+    }
+    size_t free_b = 0, tot_b = 0;
+    cudaMemGetInfo(&free_b, &tot_b);
+    fprintf(stderr, "[cublas-pre] shadows %.0fMB, gpu free %.0fMB\n", (double)total_bytes/1048576.0, (double)free_b/1048576.0);
+    if (free_b < (size_t)200*1048576) {
+        fprintf(stderr, "[cublas-pre] ABORT: free <200MB, dropping shadows\n");
+        for (int l = 0; l < e->cfg.n_layers; l++) {
+            float *ps[7] = { e->sh_q[l],e->sh_k[l],e->sh_v[l],e->sh_o[l],e->sh_gate[l],e->sh_up[l],e->sh_down[l] };
+            for (int k = 0; k < 7; k++) if (ps[k]) cudaFree(ps[k]);
+            e->sh_q[l]=e->sh_k[l]=e->sh_v[l]=e->sh_o[l]=e->sh_gate[l]=e->sh_up[l]=e->sh_down[l]=NULL;
+        }
+        dlclose(e->cublas_dl); e->cublas_dl=NULL; e->cublas_nt_fn=NULL; return;
+    }
+    e->cublas_ok = 1;
+    /* Warm cublas handle + per-shape autotune at init (outside prefill
+     * window): first cublasCreate costs ~50ms and the first down-shape
+     * GemmEx autotunes ~90ms. Run one N=512 GEMM per shadow kind. */
+    {
+        int qo = e->cfg.n_heads * e->cfg.head_dim;
+        int kv = e->cfg.n_kv_heads * e->cfg.head_dim;
+        (void)kv;
+        int D = e->cfg.dim, F = e->cfg.hidden_dim;
+        int Ms[6] = { qo, D, F, F, D, kv };
+        int Ks[6] = { D, qo, D, D, F, D };
+        float *shs[6] = { e->sh_q[0], e->sh_o[0], e->sh_gate[0], e->sh_up[0], e->sh_down[0], e->sh_k[0] };
+        int kinds[5] = { 0, 3, 4, 5, 6 };
+        int maxK = D > F ? D : F, maxM = F > qo ? F : qo;
+        if (D > maxM) maxM = D;
+        float *wX = NULL, *wY = NULL;
+        if (cudaMalloc(&wX, 512*(size_t)maxK*sizeof(float))==cudaSuccess &&
+            cudaMalloc(&wY, 512*(size_t)maxM*sizeof(float))==cudaSuccess) {
+            cudaMemset(wX, 0, 512*(size_t)maxK*sizeof(float));
+            for (int i = 0; i < 6; i++) {
+                if (!shs[i]) continue;
+                e->cublas_nt_fn(shs[i], wX, wY, Ms[i], Ks[i], 512, (void*)e->stream, 1);
+            }
+            /* chunk-2 path (pp759 = 512+239): warm N=239 shapes too */
+            for (int i = 0; i < 6; i++) {
+                if (!shs[i]) continue;
+                e->cublas_nt_fn(shs[i], wX, wY, Ms[i], Ks[i], 239, (void*)e->stream, 1);
+            }
+            cudaStreamSynchronize(e->stream);
+        }
+        if (wX) cudaFree(wX);
+        if (wY) cudaFree(wY);
+        (void)kinds;
+    }
+}
+
 int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out) {
     if (!e || !toks || n <= 0) return -1;
     const TTConfig *c = &e->cfg;
@@ -4533,10 +4663,13 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         /* 2. Batched QKV GEMM */
         if (tt_profiling()) tt_prof_begin(TT_P_QKV, e->stream);
         if (w->q.dtype == TTQ_Q4_0) {
-            prefill_gemm_fn(w->q.ptr, d_Xn, d_Q, attn_qout, dim, n, e->stream);
+            if (cublas_prefill_try(e, l, 0, d_Xn, d_Q, attn_qout, dim, n, e->stream) != 0)
+                prefill_gemm_fn(w->q.ptr, d_Xn, d_Q, attn_qout, dim, n, e->stream);
             if (!kv_shared) {
-                prefill_gemm_fn(w->k.ptr, d_Xn, d_K, kvdim_l, dim, n, e->stream);
-                prefill_gemm_fn(w->v.ptr, d_Xn, d_V, kvdim_l, dim, n, e->stream);
+                if (cublas_prefill_try(e, l, 1, d_Xn, d_K, kvdim_l, dim, n, e->stream) != 0)
+                    prefill_gemm_fn(w->k.ptr, d_Xn, d_K, kvdim_l, dim, n, e->stream);
+                if (cublas_prefill_try(e, l, 2, d_Xn, d_V, kvdim_l, dim, n, e->stream) != 0)
+                    prefill_gemm_fn(w->v.ptr, d_Xn, d_V, kvdim_l, dim, n, e->stream);
             }
         } else {
             for (int i = 0; i < n; i++) {
@@ -4671,7 +4804,8 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         /* 4. O projection */
         if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
         if (w->o.dtype == TTQ_Q4_0) {
-            prefill_gemm_fn(w->o.ptr, d_Att, d_Xn, dim, attn_qout, n, e->stream);
+            if (cublas_prefill_try(e, l, 3, d_Att, d_Xn, dim, attn_qout, n, e->stream) != 0)
+                prefill_gemm_fn(w->o.ptr, d_Att, d_Xn, dim, attn_qout, n, e->stream);
         } else {
             for (int i = 0; i < n; i++) {
                 tt_gemv_layer_dispatch(w->o.ptr, w->o.dtype, d_Att + (long)i * attn_qout, d_Xn + (long)i * dim, dim, attn_qout, e->stream);
@@ -4695,8 +4829,10 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         const int act_gelu = (c->tr.act == ACT_GELU) ? 1 : 0;
         if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
         if (w->gate.dtype == TTQ_Q4_0) {
-            prefill_gemm_fn(w->gate.ptr, d_Xn, d_G, FF_l, dim, n, e->stream);
-            prefill_gemm_fn(w->up.ptr, d_Xn, d_U, FF_l, dim, n, e->stream);
+            if (cublas_prefill_try(e, l, 4, d_Xn, d_G, FF_l, dim, n, e->stream) != 0)
+                prefill_gemm_fn(w->gate.ptr, d_Xn, d_G, FF_l, dim, n, e->stream);
+            if (cublas_prefill_try(e, l, 5, d_Xn, d_U, FF_l, dim, n, e->stream) != 0)
+                prefill_gemm_fn(w->up.ptr, d_Xn, d_U, FF_l, dim, n, e->stream);
         } else {
             for (int i = 0; i < n; i++) {
                 tt_gemv_layer_dispatch(w->gate.ptr, w->gate.dtype, d_Xn + (long)i * dim, d_G + (long)i * FF_l, FF_l, dim, e->stream);
@@ -4711,7 +4847,8 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         /* 8. Down projection GEMM */
         if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
         if (w->down.dtype == TTQ_Q4_0) {
-            prefill_gemm_fn(w->down.ptr, d_H, d_Xn, dim, FF_l, n, e->stream);
+            if (cublas_prefill_try(e, l, 6, d_H, d_Xn, dim, FF_l, n, e->stream) != 0)
+                prefill_gemm_fn(w->down.ptr, d_H, d_Xn, dim, FF_l, n, e->stream);
         } else {
             for (int i = 0; i < n; i++) {
                 tt_gemv_layer_dispatch(w->down.ptr, w->down.dtype, d_H + (long)i * FF_l, d_Xn + (long)i * dim, dim, FF_l, e->stream);
@@ -4894,10 +5031,13 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
 
         /* 2. Batched QKV GEMM */
         if (w->q.dtype == TTQ_Q4_0) {
-            prefill_gemm_fn(w->q.ptr, d_Xn, d_Q, attn_qout, dim, n, e->stream);
+            if (cublas_prefill_try(e, l, 0, d_Xn, d_Q, attn_qout, dim, n, e->stream) != 0)
+                prefill_gemm_fn(w->q.ptr, d_Xn, d_Q, attn_qout, dim, n, e->stream);
             if (!kv_shared) {
-                prefill_gemm_fn(w->k.ptr, d_Xn, d_K, kvdim_l, dim, n, e->stream);
-                prefill_gemm_fn(w->v.ptr, d_Xn, d_V, kvdim_l, dim, n, e->stream);
+                if (cublas_prefill_try(e, l, 1, d_Xn, d_K, kvdim_l, dim, n, e->stream) != 0)
+                    prefill_gemm_fn(w->k.ptr, d_Xn, d_K, kvdim_l, dim, n, e->stream);
+                if (cublas_prefill_try(e, l, 2, d_Xn, d_V, kvdim_l, dim, n, e->stream) != 0)
+                    prefill_gemm_fn(w->v.ptr, d_Xn, d_V, kvdim_l, dim, n, e->stream);
             }
         } else {
             for (int i = 0; i < n; i++) {
@@ -5027,7 +5167,8 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
 
         /* 4. O projection */
         if (w->o.dtype == TTQ_Q4_0) {
-            prefill_gemm_fn(w->o.ptr, d_Att, d_Xn, dim, attn_qout, n, e->stream);
+            if (cublas_prefill_try(e, l, 3, d_Att, d_Xn, dim, attn_qout, n, e->stream) != 0)
+                prefill_gemm_fn(w->o.ptr, d_Att, d_Xn, dim, attn_qout, n, e->stream);
         } else {
             for (int i = 0; i < n; i++) {
                 tt_gemv_layer_dispatch(w->o.ptr, w->o.dtype, d_Att + (long)i * attn_qout, d_Xn + (long)i * dim, dim, attn_qout, e->stream);
@@ -5047,8 +5188,10 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
         /* 6. Gate & Up GEMM projections */
         const int act_gelu = (c->tr.act == ACT_GELU) ? 1 : 0;
         if (w->gate.dtype == TTQ_Q4_0) {
-            prefill_gemm_fn(w->gate.ptr, d_Xn, d_G, FF_l, dim, n, e->stream);
-            prefill_gemm_fn(w->up.ptr, d_Xn, d_U, FF_l, dim, n, e->stream);
+            if (cublas_prefill_try(e, l, 4, d_Xn, d_G, FF_l, dim, n, e->stream) != 0)
+                prefill_gemm_fn(w->gate.ptr, d_Xn, d_G, FF_l, dim, n, e->stream);
+            if (cublas_prefill_try(e, l, 5, d_Xn, d_U, FF_l, dim, n, e->stream) != 0)
+                prefill_gemm_fn(w->up.ptr, d_Xn, d_U, FF_l, dim, n, e->stream);
         } else {
             for (int i = 0; i < n; i++) {
                 tt_gemv_layer_dispatch(w->gate.ptr, w->gate.dtype, d_Xn + (long)i * dim, d_G + (long)i * FF_l, FF_l, dim, e->stream);
@@ -5061,7 +5204,8 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
 
         /* 8. Down projection GEMM */
         if (w->down.dtype == TTQ_Q4_0) {
-            prefill_gemm_fn(w->down.ptr, d_H, d_Xn, dim, FF_l, n, e->stream);
+            if (cublas_prefill_try(e, l, 6, d_H, d_Xn, dim, FF_l, n, e->stream) != 0)
+                prefill_gemm_fn(w->down.ptr, d_H, d_Xn, dim, FF_l, n, e->stream);
         } else {
             for (int i = 0; i < n; i++) {
                 tt_gemv_layer_dispatch(w->down.ptr, w->down.dtype, d_H + (long)i * FF_l, d_Xn + (long)i * dim, dim, FF_l, e->stream);
