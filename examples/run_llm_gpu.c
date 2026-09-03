@@ -200,9 +200,11 @@ int main(int argc, char **argv) {
     AsyncPrinter *ap = async_printer_start();
     clock_gettime(CLOCK_MONOTONIC, &tp0);
 
+    if (getenv("TT_PROFILE")) qwen2_debug_profile_reset();
     if (qwen2_engine_prefill(eng, prompt_tokens, n_prompt)) {
         fprintf(stderr, "prefill failed\n"); return 1;
     }
+    if (getenv("TT_PROFILE")) qwen2_debug_profile_report(1);
     clock_gettime(CLOCK_MONOTONIC, &t0);   /* decode-only window starts here */
 
     int history[MAX_CTX];
