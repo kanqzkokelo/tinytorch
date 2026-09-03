@@ -137,6 +137,13 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - **Hidden 896 GEMV target (130 GB/s) disproven** as launch-bound physics (subagent `1e9e205f`): K=896 → nb=28 → only 28 blocks on 16-SM RTX 3050; null kernel launch overhead ~5 µs exceeds the 3.47 µs needed for 130 GB/s. Real fix is fused QKV or CUDA graph, not per-shape tuning. Plan updated `docs/plans/2026-08-29-hidden-896-131k-fa.md`.
 - **Verification**: `ci_local.sh`, `verify.sh m61` (now includes chat-multiturn with `build/chat_llm_gpu`), `verify.sh ple` all 100% GREEN.
 
+### Cycle 24: Final Honest Matrix (3-Hour Loop Closeout)
+- Decode FP32: ctx32 272 / ctx128 231 / ctx512 116 / ctx1024 115.5 (needs --max-ctx 2048; default ctx1024 FAILS `f32 upload missing` = KV capacity, known).
+- Prefill pp759: FP32 1372 / WMMA 2272 (+66%) / Q8 1474 — all emit 8 real tokens. (Old 25k Q8 figure was garbage attention, VOID.)
+- Q8 @1033 ctx: 21 real tokens, decode 228 tok/s, prefill 1337. Q8 decode parity with FP32.
+- Gates sweep: ci_local GREEN, m61 PASS (7/7 + chat), ple 3/3 PASS.
+- Loop totals: 5 phases, ~14 commits, 0 reverts (every builder commit KEPT after review). m84 0/7 pre-existing (gemma KV-share gap, no Q8 path) — next loop's P0.
+
 ### Cycle 23: FP32 Prefill 2x via WMMA (GEMM Was 78%)
 - Wired dead profiler: 14 stage brackets in `prefill_batched_gemm` + reset/report in `run_llm_gpu` (all env-gated, no-env path branch-only). Breakdown pp434: GEMM 78% (qkv 15-18ms, o+mlp 183-212ms), flash 21%, norm 0.6%.
 - `1fa048e` (verified KEEP): `TT_USE_WMMA_PRE=1` routes prefill GEMMs n≥64 to `k_gemm_wmma_q4_0_prefill` (+5 lines, default OFF). pp434: ~1411-1649 → 2788-2807 tok/s (**+70-95%**). Greedy first-8 identical; backfill PASS both modes; ci_local GREEN, m61 PASS.
