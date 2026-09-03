@@ -1845,15 +1845,31 @@ __global__ void k_prefill_flash_q8_0(
 
         if (active[r]) {
             const float *qr = Q + (long)qrow * (n_heads * head_dim) + (long)head * head_dim + lane * elems;
-            qreg[r][0] = qr[0]; qreg[r][1] = qr[1]; qreg[r][2] = qr[2]; qreg[r][3] = qr[3];
+            /* elems-branch (HD=128: 4, HD=64: 2): loading qr[0..3]
+             * unconditionally overreads the head (and faults/pollutes at
+             * buffer edges). Zero-fill the unused lanes. */
+            if (elems == 4) {
+                qreg[r][0] = qr[0]; qreg[r][1] = qr[1]; qreg[r][2] = qr[2]; qreg[r][3] = qr[3];
+            } else if (elems == 2) {
+                qreg[r][0] = qr[0]; qreg[r][1] = qr[1]; qreg[r][2] = 0.0f; qreg[r][3] = 0.0f;
+            } else {
+                qreg[r][0] = qr[0];
+                qreg[r][1] = (elems > 1) ? qr[1] : 0.0f;
+                qreg[r][2] = (elems > 2) ? qr[2] : 0.0f;
+                qreg[r][3] = (elems > 3) ? qr[3] : 0.0f;
+            }
         } else {
             qreg[r][0] = 0.0f; qreg[r][1] = 0.0f; qreg[r][2] = 0.0f; qreg[r][3] = 0.0f;
         }
     }
 
     const int S = (ctx + BC_PREFILL - 1) / BC_PREFILL;
-    const int block_in_head = lane >> 3;
-    const int elem_off = (lane & 7) * elems;
+    /* elems-scaled lane mapping: block_in_head=(lane*elems)/32 (HD=128:
+     * lane>>3, HD=64: lane>>4). The old lane>>3/(lane&7)*elems split only
+     * equals lane*elems when elems==4; otherwise lanes read the wrong
+     * block/scale and OOB smem bytes. */
+    const int block_in_head = (lane * elems) / 32;
+    const int lane_byte_off = lane * elems;
 
     for (int s = 0; s < S; s++) {
         const int s_start = s * BC_PREFILL;
@@ -1881,22 +1897,40 @@ __global__ void k_prefill_flash_q8_0(
 
         for (int t = s_start; t < s_end_excl; t++) {
             const int t_in_tile = t - s_start;
-            const int k_q_off = t_in_tile * head_dim + block_in_head * 32 + elem_off;
+            const int k_q_off = t_in_tile * head_dim + lane_byte_off;
             const int v_q_off = k_q_off;
             const float dk = __half2float(sK_d[t_in_tile * blocks_per_head + block_in_head]);
             const float dv = __half2float(sV_d[t_in_tile * blocks_per_head + block_in_head]);
 
-            const uint32_t k_u32 = *(const uint32_t *)&sK_q[k_q_off];
-            const uint32_t v_u32 = *(const uint32_t *)&sV_q[v_q_off];
-            const float k0 = (float)((int8_t)(k_u32      ));
-            const float k1 = (float)((int8_t)(k_u32 >>  8));
-            const float k2 = (float)((int8_t)(k_u32 >> 16));
-            const float k3 = (float)((int8_t)(k_u32 >> 24));
-
-            const float v0 = (float)((int8_t)(v_u32      ));
-            const float v1 = (float)((int8_t)(v_u32 >>  8));
-            const float v2 = (float)((int8_t)(v_u32 >> 16));
-            const float v3 = (float)((int8_t)(v_u32 >> 24));
+            /* elems-branch: uint32 pack covers 4 lanes only at elems==4.
+             * At elems==2 it loads 2 bytes past this lane (misaligned +
+             * cross-lane garbage); use uint16, scalar otherwise. */
+            float k0 = 0.0f, k1 = 0.0f, k2 = 0.0f, k3 = 0.0f;
+            float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+            if (elems == 4) {
+                const uint32_t k_u32 = *(const uint32_t *)&sK_q[k_q_off];
+                const uint32_t v_u32 = *(const uint32_t *)&sV_q[v_q_off];
+                k0 = (float)((int8_t)(k_u32      ));
+                k1 = (float)((int8_t)(k_u32 >>  8));
+                k2 = (float)((int8_t)(k_u32 >> 16));
+                k3 = (float)((int8_t)(k_u32 >> 24));
+                v0 = (float)((int8_t)(v_u32      ));
+                v1 = (float)((int8_t)(v_u32 >>  8));
+                v2 = (float)((int8_t)(v_u32 >> 16));
+                v3 = (float)((int8_t)(v_u32 >> 24));
+            } else if (elems == 2) {
+                const uint16_t k_u16 = *(const uint16_t *)&sK_q[k_q_off];
+                const uint16_t v_u16 = *(const uint16_t *)&sV_q[v_q_off];
+                k0 = (float)((int8_t)(k_u16     ));
+                k1 = (float)((int8_t)(k_u16 >> 8));
+                v0 = (float)((int8_t)(v_u16     ));
+                v1 = (float)((int8_t)(v_u16 >> 8));
+            } else {
+                if (elems > 0) { k0 = (float)sK_q[k_q_off]; v0 = (float)sV_q[v_q_off]; }
+                if (elems > 1) { k1 = (float)sK_q[k_q_off + 1]; v1 = (float)sV_q[v_q_off + 1]; }
+                if (elems > 2) { k2 = (float)sK_q[k_q_off + 2]; v2 = (float)sV_q[v_q_off + 2]; }
+                if (elems > 3) { k3 = (float)sK_q[k_q_off + 3]; v3 = (float)sV_q[v_q_off + 3]; }
+            }
 #pragma unroll
             for (int r = 0; r < BR_PREFILL; r++) {
                 if (!active[r] || t < row_min_t[r] || t > max_kv[r]) continue;
@@ -1928,10 +1962,22 @@ __global__ void k_prefill_flash_q8_0(
             const int qrow = q_tile * BR_PREFILL + r;
             float inv_l = 1.0f / l_state[r];
             float *out_row = Att + (long)qrow * (n_heads * head_dim) + (long)head * head_dim + lane * elems;
-            out_row[0] = acc[r][0] * inv_l;
-            out_row[1] = acc[r][1] * inv_l;
-            out_row[2] = acc[r][2] * inv_l;
-            out_row[3] = acc[r][3] * inv_l;
+            /* elems-branch: out_row[2..3] belong to the next lane/head at
+             * elems==2 (and fault past the buffer end on a full tile). */
+            if (elems == 4) {
+                out_row[0] = acc[r][0] * inv_l;
+                out_row[1] = acc[r][1] * inv_l;
+                out_row[2] = acc[r][2] * inv_l;
+                out_row[3] = acc[r][3] * inv_l;
+            } else if (elems == 2) {
+                out_row[0] = acc[r][0] * inv_l;
+                out_row[1] = acc[r][1] * inv_l;
+            } else {
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    if (i < elems) out_row[i] = acc[r][i] * inv_l;
+                }
+            }
         }
     }
 }
