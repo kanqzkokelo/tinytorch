@@ -17,6 +17,7 @@
 // All dims come from TTConfig (GGUF metadata). No hardcoded shapes.
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2336,15 +2337,388 @@ __global__ void k_prefill_flash_fp16_t(
     }
 }
 
+/* TT_FA2_PRE: tensor-core FA2 prefill flash (wmma m16n16k16, FP16 QK^T/PV,
+ * FP32 online softmax + O accum). CTA per (64-row Q-block, q-head), 4 warps
+ * x 16 rows. K/V FP32 slabs converted to half in smem (K stored transposed
+ * so both GEMMs are row-major). Causal block-skip: K-blocks fully above the
+ * diagonal break the loop (halves pairs @causal). O kept in per-warp smem,
+ * rescaled in place on m-updates; P@V accumulates via acc-fragment load of
+ * the rescaled O (no temp buffer). HD_ templated (64/128); other HD fall
+ * back to the legacy path in launch_prefill_flash. */
+#define FA2_BM 64
+#define FA2_BN 32
+#define FA2_WARPS 4
+template <int HD_>
+__global__ __launch_bounds__(128) void k_fa2_prefill(
+    const float *__restrict__ Q, const float *__restrict__ Kc,
+    const float *__restrict__ Vc, float *__restrict__ Att,
+    int n, int ctx, int e_pos, int n_heads, int n_kv_heads,
+    float scale, int window)
+{
+    const int G = n_heads / n_kv_heads;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int head = blockIdx.y;
+    const int kv = head / G;
+    const int q0 = blockIdx.x * FA2_BM;
+    const int r0 = warp * 16;
+    extern __shared__ half smem_h[];
+    half *sQ  = smem_h;                    /* [64][HD_] */
+    half *sKT = sQ + FA2_BM * HD_;         /* [HD_][32] transposed K */
+    half *sV  = sKT + (size_t)HD_ * FA2_BN; /* [32][HD_] */
+    float *wbase = (float *)(sV + (size_t)FA2_BN * HD_);
+    float *S = wbase + warp * (16 * FA2_BN + 16 * FA2_BN / 2 + 16 * HD_);
+    half  *P = (half *)(S + 16 * FA2_BN);  /* [16][32] */
+    float *O = (float *)(P + 16 * FA2_BN); /* [16][HD_] */
+    /* Q block -> smem half (zero-pad oob rows). */
+    {
+        const int perQ = FA2_BM * HD_;
+        for (int i = tid; i < perQ; i += blockDim.x) {
+            const int r = i / HD_, d = i % HD_;
+            const int qrow = q0 + r;
+            float v = 0.0f;
+            if (qrow < n)
+                v = Q[(long)qrow * (n_heads * HD_) + (long)head * HD_ + d];
+            sQ[i] = __float2half(v);
+        }
+    }
+    /* O zero init (lanes split each owned row in halves). */
+    {
+        const int row = lane & 15;
+        const int half0 = (lane >> 4) * (HD_ / 2);
+        for (int d = half0; d < half0 + HD_ / 2; d++) O[row * HD_ + d] = 0.0f;
+    }
+    __syncthreads();
+    const int row = lane & 15;
+    const int qrow = q0 + r0 + row;
+    const bool valid = (qrow < n);
+    const int max_kv = valid ? (e_pos + qrow) : -1;
+    const int row_min = (window > 0 && valid && (e_pos + qrow + 1 > window))
+        ? (e_pos + qrow + 1 - window) : 0;
+    float m = -1e30f, l = 0.0f;
+    const int qMax = e_pos + (q0 + FA2_BM - 1 < n ? q0 + FA2_BM - 1 : n - 1);
+    const int rowMinGlob = (window > 0) ? (e_pos + q0 + 1 - window) : 0;
+    const float4 *Kc4 = reinterpret_cast<const float4*>(Kc);
+    const float4 *Vc4 = reinterpret_cast<const float4*>(Vc);
+    const int hd4 = HD_ >> 2;
+    for (int ks = 0; ks < ctx; ks += FA2_BN) {
+        if (ks > qMax) break;                        /* causal: rest fully masked */
+        const int ke = (ks + FA2_BN < ctx) ? ks + FA2_BN : ctx;
+        if (ke <= rowMinGlob) continue;              /* SWA: fully below window */
+        const int kc = ke - ks;
+        /* K/V tiles -> smem half (K transposed). float4 over d. */
+        {
+            const int perKV = FA2_BN * hd4;
+            for (int i = tid; i < perKV; i += blockDim.x) {
+                const int k = i / hd4, d4 = i % hd4;
+                const int gt = ks + k;
+                float4 kv4 = make_float4(0, 0, 0, 0), vv4 = make_float4(0, 0, 0, 0);
+                if (k < kc) {
+                    const long g = ((long)gt * n_kv_heads + kv) * hd4 + d4;
+                    kv4 = Kc4[g]; vv4 = Vc4[g];
+                }
+                const float *kf = (const float *)&kv4, *vf = (const float *)&vv4;
+                for (int e = 0; e < 4; e++) {
+                    sKT[(d4 * 4 + e) * FA2_BN + k] = __float2half(kf[e]);
+                    sV[k * HD_ + d4 * 4 + e] = __float2half(vf[e]);
+                }
+            }
+        }
+        __syncthreads();
+        /* S = Q_warp @ KT (16 x kc) via wmma, stored fp32. */
+        using namespace nvcuda;
+        for (int nt = 0; nt < FA2_BN / 16; nt++) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+            for (int kk = 0; kk < HD_ / 16; kk++) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> fb;
+                wmma::load_matrix_sync(fa, sQ + (size_t)r0 * HD_ + (size_t)kk * 16, HD_);
+                wmma::load_matrix_sync(fb, sKT + (size_t)kk * 16 * FA2_BN + (size_t)nt * 16, FA2_BN);
+                wmma::mma_sync(acc, fa, fb, acc);
+            }
+            wmma::store_matrix_sync(S + (size_t)nt * 16, acc, FA2_BN, wmma::mem_row_major);
+        }
+        __syncwarp();
+        /* Online softmax over row; rescale O; stage P (half). Streams S
+         * from smem (no register arrays: dynamic indexing would spill). */
+        {
+            float *Srow = S + (size_t)row * FA2_BN;
+            half *Prow = P + (size_t)row * FA2_BN;
+            float bmax = -1e30f;
+            for (int k = 0; k < kc; k++) {
+                const int gt = ks + k;
+                float sc = -1e30f;
+                if (valid && gt >= row_min && gt <= max_kv) sc = Srow[k] * scale;
+                if (sc > bmax) bmax = sc;
+            }
+            const float m_new = fmaxf(m, bmax);
+            const float a = expf(m - m_new);
+            const float beta = expf(bmax - m_new);
+            const int half0 = (lane >> 4) * (HD_ / 2);
+            float *Orow = O + (size_t)row * HD_;
+            for (int d = half0; d < half0 + HD_ / 2; d++) Orow[d] *= a;
+            l *= a;
+            float bsum = 0.0f;
+            for (int k = 0; k < kc; k++) {
+                const int gt = ks + k;
+                float p = 0.0f;
+                if (valid && gt >= row_min && gt <= max_kv) {
+                    p = expf(Srow[k] * scale - bmax) * beta;
+                    bsum += p;
+                }
+                if (lane < 16) Prow[k] = __float2half(p);
+            }
+            for (int k = kc; k < FA2_BN; k++)
+                if (lane < 16) Prow[k] = __float2half(0.0f);
+            l += bsum;
+            m = m_new;
+        }
+        __syncwarp();
+        /* O = O + P @ V via wmma (acc loaded from rescaled O). */
+        for (int nt = 0; nt < HD_ / 16; nt++) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::load_matrix_sync(acc, O + (size_t)nt * 16, HD_, wmma::mem_row_major);
+            for (int kk = 0; kk < FA2_BN / 16; kk++) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> fb;
+                wmma::load_matrix_sync(fa, P + (size_t)kk * 16, FA2_BN);
+                wmma::load_matrix_sync(fb, sV + (size_t)kk * 16 * HD_ + (size_t)nt * 16, HD_);
+                wmma::mma_sync(acc, fa, fb, acc);
+            }
+            wmma::store_matrix_sync(O + (size_t)nt * 16, acc, HD_, wmma::mem_row_major);
+        }
+        __syncwarp();
+        __syncthreads();
+    }
+    /* Normalize + write out. */
+    if (valid && l > 0.0f) {
+        const float inv = 1.0f / l;
+        const int half0 = (lane >> 4) * (HD_ / 2);
+        float *out = Att + (long)qrow * (n_heads * HD_) + (long)head * HD_;
+        for (int d = half0; d < half0 + HD_ / 2; d++) out[d] = O[row * HD_ + d] * inv;
+    }
+}
+
+/* TT_FA2_PRE grouped variant (HD=64): CTA per (16-row Q-tile, kv-head),
+ * one warp per q-head in the group (G<=8). K/V tiles loaded ONCE per CTA
+ * and shared by all G warps. O in per-lane registers (32 floats); P@V
+ * done chunk-wise (16 cols) through the S scratch. smem ~43KB @G=7. */
+#define FA2_GBM 16
+#define FA2_GMAX 8
+/* S/P scratch columns padded 32->36/40: row stride 144B/80B (16B-aligned)
+ * spreads the 16 warp rows over banks (2-way vs 16-way conflict unpadded).
+ * P (half) needs ldm%8==0 for wmma alignment -> 40. */
+#define FA2_SBN_S 36
+#define FA2_SBN_P 40
+__global__ __launch_bounds__(256) void k_fa2_gqa64(
+    const float *__restrict__ Q, const float *__restrict__ Kc,
+    const float *__restrict__ Vc, float *__restrict__ Att,
+    int n, int ctx, int e_pos, int n_heads, int n_kv_heads,
+    float scale, int window)
+{
+    const int G = n_heads / n_kv_heads;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (warp >= G) return;
+    const int kv = blockIdx.y;
+    const int head = kv * G + warp;
+    const int q0 = blockIdx.x * FA2_GBM;
+    extern __shared__ half gsmem[];
+    half *sQ  = gsmem;                                        /* [G][16][64] */
+    half *sKT = sQ + (size_t)G * FA2_GBM * 64;                /* [64][32] */
+    half *sV  = sKT + (size_t)64 * FA2_BN;                    /* [32][64] */
+    float *Sbase = (float *)(sV + (size_t)FA2_BN * 64);
+    float *S = Sbase + (size_t)warp * 16 * FA2_SBN_S;
+    half *P = (half *)(Sbase + (size_t)G * 16 * FA2_SBN_S)
+            + (size_t)warp * 16 * FA2_SBN_P;
+    {
+        const int perQ = G * FA2_GBM * 64;
+        for (int i = tid; i < perQ; i += blockDim.x) {
+            const int w = i / (FA2_GBM * 64), rr = (i / 64) % FA2_GBM, d = i % 64;
+            const int qrow = q0 + rr;
+            float v = 0.0f;
+            if (qrow < n)
+                v = Q[(long)qrow * (n_heads * 64) + (long)(kv * G + w) * 64 + d];
+            sQ[i] = __float2half(v);
+        }
+    }
+    __syncthreads();
+    const int row = lane & 15;
+    const int qrow = q0 + row;
+    const bool valid = (qrow < n);
+    const int max_kv = valid ? (e_pos + qrow) : -1;
+    const int row_min = (window > 0 && valid && (e_pos + qrow + 1 > window))
+        ? (e_pos + qrow + 1 - window) : 0;
+    float m = -1e30f, l = 0.0f;
+    /* Per-lane O tile (own 32-col half only): const-indexed so it stays
+     * in registers (dynamic indexing would spill to local memory). */
+    float Oreg[32];
+    for (int d = 0; d < 32; d++) Oreg[d] = 0.0f;
+    const int half0 = (lane >> 4) * 32;
+    const int myHalf = (lane >> 4);
+    const int qMax = e_pos + (q0 + FA2_GBM - 1 < n ? q0 + FA2_GBM - 1 : n - 1);
+    const int rowMinGlob = (window > 0) ? (e_pos + q0 + 1 - window) : 0;
+    const float4 *Kc4 = reinterpret_cast<const float4*>(Kc);
+    const float4 *Vc4 = reinterpret_cast<const float4*>(Vc);
+    const int hd4 = 16;
+    half *sQw = sQ + (size_t)warp * FA2_GBM * 64;
+    using namespace nvcuda;
+    for (int ks = 0; ks < ctx; ks += FA2_BN) {
+        if (ks > qMax) break;
+        const int ke = (ks + FA2_BN < ctx) ? ks + FA2_BN : ctx;
+        if (ke <= rowMinGlob) continue;
+        const int kc = ke - ks;
+        {
+            const int perKV = FA2_BN * hd4;
+            for (int i = tid; i < perKV; i += blockDim.x) {
+                const int k = i / hd4, d4 = i % hd4;
+                const int gt = ks + k;
+                float4 kv4 = make_float4(0, 0, 0, 0), vv4 = make_float4(0, 0, 0, 0);
+                if (k < kc) {
+                    const long g = ((long)gt * n_kv_heads + kv) * hd4 + d4;
+                    kv4 = Kc4[g]; vv4 = Vc4[g];
+                }
+                const float *kf = (const float *)&kv4, *vf = (const float *)&vv4;
+                for (int e = 0; e < 4; e++) {
+                    sKT[(d4 * 4 + e) * FA2_BN + k] = __float2half(kf[e]);
+                    sV[k * 64 + d4 * 4 + e] = __float2half(vf[e]);
+                }
+            }
+        }
+        __syncthreads();
+        for (int nt = 0; nt < FA2_BN / 16; nt++) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+            for (int kk = 0; kk < 4; kk++) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> fb;
+                wmma::load_matrix_sync(fa, sQw + (size_t)kk * 16, 64);
+                wmma::load_matrix_sync(fb, sKT + (size_t)kk * 16 * FA2_BN + (size_t)nt * 16, FA2_BN);
+                wmma::mma_sync(acc, fa, fb, acc);
+            }
+            wmma::store_matrix_sync(S + (size_t)nt * 16, acc, FA2_SBN_S, wmma::mem_row_major);
+        }
+        __syncwarp();
+        /* Softmax: lanes<16 own the row math (halves expf + S traffic);
+         * upper lanes take a/bsum/m via shuffle, rescale own O half. */
+        {
+            float *Srow = S + (size_t)row * FA2_SBN_S;
+            half *Prow = P + (size_t)row * FA2_SBN_P;
+            float bmax = -1e30f, bsum = 0.0f, a = 1.0f, m_new = m;
+            if (lane < 16) {
+                for (int k = 0; k < kc; k++) {
+                    const int gt = ks + k;
+                    float sc = -1e30f;
+                    if (valid && gt >= row_min && gt <= max_kv) sc = Srow[k] * scale;
+                    if (sc > bmax) bmax = sc;
+                }
+                m_new = fmaxf(m, bmax);
+                a = expf(m - m_new);
+                const float beta = expf(bmax - m_new);
+                for (int k = 0; k < kc; k++) {
+                    const int gt = ks + k;
+                    float p = 0.0f;
+                    if (valid && gt >= row_min && gt <= max_kv) {
+                        p = expf(Srow[k] * scale - bmax) * beta;
+                        /* Self-consistent l: accumulate the ROUNDED weight
+                         * actually staged to P (half flushes tiny p to 0;
+                         * counting unrounded p in l biases O/l downward). */
+                        p = __half2float(__float2half(p));
+                        bsum += p;
+                    }
+                    Prow[k] = __float2half(p);
+                }
+                for (int k = kc; k < FA2_BN; k++) Prow[k] = __float2half(0.0f);
+            }
+            const float a_all = __shfl_sync(0xffffffff, a, lane & 15);
+            const float bsum_all = __shfl_sync(0xffffffff, bsum, lane & 15);
+            m = __shfl_sync(0xffffffff, m_new, lane & 15);
+            for (int d = 0; d < 32; d++) Oreg[d] *= a_all;
+            l = l * a_all + bsum_all;
+        }
+        __syncwarp();
+        /* P@V in two 32-col halves through the S scratch (16x32 fp32).
+         * T-aliasing sQ was sized wrong (1024 floats/warp vs 512 free). */
+        for (int h = 0; h < 2; h++) {
+            for (int nt = 0; nt < 2; nt++) {
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+                wmma::fill_fragment(acc, 0.0f);
+                for (int kk = 0; kk < FA2_BN / 16; kk++) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> fb;
+                    wmma::load_matrix_sync(fa, P + (size_t)kk * 16, FA2_SBN_P);
+                    wmma::load_matrix_sync(fb, sV + (size_t)kk * 16 * 64 + (size_t)(h * 32 + nt * 16), 64);
+                    wmma::mma_sync(acc, fa, fb, acc);
+                }
+                wmma::store_matrix_sync(S + (size_t)nt * 16, acc, FA2_SBN_S, wmma::mem_row_major);
+            }
+            __syncwarp();
+            if (myHalf == h) {
+                float *Srow = S + (size_t)row * FA2_SBN_S;
+                for (int c = 0; c < 32; c++) Oreg[c] += Srow[c];
+            }
+            __syncwarp();
+        }
+        __syncwarp();
+        __syncthreads();
+    }
+    if (valid && l > 0.0f) {
+        const float inv = 1.0f / l;
+        float *out = Att + (long)qrow * (n_heads * 64) + (long)head * 64;
+        for (int d = 0; d < 32; d++) out[half0 + d] = Oreg[d] * inv;
+    }
+}
+
+/* TT_FA2_PRE dispatch: flag off or uncommon HD keeps legacy path. */
+static inline int tt_fa2_pre_on(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("TT_FA2_PRE") ? 1 : 0;
+    return v;
+}
 /* TT_FLASH_FP16 dispatch: flag off or uncommon HD keeps legacy fp32 kernel. */
 static inline int tt_flash_fp16_on(void) {
     static int v = -1;
     if (v < 0) v = getenv("TT_FLASH_FP16") ? 1 : 0;
     return v;
 }
+/* FA2 engages at n>=FA2_MIN_N: below that the TC win is sub-ms absolute
+ * while FP16 rounding perturbs borderline argmax races (backfill Q8 Margins).
+ * Short-n keeps the bit-exact legacy path; long-n takes tensor cores. */
+#define FA2_MIN_N 64
 static void launch_prefill_flash(const float *Q, const float *Kf, const float *Vf,
     float *Att, int n, int ctx, int e_pos, int H, int KV, int HD,
     float scale, int swa, cudaStream_t stream) {
+    if (tt_fa2_pre_on() && n >= FA2_MIN_N && (HD == 64 || HD == 128)) {
+        dim3 grid((n + FA2_BM - 1) / FA2_BM, H);
+        const int threads = FA2_WARPS * 32;
+        size_t smem = ((size_t)FA2_BM * HD + 2 * (size_t)HD * FA2_BN) * sizeof(half)
+                    + (size_t)FA2_WARPS * (16 * FA2_BN * sizeof(float)
+                        + 16 * FA2_BN * sizeof(half) + 16 * (size_t)HD * sizeof(float));
+        if (HD == 64 && (H / KV) <= FA2_GMAX) {
+            /* Grouped GQA: CTA per (16-row tile, kv-head), warp per q-head. */
+            dim3 grid((n + FA2_GBM - 1) / FA2_GBM, KV);
+            const int G = H / KV;
+            const int threads = G * 32;
+            size_t smem = ((size_t)G * FA2_GBM * 64 + 64 * FA2_BN
+                         + (size_t)FA2_BN * 64) * sizeof(half)
+                        + (size_t)G * 16 * FA2_SBN_S * sizeof(float)
+                        + (size_t)G * 16 * FA2_SBN_P * sizeof(half);
+            k_fa2_gqa64<<<grid, threads, smem, stream>>>(
+                Q, Kf, Vf, Att, n, ctx, e_pos, H, KV, scale, swa);
+        } else if (HD == 64) {
+            k_fa2_prefill<64><<<grid, threads, smem, stream>>>(
+                Q, Kf, Vf, Att, n, ctx, e_pos, H, KV, scale, swa);
+        } else {
+            cudaFuncSetAttribute(k_fa2_prefill<128>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+            k_fa2_prefill<128><<<grid, threads, smem, stream>>>(
+                Q, Kf, Vf, Att, n, ctx, e_pos, H, KV, scale, swa);
+        }
+        return;
+    }
     int use_fp16 = tt_flash_fp16_on() && (HD == 64 || HD == 128 || HD == 32);
     if (use_fp16) {
         static int attr = 0;
