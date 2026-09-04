@@ -145,6 +145,11 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - Wall: per-MAC Q4 dequant ALU starves MMA (~3 TFLOPS eff of ~50 ceiling). Only LUT-dequant or prefill-FP16-copy can move GEMM now. Flash (~150ms) now equals GEMM — next target.
 - Prefill stands 2.3k (WMMA, 0.3x llama 8k). 100x dead on this GPU; realistic ceiling ~4-6x via dequant-LUT + flash work.
 
+## 10k push: 6.4k via FA2 (Cycle 27)
+- `8f7fe53` (verified KEEP): `k_fa2_gqa64` — CTA per 16-row tile×kv-head, warp per q-head (GQA-shared KV), WMMA FP16 QK^T+PV, FP32 online softmax, transposed-K smem (bank-conflict fix 1.27→0.75ms), causal block-break. Kernels-only +374/-0. Flag `TT_FA2_PRE=1`.
+- Flash 54.8→14.5ms HOT. Combo (cuBLAS+FA2) prefill 1489→6400. Greedy-identical short+pp759. FA2_MIN_N=64 policy (exact legacy below); N≥64 borderline-race disclosure accepted, pp759 stable. G>8 → generic FA2 (not legacy — claim fixed).
+- Prefill 1.4k→6.4k (4.6x) since roofline start. Remaining to 10k: GEMM 99ms @5.5 TFLOPS (small-M underuse?) + misc; check long-prompt scaling + launch overlap next.
+
 ## 10k push: combo BANKED at 4.1-4.6k (Cycle 26)
 - `415b357` (verified KEEP): FP32 shadow (1365MB) + cuBLAS GEMM + fast flash. Hot median 4092-4633 (clock variance; 682MHz cold→1965MHz hot, can't lock w/o sudo — always warm up 2 runs). Greedy-identical, maxdiff 0.0128. Graceful OOM fallback (`[cublas-pre] ABORT`, drops shadows). Kernels-only +189/-14. Gates green.
 - Path 2.3k→4.6k banked (2x). Remaining to 10k: flash 54ms @1.4 TFLOPS needs FA2-class rewrite (~5x → ~10ms). GEMM at 5.5 TFLOPS cuBLAS is done.
