@@ -156,6 +156,12 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - Fixes tried (all bit-exact, all missed 7k): rope freq-table, float4 swiglu, single-chunk-759 (worse tiles), fused gate+up M=9728 (cuBLAS algo fallback → 0.5 TFLOPS, lesson: algo choice dominates).
 - Best 6767 vs baseline 6680-6790. o+mlp cuBLAS 76.7ms (65%) is now the whole game → next bet: per-shape cuBLAS algo autotune.
 
+## Cycle 29: Algo Autotune Exhausted (reverted, no commit)
+- Per-shape: gate bimodal DEFAULT 0.64↔0.84ms, pinned ALGO1+ stable 0.633ms/7.05TF (stability win only); down flat 6.72 all algos; o-shape flat 5.56 (Lt +11% = 0.4ms total, noise); Lt worse than GemmEx on gate/down.
+- Tuned hot median 6740 < 7000 acceptance. Greedy Y. Tree reverted clean, rebuilt 6810 ≈ baseline.
+- Ceiling proven: GEMM floor ~83ms + non-GEMM ~29ms = ~112ms (~6770). Algo choice exhausted — 10k needs structural change (fewer FLOPs/bytes), not better algos.
+- UNTRIED (GPT-5.6 advice): FP16 shadow + COMPUTE_32F_FAST_16F tensor path — all work so far used FP32 SIMT path. That's the next real bet (2-4x on GEMM).
+
 ## 10k push: combo BANKED at 4.1-4.6k (Cycle 26)
 - `415b357` (verified KEEP): FP32 shadow (1365MB) + cuBLAS GEMM + fast flash. Hot median 4092-4633 (clock variance; 682MHz cold→1965MHz hot, can't lock w/o sudo — always warm up 2 runs). Greedy-identical, maxdiff 0.0128. Graceful OOM fallback (`[cublas-pre] ABORT`, drops shadows). Kernels-only +189/-14. Gates green.
 - Path 2.3k→4.6k banked (2x). Remaining to 10k: flash 54ms @1.4 TFLOPS needs FA2-class rewrite (~5x → ~10ms). GEMM at 5.5 TFLOPS cuBLAS is done.
