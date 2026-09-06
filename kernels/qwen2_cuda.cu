@@ -3209,6 +3209,20 @@ struct Qwen2Engine {
     void *cublas_dl;
     int (*cublas_nt_fn)(const float *, const float *, float *, int, int, int, void *, int);
     int cublas_ok;
+    /* TT_CUBLAS_FP16: FP16 shadow weights (device half) + tensor-core GEMM.
+     * NULL entry = fallback to FP32/Q4 path. fp16_x = persistent N*K scratch. */
+    half *sh16_q[128], *sh16_k[128], *sh16_v[128], *sh16_o[128];
+    half *sh16_gate[128], *sh16_up[128], *sh16_down[128];
+    void *cublas_fp16_dl;
+    int (*cublas_fp16_fn)(const void *, const void *, float *, int, int, int, void *);
+    int cublas_fp16_ok;
+    half *fp16_x;
+    size_t fp16_x_cap;
+    /* Xn convert cache: pre-attn q/k/v (kinds 0,1,2) share d_Xn per layer; convert once. */
+    half *fp16_xn;
+    size_t fp16_xn_cap;
+    const float *fp16_xn_src;
+    int fp16_xn_l, fp16_xn_N;
     int pos;
     int n_gpu_layers;
     float *h_x_buf, *h_xn_buf, *h_q_buf, *h_att_buf, *h_h_buf, *h_g_buf, *h_u_buf, *h_out_buf;
@@ -3329,6 +3343,7 @@ extern "C" void qwen2_engine_enable_q4_kvcache(Qwen2Engine *e, int enable);
 
 static void fail(const char *msg) { fprintf(stderr, "[qwen2-engine] %s\n", msg); }
 static void cublas_build_shadows(Qwen2Engine *e, GGUFModel *m);
+static void cublas_fp16_build(Qwen2Engine *e, GGUFModel *m);
 
 Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
 #define ABORT_CREATE(msg) do { fail(msg); qwen2_engine_free(e); return NULL; } while (0)
@@ -3768,6 +3783,7 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         }
     }
     cublas_build_shadows(e, m);
+    cublas_fp16_build(e, m);
     return e;
 
 
@@ -3811,7 +3827,17 @@ void qwen2_engine_free(Qwen2Engine *e) {
         if (e->sh_gate[l]) cudaFree(e->sh_gate[l]);
         if (e->sh_up[l]) cudaFree(e->sh_up[l]);
         if (e->sh_down[l]) cudaFree(e->sh_down[l]);
+        if (e->sh16_q[l]) cudaFree(e->sh16_q[l]);
+        if (e->sh16_k[l]) cudaFree(e->sh16_k[l]);
+        if (e->sh16_v[l]) cudaFree(e->sh16_v[l]);
+        if (e->sh16_o[l]) cudaFree(e->sh16_o[l]);
+        if (e->sh16_gate[l]) cudaFree(e->sh16_gate[l]);
+        if (e->sh16_up[l]) cudaFree(e->sh16_up[l]);
+        if (e->sh16_down[l]) cudaFree(e->sh16_down[l]);
     }
+    if (e->fp16_x) cudaFree(e->fp16_x);
+    if (e->fp16_xn) cudaFree(e->fp16_xn);
+    if (e->cublas_fp16_dl) dlclose(e->cublas_fp16_dl);
     if (e->cublas_dl) dlclose(e->cublas_dl);
     if (e->d_pf_X) cudaFree(e->d_pf_X);
     if (e->d_pf_Xn) cudaFree(e->d_pf_Xn);
@@ -4785,6 +4811,66 @@ void qwen2_engine_reset(Qwen2Engine *e) {
     cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
 }
 
+/* TT_CUBLAS_FP16: f32->half activation conversion for tensor-core GEMM. */
+__global__ void k_f32_to_f16(const float *src, half *dst, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(src[i]);
+}
+static inline int cublas_fp16_wanted(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("TT_CUBLAS_FP16") ? 1 : 0;
+    return cached;
+}
+static inline half *cublas_fp16_ptr(Qwen2Engine *e, int l, int kind) {
+    if (!e->cublas_fp16_ok || l < 0 || l >= e->cfg.n_layers) return NULL;
+    switch (kind) {
+        case 0: return e->sh16_q[l]; case 1: return e->sh16_k[l];
+        case 2: return e->sh16_v[l]; case 3: return e->sh16_o[l];
+        case 4: return e->sh16_gate[l]; case 5: return e->sh16_up[l];
+        case 6: return e->sh16_down[l]; default: return NULL;
+    }
+}
+static inline int cublas_fp16_ensure_x(Qwen2Engine *e, size_t need) {
+    if (need == 0) return -1;
+    if (e->fp16_x && e->fp16_x_cap >= need) return 0;
+    if (e->fp16_x) { cudaFree(e->fp16_x); e->fp16_x = NULL; e->fp16_x_cap = 0; }
+    if (cudaMalloc(&e->fp16_x, need * sizeof(half)) != cudaSuccess) return -1;
+    e->fp16_x_cap = need;
+    return 0;
+}
+/* FP16 tensor-core try: convert dX f32->f16 in scratch, GEMM fp16->fp32 out.
+ * Returns 0 on success, nonzero = fall back. */
+static inline int cublas_fp16_try(Qwen2Engine *e, int l, int kind,
+    const float *dX, float *dY, int M, int K, int N, cudaStream_t s) {
+    half *dW = cublas_fp16_ptr(e, l, kind);
+    if (!dW || !e->cublas_fp16_fn) return -99;
+    size_t need = (size_t)N * (size_t)K;
+    const half *dX16 = NULL;
+    /* FIX C31: cache ONLY pre-attn kinds 0,1,2. d_Xn arena ptr is reused:
+     * o-proj/ffn-norm overwrite it, so gate/up (4,5) same-ptr reads are
+     * different data -> stale hit. gate/up/down (4,5,3,6) fresh-convert. */
+    if ((kind == 0 || kind == 1 || kind == 2)) {
+        if (!(e->fp16_xn && e->fp16_xn_cap >= need && e->fp16_xn_src == dX &&
+              e->fp16_xn_l == l && e->fp16_xn_N == N)) {
+            if (e->fp16_xn_cap < need) {
+                if (e->fp16_xn) { cudaFree(e->fp16_xn); e->fp16_xn = NULL; }
+                if (cudaMalloc(&e->fp16_xn, need * sizeof(half)) != cudaSuccess) return -97;
+                e->fp16_xn_cap = need;
+            }
+            size_t blocks = (need + 255) / 256;
+            k_f32_to_f16<<<blocks, 256, 0, s>>>(dX, e->fp16_xn, need);
+            e->fp16_xn_src = dX; e->fp16_xn_l = l; e->fp16_xn_N = N;
+        }
+        dX16 = e->fp16_xn;
+    } else {
+        if (cublas_fp16_ensure_x(e, need) != 0) return -97;
+        size_t blocks = (need + 255) / 256;
+        k_f32_to_f16<<<blocks, 256, 0, s>>>(dX, e->fp16_x, need);
+        dX16 = e->fp16_x;
+    }
+    int rc = e->cublas_fp16_fn(dW, dX16, dY, M, K, N, (void*)s);
+    return rc == 0 ? 0 : -98;
+}
 /* TT_CUBLAS_PRE: FP32-shadow + cuBLAS prefill. dlopened libtt_cublas.so,
  * strict CUBLAS_COMPUTE_32F except gate/up/down (FAST_TF32). */
 static inline int cublas_pre_wanted(void) {
@@ -4804,6 +4890,10 @@ static inline float *cublas_shadow_ptr(Qwen2Engine *e, int l, int kind) {
 }
 static inline int cublas_prefill_try(Qwen2Engine *e, int l, int kind,
     const float *dX, float *dY, int M, int K, int N, cudaStream_t s) {
+    if (cublas_fp16_wanted()) {
+        if (cublas_fp16_try(e, l, kind, dX, dY, M, K, N, s) == 0) return 0;
+        if (e->cublas_fp16_ok) return -98; /* fp16 armed but failed: no silent Q4 */
+    }
     float *dW = cublas_shadow_ptr(e, l, kind);
     if (!dW || !e->cublas_nt_fn) return -99;
     int allow = 1; /* TF32 for all prefill GEMMs: strict-FP32 q/o is 6x slower
@@ -4892,6 +4982,117 @@ static void cublas_build_shadows(Qwen2Engine *e, GGUFModel *m) {
         if (wX) cudaFree(wX);
         if (wY) cudaFree(wY);
         (void)kinds;
+    }
+}
+
+/* TT_CUBLAS_FP16: FP16 shadow weights (dequant Q4->half once) + tensor-core
+ * GEMM (cublasGemmEx CUDA_R_16F / COMPUTE_32F_FAST_16F / TENSOR_OP, FP32 out).
+ * Independent of TT_CUBLAS_PRE. ABORT+fallback if free <200MB. */
+static void cublas_fp16_build(Qwen2Engine *e, GGUFModel *m) {
+    e->cublas_fp16_ok = 0; e->cublas_fp16_dl = NULL; e->cublas_fp16_fn = NULL;
+    e->fp16_x = NULL; e->fp16_x_cap = 0;
+    e->fp16_xn = NULL; e->fp16_xn_cap = 0;
+    e->fp16_xn_src = NULL; e->fp16_xn_l = -1; e->fp16_xn_N = -1;
+    for (int l = 0; l < 128; l++)
+        e->sh16_q[l]=e->sh16_k[l]=e->sh16_v[l]=e->sh16_o[l]=e->sh16_gate[l]=e->sh16_up[l]=e->sh16_down[l]=NULL;
+    if (!cublas_fp16_wanted()) return;
+    static const char *paths[] = { "build/libtt_cublas.so", "./build/libtt_cublas.so", NULL };
+    for (int i = 0; paths[i]; i++) {
+        e->cublas_fp16_dl = dlopen(paths[i], RTLD_NOW);
+        if (e->cublas_fp16_dl) break;
+    }
+    if (!e->cublas_fp16_dl) { fprintf(stderr, "[cublas-fp16] dlopen fail: %s\n", dlerror()); return; }
+    e->cublas_fp16_fn = (int(*)(const void*,const void*,float*,int,int,int,void*))dlsym(e->cublas_fp16_dl, "tt_cublas_prefill_nt_fp16");
+    if (!e->cublas_fp16_fn) { fprintf(stderr, "[cublas-fp16] dlsym fail\n"); dlclose(e->cublas_fp16_dl); e->cublas_fp16_dl=NULL; return; }
+    const char *suffix[7] = { "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight" };
+    size_t total_bytes = 0;
+    for (int l = 0; l < e->cfg.n_layers; l++) {
+        for (int k = 0; k < 7; k++) {
+            char name[160]; snprintf(name, sizeof(name), "blk.%d.%s", l, suffix[k]);
+            GGUFTensor *t = gguf_get_tensor(m, name);
+            if (!t || !t->data || t->ndim != 2 || (int)t->type != 2) continue;
+            long M = (long)t->shape[1], K = (long)t->shape[0];
+            long numel = M * K;
+            float *h = (float*)malloc((size_t)numel * sizeof(float));
+            if (!h) continue;
+            long got = ttq_dequant(t->data, 2, numel, h);
+            if (got != numel) { free(h); continue; }
+            half *h16 = (half*)malloc((size_t)numel * sizeof(half));
+            if (!h16) { free(h); continue; }
+            for (long i = 0; i < numel; i++) h16[i] = __float2half(h[i]);
+            free(h);
+            half *d = NULL;
+            if (cudaMalloc(&d, (size_t)numel * sizeof(half)) != cudaSuccess) { free(h16); continue; }
+            if (cudaMemcpy(d, h16, (size_t)numel * sizeof(half), cudaMemcpyHostToDevice) != cudaSuccess) { cudaFree(d); free(h16); continue; }
+            free(h16);
+            total_bytes += (size_t)numel * sizeof(half);
+            half **slot = NULL;
+            switch (k) { case 0: slot=&e->sh16_q[l]; break; case 1: slot=&e->sh16_k[l]; break; case 2: slot=&e->sh16_v[l]; break; case 3: slot=&e->sh16_o[l]; break; case 4: slot=&e->sh16_gate[l]; break; case 5: slot=&e->sh16_up[l]; break; case 6: slot=&e->sh16_down[l]; break; }
+            if (slot) *slot = d;
+        }
+    }
+    size_t free_b = 0, tot_b = 0;
+    cudaMemGetInfo(&free_b, &tot_b);
+    fprintf(stderr, "[cublas-fp16] shadows %.0fMB, gpu free %.0fMB\n", (double)total_bytes/1048576.0, (double)free_b/1048576.0);
+    if (free_b < (size_t)200*1048576) {
+        fprintf(stderr, "[cublas-fp16] ABORT: free <200MB, dropping shadows\n");
+        for (int l = 0; l < e->cfg.n_layers; l++) {
+            half *ps[7] = { e->sh16_q[l],e->sh16_k[l],e->sh16_v[l],e->sh16_o[l],e->sh16_gate[l],e->sh16_up[l],e->sh16_down[l] };
+            for (int k = 0; k < 7; k++) if (ps[k]) cudaFree(ps[k]);
+            e->sh16_q[l]=e->sh16_k[l]=e->sh16_v[l]=e->sh16_o[l]=e->sh16_gate[l]=e->sh16_up[l]=e->sh16_down[l]=NULL;
+        }
+        dlclose(e->cublas_fp16_dl); e->cublas_fp16_dl=NULL; e->cublas_fp16_fn=NULL; return;
+    }
+    /* Persistent fp16 X scratch: 512 x maxK (chunk path guarantees N<=512). */
+    {
+        int maxK = e->cfg.dim > e->cfg.hidden_dim ? e->cfg.dim : e->cfg.hidden_dim;
+        size_t cap = (size_t)512 * (size_t)maxK;
+        if (cublas_fp16_ensure_x(e, cap) != 0)
+            fprintf(stderr, "[cublas-fp16] scratch alloc fail\n");
+    }
+    e->cublas_fp16_ok = 1;
+    /* Warm handle + per-shape autotune outside prefill window (N=512,239). */
+    {
+        int qo = e->cfg.n_heads * e->cfg.head_dim;
+        int kv = e->cfg.n_kv_heads * e->cfg.head_dim;
+        int D = e->cfg.dim, F = e->cfg.hidden_dim;
+        int Ms[6] = { qo, D, F, F, D, kv };
+        int Ks[6] = { D, qo, D, D, F, D };
+        half *shs[6] = { e->sh16_q[0], e->sh16_o[0], e->sh16_gate[0], e->sh16_up[0], e->sh16_down[0], e->sh16_k[0] };
+        float *wX = NULL, *wY = NULL;
+        int maxK = D > F ? D : F, maxM = F > qo ? F : qo;
+        if (D > maxM) maxM = D;
+        if (cudaMalloc(&wX, 512*(size_t)maxK*sizeof(float))==cudaSuccess &&
+            cudaMalloc(&wY, 512*(size_t)maxM*sizeof(float))==cudaSuccess) {
+            cudaMemset(wX, 0, 512*(size_t)maxK*sizeof(float));
+            for (int i = 0; i < 6; i++) {
+                if (!shs[i]) continue;
+                size_t need = (size_t)512 * (size_t)Ks[i];
+                if (cublas_fp16_ensure_x(e, need) != 0) continue;
+                size_t bl = (need + 255) / 256;
+                k_f32_to_f16<<<bl, 256, 0, e->stream>>>(wX, e->fp16_x, need);
+                e->cublas_fp16_fn(shs[i], e->fp16_x, wY, Ms[i], Ks[i], 512, (void*)e->stream);
+            }
+            for (int i = 0; i < 6; i++) {
+                if (!shs[i]) continue;
+                size_t need = (size_t)247 * (size_t)Ks[i];
+                if (cublas_fp16_ensure_x(e, need) != 0) continue;
+                size_t bl = (need + 255) / 256;
+                k_f32_to_f16<<<bl, 256, 0, e->stream>>>(wX, e->fp16_x, need);
+                e->cublas_fp16_fn(shs[i], e->fp16_x, wY, Ms[i], Ks[i], 247, (void*)e->stream);
+            }
+            for (int i = 0; i < 6; i++) {
+                if (!shs[i]) continue;
+                size_t need = (size_t)759 * (size_t)Ks[i];
+                if (cublas_fp16_ensure_x(e, need) != 0) continue;
+                size_t bl = (need + 255) / 256;
+                k_f32_to_f16<<<bl, 256, 0, e->stream>>>(wX, e->fp16_x, need);
+                e->cublas_fp16_fn(shs[i], e->fp16_x, wY, Ms[i], Ks[i], 759, (void*)e->stream);
+            }
+            cudaStreamSynchronize(e->stream);
+        }
+        if (wX) cudaFree(wX);
+        if (wY) cudaFree(wY);
     }
 }
 
@@ -5619,7 +5820,9 @@ int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
     /* resync device position scalar before any forward work (sync: see advance()) */
     cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
     if (n >= 32 && !e->has_pl_embd && e->cfg.tr.softcap_value == 0.0f) {
-        const int CHUNK_SIZE = 512;
+        /* TT_CUBLAS_FP16: single large chunk (N=759 in one GEMM) for tensor
+         * occupancy; default path keeps 512-chunk behavior. */
+        const int CHUNK_SIZE = cublas_fp16_wanted() ? 2048 : 512;
         int offset = 0;
         int failed = 0;
         while (offset < n) {

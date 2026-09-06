@@ -1,6 +1,7 @@
 // M3: minimal cuBLAS sgemm reference wrapper (row-major semantics).
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdio>
 
 static cublasHandle_t g_handle = nullptr;
@@ -52,5 +53,31 @@ extern "C" int tt_cublas_prefill_nt(const float *dW, const float *dX, float *dY,
         &beta,
         dY, dt, M,
         ct, CUBLAS_GEMM_DEFAULT);
+    return (int)st;
+}
+
+/* TT_CUBLAS_FP16: tensor-core prefill GEMM. Row-major Y[N,M] = X[N,K] @ W^T[M,K].
+ * dW/dX are FP16 device row-major, dY is FP32 row-major (FP32 accumulate+store
+ * for parity). Column-major mapping identical to tt_cublas_prefill_nt:
+ * OP_T(W,lda=K) OP_N(X,ldb=K), m=M n=N k=K ldc=M.
+ * compute=CUBLAS_COMPUTE_32F_FAST_16F, algo=TENSOR_OP. stream may be NULL.
+ * Returns 0 on success. */
+extern "C" int tt_cublas_prefill_nt_fp16(const void *dW, const void *dX, float *dY,
+                                    int M, int K, int N,
+                                    void *stream) {
+    ensure_handle();
+    if (!g_handle) return -1;
+    if (!dW || !dX || !dY || M <= 0 || N <= 0 || K <= 0) return -2;
+    if (stream) cublasSetStream(g_handle, (cudaStream_t)stream);
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(g_handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        M, N, K,
+        &alpha,
+        dW, CUDA_R_16F, K,
+        dX, CUDA_R_16F, K,
+        &beta,
+        dY, CUDA_R_32F, M,
+        CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     return (int)st;
 }
