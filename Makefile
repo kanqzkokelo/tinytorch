@@ -32,7 +32,7 @@ NVCC ?= $(HOME)/mmcuda/bin/nvcc
 CUDA_INC := $(HOME)/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/include
 
 $(BUILD)/libtinytorch_cuda.so: kernels/gemm_cuda.cu kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -shared -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ kernels/gemm_cuda.cu kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu \
@@ -46,7 +46,7 @@ CUBLAS_INC := $(HOME)/.local/lib/python3.12/site-packages/nvidia/cublas/include
 CUBLAS_LIB := $(HOME)/.local/lib/python3.12/site-packages/nvidia/cublas/lib
 
 $(BUILD)/libtt_cublas.so: kernels/cublas_ref.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -I$(CUBLAS_INC) -shared -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib:$(CUBLAS_LIB) \
 	  -o $@ kernels/cublas_ref.cu \
@@ -57,7 +57,7 @@ cublas: $(BUILD)/libtt_cublas.so
 .PHONY: cublas
 
 $(BUILD)/run_llm_gpu: examples/run_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c src/async_printer.c src/chat_template.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler "-fPIC -fopenmp" \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -67,7 +67,7 @@ $(BUILD)/run_llm_gpu: examples/run_llm_gpu.c src/loader_gguf.c src/arch_registry
 run_llm_gpu: $(BUILD)/run_llm_gpu
 
 $(BUILD)/chat_llm_gpu: examples/chat_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c src/async_printer.c src/chat_template.c src/samplers.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler "-fPIC -fopenmp" \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -77,7 +77,7 @@ $(BUILD)/chat_llm_gpu: examples/chat_llm_gpu.c src/loader_gguf.c src/arch_regist
 chat_llm_gpu: $(BUILD)/chat_llm_gpu
 
 $(BUILD)/server_minimal: examples/server_minimal.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c src/chat_template.c src/samplers.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler "-fPIC -fopenmp" \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -90,7 +90,7 @@ server_minimal: $(BUILD)/server_minimal
 # batched verify_speculative() (CUDA). Source list mirrors run_llm_gpu
 # plus src/ngram_lookup.c.
 $(BUILD)/spec_llm_gpu: examples/spec_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c src/async_printer.c src/ngram_lookup.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler "-fPIC -fopenmp" \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -114,7 +114,7 @@ oracle_logits: $(BUILD)/oracle_logits
 .PHONY: run_llm_gpu chat_llm_gpu
 
 $(BUILD)/dump_logits: tools/dump_logits.c src/loader_gguf.c src/dequant_ref.c src/cpu_backend.c src/arch_registry.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler "-fPIC -fopenmp" \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -126,7 +126,7 @@ dump_logits: $(BUILD)/dump_logits
 .PHONY: dump_logits
 
 $(BUILD)/bench_prefill: tools/bench_prefill.c src/loader_gguf.c src/dequant_ref.c src/arch_registry.c src/cpu_backend.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -138,7 +138,7 @@ bench_prefill: $(BUILD)/bench_prefill
 .PHONY: bench_prefill
 
 $(BUILD)/profile_step: tools/profile_step.cu src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler "-fPIC -fopenmp" \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -166,7 +166,7 @@ bench_ipc: $(BUILD)/bench_ipc
 # M7 task 2: GPU golden GEMV grid for all Tier-1 quant types
 $(BUILD)/test_gemv_typed: tools/test_gemv_typed.cu src/loader_gguf.c src/dequant_ref.c \
 		kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -181,7 +181,7 @@ test_gemv_typed: $(BUILD)/test_gemv_typed
 # Speculative-decode verify test: compares batched verify(N) logits against
 # N sequential single-token forwards (bit-exact on qwen2.5-0.5b-q4_0).
 $(BUILD)/test_spec_verify: tests/test_spec_verify.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -197,7 +197,7 @@ test_spec_verify: $(BUILD)/test_spec_verify
 # Compares tt_gemv_q4_0_batch4 against 4 sequential tt_gemv_q4_0 calls
 # across engine-relevant shapes; same for q8_0.
 $(BUILD)/test_batch4_gemv: tests/test_batch4_gemv.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -210,7 +210,7 @@ test_batch4_gemv: $(BUILD)/test_batch4_gemv
 
 # Q8_0 V4 LM Head Launcher bit-exact correctness test.
 $(BUILD)/test_logits_q8_v4: tests/test_logits_q8_v4.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -223,7 +223,7 @@ test_logits_q8_v4: $(BUILD)/test_logits_q8_v4
 
 # Q8_0 KV Cache Scatter and Flash Attention correctness test.
 $(BUILD)/test_q8_kvcache: tests/test_q8_kvcache.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -235,7 +235,7 @@ test_q8_kvcache: $(BUILD)/test_q8_kvcache
 .PHONY: test_q8_kvcache
 
 $(BUILD)/test_q4_kvcache: tests/test_q4_kvcache.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -247,7 +247,7 @@ test_q4_kvcache: $(BUILD)/test_q4_kvcache
 .PHONY: test_q4_kvcache
 
 $(BUILD)/test_q4_split_exact: tests/test_q4_split_exact.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -259,7 +259,7 @@ test_q4_split_exact: $(BUILD)/test_q4_split_exact
 .PHONY: test_q4_split_exact
 
 $(BUILD)/test_qcache_backfill: tests/test_qcache_backfill.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -272,7 +272,7 @@ test_qcache_backfill: $(BUILD)/test_qcache_backfill
 
 # Batched Q4_0 Prefill GEMM multi-boundary correctness test.
 $(BUILD)/test_prefill_gemm: tests/test_prefill_gemm.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Xcompiler -fPIC -Xcompiler -fopenmp \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -285,7 +285,7 @@ test_prefill_gemm: $(BUILD)/test_prefill_gemm
 
 # Tensor Core WMMA Q4_0 Prefill GEMM multi-boundary correctness test.
 $(BUILD)/test_wmma_prefill_gemm: tests/test_wmma_prefill_gemm.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Xcompiler -fPIC -Xcompiler -fopenmp \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
@@ -298,7 +298,7 @@ test_wmma_prefill_gemm: $(BUILD)/test_wmma_prefill_gemm
 
 # Layer-0 Parity Diagnostic Test: compares batched prefill GEMM against sequential advance for N=32.
 $(BUILD)/test_prefill_layer_parity: tests/test_prefill_layer_parity.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
-	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 \
+	$(NVCC) -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler -fPIC \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
