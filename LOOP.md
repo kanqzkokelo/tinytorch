@@ -162,6 +162,12 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - Ceiling proven: GEMM floor ~83ms + non-GEMM ~29ms = ~112ms (~6770). Algo choice exhausted — 10k needs structural change (fewer FLOPs/bytes), not better algos.
 - UNTRIED (GPT-5.6 advice): FP16 shadow + COMPUTE_32F_FAST_16F tensor path — all work so far used FP32 SIMT path. That's the next real bet (2-4x on GEMM).
 
+## Cycle 30: FP16 Tensor Path Tried — Bug + Starvation (reverted, no commit)
+- Built FP16 shadow 682MB + `tt_cublas_prefill_nt_fp16` (16F/TENSOR_OP, FP32-out), single-chunk N=759. Hot median 6816→7972 (target 9000 MISS; o+mlp 75.9→59.4ms — tall-skinny N=759 starves 16 SMs).
+- Parity FAIL is a BUG, not precision: pp759 garbage ('ireghty and ouch'), probe maxdiff 19.6, short OK. Suspects: Xn-convert cache, N=759 algo accumulation reorder, or shadow dequant stride bug at scale.
+- Post-revert gates GREEN (ci_local, m61, backfill). Tree clean.
+- Next: debug parity bug in isolation (may unlock true tensor number) OR accept 6.8k wall on this GPU.
+
 ## 10k push: combo BANKED at 4.1-4.6k (Cycle 26)
 - `415b357` (verified KEEP): FP32 shadow (1365MB) + cuBLAS GEMM + fast flash. Hot median 4092-4633 (clock variance; 682MHz cold→1965MHz hot, can't lock w/o sudo — always warm up 2 runs). Greedy-identical, maxdiff 0.0128. Graceful OOM fallback (`[cublas-pre] ABORT`, drops shadows). Kernels-only +189/-14. Gates green.
 - Path 2.3k→4.6k banked (2x). Remaining to 10k: flash 54ms @1.4 TFLOPS needs FA2-class rewrite (~5x → ~10ms). GEMM at 5.5 TFLOPS cuBLAS is done.
