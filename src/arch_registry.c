@@ -71,6 +71,16 @@ static const ArchEntry kArchTable[] = {
     /* aliases for converted checkpoints that keep hf "tinyllama" name */
     { "tinyllama", { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
     { "granite",   { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
+    /* Tier-1 bulk-add (traits-only, zero kernel changes). Verified against
+     * ~/Storage/llama.cpp: rope via llama-model.cpp llama_model_rope_type(),
+     * FFN via src/models/<arch>.cpp build_ffn, tied via output TENSOR_DUPLICATED.
+     * internlm2/xverse: NORM (=GPTJ) + SILU/PAR + untied output (required tensor).
+     * exaone: NEOX + SILU/PAR + tied (output optional -> TENSOR_DUPLICATED).
+     * ernie4_5 (underscore key): NORM (=GPTJ) + SILU/PAR + tied. */
+    { "internlm2", { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
+    { "xverse",    { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0 } },
+    { "exaone",    { ROPE_NEOX, ACT_SILU, 0.0f, 0, 1, 0, 0.0f, 0.0f, 0, 0, 0 } },
+    { "ernie4_5",  { ROPE_GPTJ, ACT_SILU, 0.0f, 0, 1, 0, 0.0f, 0.0f, 0, 0, 0 } },
 };
 
 const TTraits *tt_traits_lookup(const char *arch) {
@@ -91,7 +101,7 @@ int tt_traits_resolve(const GGUFModel *m, TTraits *out) {
 }
 
 const char *tt_traits_supported(void) {
-    return "qwen2, llama (incl. llama3.x), qwen3(+moe), gemma, gemma2/3, gemma4, tinyllama, granite, smollm2, mistral";
+    return "qwen2, llama (incl. llama3.x), qwen3(+moe), gemma, gemma2/3, gemma4, tinyllama, granite, smollm2, mistral, internlm2, xverse, exaone, ernie4_5";
 }
 
 /* ---------------------------------------------------------------------
