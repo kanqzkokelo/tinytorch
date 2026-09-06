@@ -174,6 +174,12 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - Numbers: combo HOT 7854 (o+mlp 76→54ms), greedy-identical short+pp759, probe argmax match (maxdiff 0.0158 FP16-only; 0.048 w/ pre-existing FA2 noise). Gates green. Verified BANK.
 - Below 9k bar (tall-skinny N=759 starves 16 SMs; clocks unlockable). Prefill 1.4k→7.8k (5.6x) since roofline start. Next: gate+up merge done right, or N=768 pad + bigger tiles.
 
+## Cycle 32: Gate+Up Merge DEAD (reverted, no commit)
+- Merged M=9728 standalone SANE (10.64 vs 10.30 TFLOPS, no fallback) but engine o+mlp REGRESSED 54.5→59.0ms; hot median 7921 vs 7829 (+1.2%, target 8300 MISS).
+- Greedy Y, probe maxdiff 0.018, ci_local + m61 green — but backfill engine FAIL under merge (FP16-no-merge also pre-existing FAIL-B; default PASS).
+- Lesson: bigger-M theory dead on this GPU — per-call overhead/converts dominate, not occupancy. Tree reverted clean.
+- Prefill stands 7.8k. Remaining 10k paths: N=768 pad, decode work, or new GPU.
+
 ## 10k push: combo BANKED at 4.1-4.6k (Cycle 26)
 - `415b357` (verified KEEP): FP32 shadow (1365MB) + cuBLAS GEMM + fast flash. Hot median 4092-4633 (clock variance; 682MHz cold→1965MHz hot, can't lock w/o sudo — always warm up 2 runs). Greedy-identical, maxdiff 0.0128. Graceful OOM fallback (`[cublas-pre] ABORT`, drops shadows). Kernels-only +189/-14. Gates green.
 - Path 2.3k→4.6k banked (2x). Remaining to 10k: flash 54ms @1.4 TFLOPS needs FA2-class rewrite (~5x → ~10ms). GEMM at 5.5 TFLOPS cuBLAS is done.
