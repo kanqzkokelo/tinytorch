@@ -168,6 +168,12 @@ Keep all CI gates green at all times (`ci_local.sh`, `verify.sh m61`, `verify.sh
 - Post-revert gates GREEN (ci_local, m61, backfill). Tree clean.
 - Next: debug parity bug in isolation (may unlock true tensor number) OR accept 6.8k wall on this GPU.
 
+## Cycle 31: FP16 Tensor Path BANKED at 7.8k (verified)
+- Commit: FP16 shadow 682MB + `TT_CUBLAS_FP16` tensor GEMM + stale-Xn cache fix (cache kinds 0/1/2 only; gate/up/down fresh-convert). +232/-2, kernels only.
+- Root cause recap: convert cache keyed (ptr,l,N) hit stale X after arena reuse (:5181/:5199 overwrote :5040's X). Single-op precision was always clean (0.001-0.002).
+- Numbers: combo HOT 7854 (o+mlp 76→54ms), greedy-identical short+pp759, probe argmax match (maxdiff 0.0158 FP16-only; 0.048 w/ pre-existing FA2 noise). Gates green. Verified BANK.
+- Below 9k bar (tall-skinny N=759 starves 16 SMs; clocks unlockable). Prefill 1.4k→7.8k (5.6x) since roofline start. Next: gate+up merge done right, or N=768 pad + bigger tiles.
+
 ## 10k push: combo BANKED at 4.1-4.6k (Cycle 26)
 - `415b357` (verified KEEP): FP32 shadow (1365MB) + cuBLAS GEMM + fast flash. Hot median 4092-4633 (clock variance; 682MHz cold→1965MHz hot, can't lock w/o sudo — always warm up 2 runs). Greedy-identical, maxdiff 0.0128. Graceful OOM fallback (`[cublas-pre] ABORT`, drops shadows). Kernels-only +189/-14. Gates green.
 - Path 2.3k→4.6k banked (2x). Remaining to 10k: flash 54ms @1.4 TFLOPS needs FA2-class rewrite (~5x → ~10ms). GEMM at 5.5 TFLOPS cuBLAS is done.
