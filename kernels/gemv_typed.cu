@@ -609,7 +609,7 @@ __global__ void k_gemv_q4_K_v2(const uint8_t *__restrict__ W,
                 a4 = (int)((w0 >>  32)  & 0xFu);
                 a5 = (int)((w0 >>  40)  & 0xFu);
                 a6 = (int)((w0 >>  48)  & 0xFu);
-                a7 = (int)((w0 >>  56)        );
+                a7 = (int)((w0 >>  56)  & 0xFu);
                 b0 = (int)( w1          & 0xFu);
                 b1 = (int)((w1 >>   8)  & 0xFu);
                 b2 = (int)((w1 >>  16)  & 0xFu);
@@ -617,7 +617,7 @@ __global__ void k_gemv_q4_K_v2(const uint8_t *__restrict__ W,
                 b4 = (int)((w1 >>  32)  & 0xFu);
                 b5 = (int)((w1 >>  40)  & 0xFu);
                 b6 = (int)((w1 >>  48)  & 0xFu);
-                b7 = (int)((w1 >>  56)        );
+                b7 = (int)((w1 >>  56)  & 0xFu);
             } else {
                 a0 = (int)((w0 >>   4)  & 0xFu);
                 a1 = (int)((w0 >>  12)  & 0xFu);
@@ -715,7 +715,7 @@ __global__ void k_gemv_q5_K_v2(const uint8_t *__restrict__ W,
                 a4 = (int)((w0 >>  32)  & 0xFu) | (int)(((h0 >>  32) >> sub) & 1u) << 4;
                 a5 = (int)((w0 >>  40)  & 0xFu) | (int)(((h0 >>  40) >> sub) & 1u) << 4;
                 a6 = (int)((w0 >>  48)  & 0xFu) | (int)(((h0 >>  48) >> sub) & 1u) << 4;
-                a7 = (int)((w0 >>  56)        ) | (int)(((h0 >>  56) >> sub) & 1u) << 4;
+                a7 = (int)((w0 >>  56)  & 0xFu) | (int)(((h0 >>  56) >> sub) & 1u) << 4;
                 b0 = (int)( w1          & 0xFu) | (int)(((h1      ) >> sub) & 1u) << 4;
                 b1 = (int)((w1 >>   8)  & 0xFu) | (int)(((h1 >>   8) >> sub) & 1u) << 4;
                 b2 = (int)((w1 >>  16)  & 0xFu) | (int)(((h1 >>  16) >> sub) & 1u) << 4;
@@ -723,24 +723,24 @@ __global__ void k_gemv_q5_K_v2(const uint8_t *__restrict__ W,
                 b4 = (int)((w1 >>  32)  & 0xFu) | (int)(((h1 >>  32) >> sub) & 1u) << 4;
                 b5 = (int)((w1 >>  40)  & 0xFu) | (int)(((h1 >>  40) >> sub) & 1u) << 4;
                 b6 = (int)((w1 >>  48)  & 0xFu) | (int)(((h1 >>  48) >> sub) & 1u) << 4;
-                b7 = (int)((w1 >>  56)        ) | (int)(((h1 >>  56) >> sub) & 1u) << 4;
+                b7 = (int)((w1 >>  56)  & 0xFu) | (int)(((h1 >>  56) >> sub) & 1u) << 4;
             } else {
-                a0 = (int)((w0 >>   4)  & 0xFu) | (int)(((h0 >>   4) >> sub) & 1u) << 4;
-                a1 = (int)((w0 >>  12)  & 0xFu) | (int)(((h0 >>  12) >> sub) & 1u) << 4;
-                a2 = (int)((w0 >>  20)  & 0xFu) | (int)(((h0 >>  20) >> sub) & 1u) << 4;
-                a3 = (int)((w0 >>  28)  & 0xFu) | (int)(((h0 >>  28) >> sub) & 1u) << 4;
-                a4 = (int)((w0 >>  36)  & 0xFu) | (int)(((h0 >>  36) >> sub) & 1u) << 4;
-                a5 = (int)((w0 >>  44)  & 0xFu) | (int)(((h0 >>  44) >> sub) & 1u) << 4;
-                a6 = (int)((w0 >>  52)  & 0xFu) | (int)(((h0 >>  52) >> sub) & 1u) << 4;
-                a7 = (int)((w0 >>  60)        ) | (int)(((h0 >>  60) >> sub) & 1u) << 4;
-                b0 = (int)((w1 >>   4)  & 0xFu) | (int)(((h1 >>   4) >> sub) & 1u) << 4;
-                b1 = (int)((w1 >>  12)  & 0xFu) | (int)(((h1 >>  12) >> sub) & 1u) << 4;
-                b2 = (int)((w1 >>  20)  & 0xFu) | (int)(((h1 >>  20) >> sub) & 1u) << 4;
-                b3 = (int)((w1 >>  28)  & 0xFu) | (int)(((h1 >>  28) >> sub) & 1u) << 4;
-                b4 = (int)((w1 >>  36)  & 0xFu) | (int)(((h1 >>  36) >> sub) & 1u) << 4;
-                b5 = (int)((w1 >>  44)  & 0xFu) | (int)(((h1 >>  44) >> sub) & 1u) << 4;
-                b6 = (int)((w1 >>  52)  & 0xFu) | (int)(((h1 >>  52) >> sub) & 1u) << 4;
-                b7 = (int)((w1 >>  60)        ) | (int)(((h1 >>  60) >> sub) & 1u) << 4;
+                a0 = (int)((w0 >>   4)  & 0xFu) | (int)(((h0      ) >> sub) & 1u) << 4;
+                a1 = (int)((w0 >>  12)  & 0xFu) | (int)(((h0 >>   8) >> sub) & 1u) << 4;
+                a2 = (int)((w0 >>  20)  & 0xFu) | (int)(((h0 >>  16) >> sub) & 1u) << 4;
+                a3 = (int)((w0 >>  28)  & 0xFu) | (int)(((h0 >>  24) >> sub) & 1u) << 4;
+                a4 = (int)((w0 >>  36)  & 0xFu) | (int)(((h0 >>  32) >> sub) & 1u) << 4;
+                a5 = (int)((w0 >>  44)  & 0xFu) | (int)(((h0 >>  40) >> sub) & 1u) << 4;
+                a6 = (int)((w0 >>  52)  & 0xFu) | (int)(((h0 >>  48) >> sub) & 1u) << 4;
+                a7 = (int)((w0 >>  60)        ) | (int)(((h0 >>  56) >> sub) & 1u) << 4;
+                b0 = (int)((w1 >>   4)  & 0xFu) | (int)(((h1      ) >> sub) & 1u) << 4;
+                b1 = (int)((w1 >>  12)  & 0xFu) | (int)(((h1 >>   8) >> sub) & 1u) << 4;
+                b2 = (int)((w1 >>  20)  & 0xFu) | (int)(((h1 >>  16) >> sub) & 1u) << 4;
+                b3 = (int)((w1 >>  28)  & 0xFu) | (int)(((h1 >>  24) >> sub) & 1u) << 4;
+                b4 = (int)((w1 >>  36)  & 0xFu) | (int)(((h1 >>  32) >> sub) & 1u) << 4;
+                b5 = (int)((w1 >>  44)  & 0xFu) | (int)(((h1 >>  40) >> sub) & 1u) << 4;
+                b6 = (int)((w1 >>  52)  & 0xFu) | (int)(((h1 >>  48) >> sub) & 1u) << 4;
+                b7 = (int)((w1 >>  60)        ) | (int)(((h1 >>  56) >> sub) & 1u) << 4;
             }
             swx0 += a0 * xv0.x + a1 * xv0.y + a2 * xv0.z + a3 * xv0.w
                   + a4 * xv1.x + a5 * xv1.y + a6 * xv1.z + a7 * xv1.w;
