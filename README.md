@@ -6,10 +6,21 @@ parity, and a multi-architecture LLM inference engine that **~1.35x vs current l
 
 ## LLM engine
 
+Environment (custom CUDA toolkit path used on dev boxes):
+
+```bash
+export PATH=$HOME/mmcuda/bin:$PATH
+export LD_LIBRARY_PATH=$HOME/mmcuda/lib:$LD_LIBRARY_PATH
+```
+
 ```bash
 ./chat                                    # interactive chat (qwen2.5 default)
 TT_MODEL=data/testmodels/smollm2-135m-instruct-Q8_0.gguf ./chat
 ```
+
+Prefill (RTX 3050 laptop, Qwen2.5-0.5B): **~7.8k tok/s** via FP16-shadow +
+tensor-core GEMM (`TT_CUBLAS_FP16`); see `docs/plans/2026-09-03-prefill-roofline.md`.
+Full family matrix: `docs/SUPPORTED_FAMILIES.md`.
 
 | Property | Value |
 |---|---|
