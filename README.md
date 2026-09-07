@@ -121,7 +121,7 @@ runs end-to-end. Parity verified at the 7-prompt m84 gate:
 | Autograd gradcheck | < 1e-4 rel. error |
 | MNIST MLP (2-layer) | ≥97% test accuracy |
 | CPU matmul (AVX2+FMA asm) | 75 GFLOPS 1T / 239 GFLOPS MP (0.76× OpenBLAS-1T — documented wall) |
-| CUDA sgemm tiled | **up to 100.7% of cuBLAS**, 39× naive @1024³ |
+| CUDA sgemm tiled | ≈ cuBLAS parity, 39× naive @1024³ |
 | WMMA fp16 | up to 72% cuBLAS |
 | CIFAR-10 CNN | gate wired (`verify.sh m4`), formal run pending |
 
@@ -159,7 +159,7 @@ include/        headers
 kernels/qwen2_cuda.cu   trait-driven decode engine (cudaGraph replay)
 tests/          gates + golden references (NumPy forward, dequant goldens)
 bench/          benchmark harnesses + results.md ladder tables
-oracle/         pinned llama.cpp build (parity ground truth)
+oracle/         local-only llama.cpp checkout (parity ground truth, git-ignored)
 tools/          dump_logits, oracle_logits, profile_step
 docs/plans/     implementation plans (M6.3 perf, M7 quants/archs)
 ```
