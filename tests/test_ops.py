@@ -29,11 +29,14 @@ lib.tt_ndim.restype = ctypes.c_int
 lib.tt_ndim.argtypes = [ctypes.c_void_p]
 lib.tt_shape.argtypes = [ctypes.c_void_p, I64P]
 lib.tt_strides.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
-for name in ("tt_add", "tt_mul", "tt_matmul", "tt_relu", "tt_softmax",
-             "tt_matmul_fast"):
+for name in ("tt_relu", "tt_softmax", "tt_matmul_fast"):
     f = getattr(lib, name)
     f.restype = ctypes.c_void_p
     f.argtypes = [ctypes.c_void_p]
+for name in ("tt_add", "tt_mul", "tt_matmul"):
+    f = getattr(lib, name)
+    f.restype = ctypes.c_void_p
+    f.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 lib.tt_matmul_omp.restype = ctypes.c_void_p
 lib.tt_matmul_omp.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
                               ctypes.c_int]

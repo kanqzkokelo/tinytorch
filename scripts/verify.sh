@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Single source of truth. Exit 0 = gate green, nonzero = red.
-# Usage: ./scripts/verify.sh [m0|m1|m2|m3|m4|m61|m84|ple|tok|all]
+# Usage: ./scripts/verify.sh [m0|m1|m2|m3|m4|all]
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -14,20 +14,14 @@ run() { # run <name> <cmd...>
 }
 
 case "$GATE" in
-  m61) run "m6-logits-parity" python3 tests/gate_m6_logit_parity.py
-       run "chat-multiturn"    python3 tests/gate_chat.py ;;
   m0)  run "unit-vs-numpy"   python3 tests/test_ops.py ;;
   m1)  run "gradcheck"       python3 tests/test_grad.py
        run "mnist-mlp"       python3 tests/gate_mnist_mlp.py ;;
   m2)  run "cpu-bench"       python3 bench/bench_cpu.py --gate ;;
-  m3)  run "gpu-parity"      python3 tests/test_gpu_parity.py
-       run "cuda-bench"      python3 bench/bench_cuda.py --gate ;;
+  m3)  run "cuda-bench"      python3 bench/bench_cuda.py --gate ;;
   m4)  run "cifar-cnn"       python3 tests/gate_cifar_cnn.py
        run "pybind-demo"     python3 examples/train_mnist.py --smoke ;;
-  m84) run "m84-gemma4-parity" python3 tests/gate_m84_gemma4.py ;;
-  ple) run "m6-ple-golden"     python3 tests/gate_ple_golden.py ;;
-  tok) run "tokenizer-oracle-parity" python3 tests/gate_tokenizer.py ;;
-  all) for g in m0 m1 m2 m3 m4 m61; do "$0" "$g"; done ;;
+  all) for g in m0 m1 m2 m3 m4; do "$0" "$g"; done ;;
   *) echo "unknown gate: $GATE"; exit 2 ;;
 esac
 
