@@ -38,15 +38,15 @@ dequant-fp32 accumulation).
 
 | Architecture | Models | Quant formats | Status |
 |---|---|---|---|
-| qwen2 | Qwen2.5-0.5B | q4_0 (+q8_0 head) | ✅ 7/7 strict |
-| qwen3 | Qwen3-0.6B | q8_0 | ✅ 7/7 |
-| llama | TinyLlama-1.1B | f16 | ✅ bit-perfect (median Δ = 0.0009) |
-| llama | SmolLM2-135M | f16, q4_0, q5_0, q5_1, q8_0, q4_K, q4_K_S, q5_K | ✅ |
-| llama | SmolLM2-135M | q4_1, q5_K_S, q6_K | ⚠️ 5–6/7 (top-1 flips on near-tied logits) |
-| llama | Llama-3.2-1B | q8_0 | ✅ 7/7 unmodified (src/arch_registry.c:91) |
-| phi2 | phi-2 | — | 🚫 scoped out: needs LayerNorm kernels + epsilon-key alias; analysis in src/arch_registry.c:101 |
-| gemma2 | Gemma2-2B | q6_K | ⚠️ 6/7 (was 7/7; re-verified during M8 session) |
-| gemma4 | Gemma-4-E2B | q4_0 | ✅ 6/7 m84 gate (median ≤0.6) |
+| qwen2 | Qwen2.5-0.5B | q4_0 (+q8_0 head) | PASS 7/7 strict |
+| qwen3 | Qwen3-0.6B | q8_0 | PASS 7/7 |
+| llama | TinyLlama-1.1B | f16 | PASS bit-perfect (median Δ = 0.0009) |
+| llama | SmolLM2-135M | f16, q4_0, q5_0, q5_1, q8_0, q4_K, q4_K_S, q5_K | PASS |
+| llama | SmolLM2-135M | q4_1, q5_K_S, q6_K | PARTIAL 5–6/7 (top-1 flips on near-tied logits) |
+| llama | Llama-3.2-1B | q8_0 | PASS 7/7 unmodified (src/arch_registry.c:91) |
+| phi2 | phi-2 | — | OUT: needs LayerNorm kernels + epsilon-key alias; analysis in src/arch_registry.c:101 |
+| gemma2 | Gemma2-2B | q6_K | PARTIAL 6/7 (was 7/7; re-verified during M8 session) |
+| gemma4 | Gemma-4-E2B | q4_0 | PASS 6/7 m84 gate (median ≤0.6) |
 
 Quant kernels: q4_0, q4_1, q5_0, q5_1, q8_0, q4_K(+S), q5_K(+S), q6_K — all
 golden-verified against gguf-py dequantization on real model bytes.
