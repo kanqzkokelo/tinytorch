@@ -2,7 +2,8 @@
 
 From-scratch neural-network inference in pure C + CUDA: tensor lib, autograd,
 AVX2 GEMMs, a CUDA GEMM ladder at cuBLAS parity, and a multi-arch LLM engine
-(~1.35x llama.cpp CUDA decode, 5-run median, same GPU; logits verified equal).
+with logits verified equal vs llama.cpp (decode 0.55–0.82x of llama.cpp CUDA,
+5-run median, same GPU — see table).
 
 ## LLM engine
 
