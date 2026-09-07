@@ -1,6 +1,6 @@
 # cuBLAS Algo Autotune — Implementation Plan
 
-> **REQUIRED SUB-SKILL:** Use the executing-plans skill to implement this plan task-by-task.
+> Execution note: implement this plan task-by-task, one task per commit.
 
 **Goal:** prefill 6.4–6.8k → 7.5–8.5k tok/s @pp759 by autotuning cuBLAS algorithm selection per GEMM shape. o+mlp 76.7ms (65% of prefill) is the whole game; prior fusion attempt proved algo choice swings 10x (0.5 vs 5.5 TFLOPS).
 

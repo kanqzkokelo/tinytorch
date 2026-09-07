@@ -1,6 +1,6 @@
 # Batched Prefill FlashAttention Implementation Plan
 
-> **REQUIRED SUB-SKILL:** Use the executing-plans skill to implement this plan task-by-task.
+> Execution note: implement this plan task-by-task, one task per commit.
 
 **Goal:** Replace the per-token serial flash loop in `prefill_batched_gemm` with a single FlashAttention-style kernel that processes all `n` query tokens × `ctx` Q8_0 KV blockwise. Lift prefill throughput at $N \ge 2048$ from 24.9 tok/s to **2,000+ tok/s**, reaching llama.cpp parity (~11,000 tok/s at $N=2169$ for 0.5B on RTX 3050, but realistic target 2-4k tok/s for our Q8_0 KV path).
 

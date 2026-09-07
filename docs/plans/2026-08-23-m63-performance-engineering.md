@@ -1,6 +1,6 @@
 # M6.3 Performance Engineering Implementation Plan
 
-> **REQUIRED SUB-SKILL:** Use the executing-plans skill to implement this task-by-task.
+> Execution note: implement this task-by-task.
 
 **Goal:** Take the correct tinytorch Qwen2 decode engine from 48 tok/s to ≥100 tok/s decode-only on the RTX 3050 laptop, without ever breaking greedy-output parity against the llama.cpp oracle.
 

@@ -1,6 +1,6 @@
 # M7: All Practical Quants + All Major Model Architectures Implementation Plan
 
-> **REQUIRED SUB-SKILL:** Use the executing-plans skill to implement this task-by-task.
+> Execution note: implement this task-by-task.
 
 **Goal:** tinytorch loads and correctly runs every widely-downloaded GGUF quantization format across the major open-model families (Llama/Mistral, Qwen2/3, Gemma, Phi, SmolLM), verified against llama.cpp oracle parity per model×quant combination.
 

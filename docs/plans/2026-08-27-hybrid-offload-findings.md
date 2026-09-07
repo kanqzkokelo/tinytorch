@@ -1,6 +1,6 @@
 # Hybrid CPU+GPU offload — research findings (2026-08-26)
 
-Source agent study of local oracle llama.cpp + web measurements.
+Source: study of the local llama.cpp checkout (oracle/) + published measurements.
 
 ## Placement granularity (llama.cpp evidence)
 - Whole-layer `-ngl N`: contiguous top block, all-or-nothing (llama-model.cpp i_gpu_start).

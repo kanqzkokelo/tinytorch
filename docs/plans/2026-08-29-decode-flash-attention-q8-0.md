@@ -1,6 +1,6 @@
 # Decode FlashAttention-2 Q8_0 Implementation Plan
 
-> **REQUIRED SUB-SKILL:** Use the executing-plans skill to implement this plan task-by-task.
+> Execution note: implement this plan task-by-task, one task per commit.
 
 **Goal:** Integrate the FlashAttention-2 tiled Q8_0 split-K decode kernel (`k_fa2_q8_split` + `k_fa2_combine`) into `forward_layers()` in `kernels/qwen2_cuda.cu`. Eliminate long-context decode decay at $N \ge 2\text{k}$ tokens, lifting decode throughput from **$100\text{ tok/s} \to \mathbf{250\text{--}265\text{ tok/s}}$** on RTX 3050 (achieving $\mathbf{90\%+}$ parity with llama.cpp's $277\text{ tok/s}$ across the full context window).
 

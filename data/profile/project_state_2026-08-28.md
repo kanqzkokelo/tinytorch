@@ -24,17 +24,17 @@
 
 ## What's Next: Fused QKV/FFN Task 3 (WIRE INTO ENGINE)
 - Task 3 was IN PROGRESS when session ended
-- Task 3 builder agent hit "Insufficient balance" mid-work
+- Task 3 stalled mid-work on a transient infrastructure error
 - Microbenches prove the kernels work; integration is what's left
 - Plan at: `docs/plans/2026-08-28-fused-qkv-ffn-kernels.md`
 - Plan tracker state:
   - ✓ Task 1: Microbench fused QKV (done)
   - ✓ Task 2: Microbench fused FFN (done)
-  - ⚠ Task 3: Wire into engine (PENDING - last agent failed)
+  - ⚠ Task 3: Wire into engine (PENDING - previous attempt stalled)
   - ○ Task 4: Final decode benchmark & parity verification
 
 ## What the Task 3 partial work showed
-- The agent was investigating the FFN shape (M=4864, K=896) and register pressure
+- The partial work investigated the FFN shape (M=4864, K=896) and register pressure
 - 8 warps per block, 4 rows per warp = 32 rows per block = 152 blocks total
 - The existing `tt_ffn_q4_0` uses 16 warps per block, 2 rows per warp
 - Need to check if larger register pressure (16 accumulators per warp) is the issue

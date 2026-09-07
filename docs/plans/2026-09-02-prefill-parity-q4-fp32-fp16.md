@@ -1,6 +1,6 @@
 # Comprehensive Prefill Parity Plan (Q4, FP32, FP16 & Static Arena)
 
-> **REQUIRED SUB-SKILL:** Use the executing-plans skill to implement this plan task-by-task.
+> Execution note: implement this plan task-by-task, one task per commit.
 
 **Goal:** Reach multi-thousand tok/s prefill across ALL remaining data formats (Q4_0 KV, FP32 KV, FP16 KV) to close the prefill gap with llama.cpp, matching what Q8_0 KV achieved ($16,000\text{--}20,000\text{ tok/s}$).
 

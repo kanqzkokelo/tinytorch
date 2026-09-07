@@ -129,7 +129,7 @@ def main():
     graph_exec = allocate_gpu_buffers()
     print(" \033[1;32m[GPU READY]\033[0m\n")
 
-    system_prompt = "You are a helpful, respectful, and concise AI assistant."
+    system_prompt = "You are a helpful, respectful, and concise assistant."
     history = []
 
     print(f"\033[1;30msystem: {system_prompt}\033[0m")

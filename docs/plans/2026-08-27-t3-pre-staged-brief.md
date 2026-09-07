@@ -1,7 +1,7 @@
 # T3 Pre-Staged Brief — apply pos-1 fix + run m84
 
-> **STATUS: Not yet run.** This file is a *pre-staged* prompt for a future
-> subagent that fires the moment T2 (per-layer pos-1 bisection) lands with
+> **STATUS: Not yet run.** This file is a *pre-staged* task brief for the
+> follow-up fix that starts the moment T2 (per-layer pos-1 bisection) lands with
 > a clear hypothesis. The actual T2 report will refine the exact fix below;
 > most of this brief is reusable scaffolding.
 
@@ -21,16 +21,15 @@ T2's last transcript before close showed:
 
 3. **Output writeback / store path**: the `oreg[t]` array may be written in wrong order vs oracle's head-concat convention. Oracle's `build_attn` for gemma4: `ggml_reshape_2d(out, n_embd_head*n_head, n_tokens)`. Engine: `Y[(size_t)row * T + col0 + t] = v;` with `row` from `blockIdx.x * blockDim.y + threadIdx.y` and head ordering implicit. Check if head-major vs token-major ordering is the bug.
 
-## Brief template (paste into agent when firing)
+## Work template (follow-up task checklist)
 
 ```
-You are the T3 agent from docs/plans/2026-08-27-t3-pre-staged-brief.md. Repo:
+T3 follow-up task (see docs/plans/2026-08-27-t3-pre-staged-brief.md). Repo:
 ~/Storage/repos/nnfromscratch. EDIT ONLY `kernels/qwen2_cuda.cu` (NOT other files).
 
 ## Stage 1: read the latest bisection report
 Read /tmp/hypothesis.txt (T2 wrote the precise fix here). Also read the
-most recent subagent transcript at
-/tmp/pi-subagents-1000/.../tasks/64f99fbd-4d08-457.output (last 200 lines)
+most recent bisection log excerpt (last 200 lines)
 to get the full context of the bisection.
 
 ## Stage 2: clean up T2's instrumentation
@@ -54,7 +53,7 @@ Expected: at least 5/7 pass (median reduction).
 ## Stage 6: if not 7/7, iterate
 Do NOT chain fixes. If 5/6 PASS, run the engine against the failing
 prompts and capture which stage diverges using existing TT_DUMP_LAYER
-infra. Apply the next-most-likely fix (or re-dispatch the bisection agent).
+infra. Apply the next-most-likely fix (or re-run the bisection task).
 Each cycle is one fix.
 
 ## Stage 7: commit
@@ -71,5 +70,5 @@ wasn't 7/7, what's the remaining gap and your best next-step hypothesis.
 - DO NOT remove debug printfs not added by T2.
 - DO NOT add new functions or refactor — minimal fix only.
 - If your fix needs more than 5 lines of change, STOP and re-dispatch a
-  bisection agent with your expanded hypothesis.
+  bisection task with your expanded hypothesis.
 ```

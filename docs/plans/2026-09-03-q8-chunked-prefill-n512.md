@@ -1,6 +1,6 @@
 # Q8 Chunked Prefill N>512 Fix Implementation Plan
 
-> **REQUIRED SUB-SKILL:** Use the executing-plans skill to implement this plan task-by-task.
+> Execution note: implement this plan task-by-task, one task per commit.
 
 **Goal:** Make `TT_Q8_KV=1` prefill work for prompts longer than 512 tokens (currently `embed rc=716` on chunk 2).
 

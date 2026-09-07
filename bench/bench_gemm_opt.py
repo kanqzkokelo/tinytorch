@@ -4,7 +4,7 @@
 Protocol: warmup 2, median of 5 runs. Correctness gate at every shape:
 max relative error vs float64 numpy <= 1e-4.
 Reference: numpy's OpenBLAS (reference only, never linked into our code).
-Reports load average with each measurement (other agents may use the CPU).
+Reports load average with each measurement (other processes may use the CPU).
 """
 import os
 

@@ -1,6 +1,6 @@
 # Prefill Roofline Chase Implementation Plan
 
-> **REQUIRED SUB-SKILL:** Use the executing-plans skill to implement this plan task-by-task.
+> Execution note: implement this plan task-by-task, one task per commit.
 
 **Goal:** Take prefill from ~2.8k tok/s (WMMA FP16) to ~8-11k tok/s (~4x, llama.cpp parity) by climbing the GEMM roofline; document the physics wall (~50k tok/s) honestly.
 

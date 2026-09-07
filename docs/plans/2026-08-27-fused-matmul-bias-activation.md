@@ -1,6 +1,6 @@
 # Fused Matmul + Bias + Activation Implementation Plan
 
-> **REQUIRED SUB-SKILL:** Use the executing-plans skill to implement this plan task-by-task.
+> Execution note: implement this plan task-by-task, one task per commit.
 
 **Goal:** Close the decode gap to llama.cpp CUDA (currently 0.71× on qwen2.5-0.5b-q4_0) by reducing kernel launch overhead and the number of round-trips through global memory in the per-layer epilogue.
 

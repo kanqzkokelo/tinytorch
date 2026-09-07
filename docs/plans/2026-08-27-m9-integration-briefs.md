@@ -1,6 +1,6 @@
 # M9 integration briefs — pre-staged for when kernels/ frees
 
-> **STATUS: Not yet run.** These are pre-staged agent prompts. When T3 lands
+> **STATUS: Not yet run.** These are pre-staged task briefs. When T3 lands
 > and `kernels/qwen2_cuda.cu` is clean, fire them in order. Each owns only
 > `kernels/qwen2_cuda.cu` and the corresponding `tests/proto_*.cu`; the
 > existing protos have already proven the perf wins.
@@ -15,7 +15,7 @@
 ## C1 brief
 
 ```
-You are the M9.1 batched-prefill wire-in agent. Repo: ~/Storage/repos/nnfromscratch.
+M9.1 batched-prefill wire-in task. Repo: ~/Storage/repos/nnfromscratch.
 You own `kernels/qwen2_cuda.cu` (and ONLY that file). READ:
 - kernels/gemv_typed.cu (the tt_gemm_batched_q4_0 function — already there)
 - tests/proto_batched_gemv.cu (the perf numbers — f(8)=0.11x)
@@ -46,7 +46,7 @@ You own `kernels/qwen2_cuda.cu` (and ONLY that file). READ:
 ## C2 brief
 
 ```
-You are the M9.0 PLE-fused V2 wire-in agent. Repo: ~/Storage/repos/nnfromscratch.
+M9.0 PLE-fused V2 wire-in task. Repo: ~/Storage/repos/nnfromscratch.
 You own `kernels/qwen2_cuda.cu` ONLY.
 
 ## Step-by-step
@@ -74,7 +74,7 @@ You own `kernels/qwen2_cuda.cu` ONLY.
 ## C3 brief
 
 ```
-You are the M9.0 split-K flash wire-in agent. Repo: ~/Storage/repos/nnfromscratch.
+M9.0 split-K flash wire-in task. Repo: ~/Storage/repos/nnfromscratch.
 You own `kernels/qwen2_cuda.cu` ONLY.
 
 ## Step-by-step
@@ -103,7 +103,6 @@ work for gemma4. Commit: "M9: re-enable CUDA graph capture for gemma4
 
 ## Rollback plan
 
-If any of C1/C2/C3 regresses m61 (parity 7/7 lost), the agent must
-investigate FIRST, not paper over. Each wire-in is a small
+If any of C1/C2/C3 regresses m61 (parity 7/7 lost), investigate FIRST, not paper over. Each wire-in is a small
 change; the worst case is "revert the dispatch branch" which is one
 `if (n_tokens < threshold)` block.
