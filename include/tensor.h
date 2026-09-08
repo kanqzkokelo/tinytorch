@@ -9,8 +9,8 @@ extern "C" {
 
 typedef struct Tensor {
     float *data;     /* row-major payload */
-    int   *shape;    /* ndim entries */
-    int   *strides;  /* in elements, per dim */
+    long  *shape;    /* ndim entries */
+    long  *strides;  /* in elements, per dim */
     int    ndim;
     long   numel;
     int    refcount;
@@ -27,7 +27,7 @@ float  *tt_data(const Tensor *t);
 long    tt_numel(const Tensor *t);
 int     tt_ndim(const Tensor *t);
 void    tt_shape(const Tensor *t, long *out);
-void    tt_strides(const Tensor *t, int *out);
+void    tt_strides(const Tensor *t, long *out);
 
 /* ops (allocate fresh output; NULL on shape/arg error) */
 Tensor *tt_add(const Tensor *a, const Tensor *b);

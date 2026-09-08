@@ -1,24 +1,31 @@
 #include "tensor.h"
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Sane upper bound on elements per tensor (~1T float32 = 4TB).
+   Rejects insane shapes before calloc can hang/OOM the host. */
+#define TT_MAX_NUMEL (1L << 40)
 
 static Tensor *tt_alloc(const long *shape, int ndim) {
     if (ndim <= 0 || ndim > 8) return NULL;
     long numel = 1;
     for (int i = 0; i < ndim; i++) {
         if (shape[i] <= 0) return NULL;
+        if (numel > LONG_MAX / shape[i]) return NULL;  /* overflow guard */
         numel *= shape[i];
     }
+    if (numel > TT_MAX_NUMEL) return NULL;  /* sane cap, pre-alloc */
     Tensor *t = (Tensor *)calloc(1, sizeof(Tensor));
     if (!t) return NULL;
     t->data = (float *)calloc((size_t)numel, sizeof(float));
-    t->shape = (int *)malloc(sizeof(int) * (size_t)ndim);
-    t->strides = (int *)malloc(sizeof(int) * (size_t)ndim);
+    t->shape = (long *)malloc(sizeof(long) * (size_t)ndim);
+    t->strides = (long *)malloc(sizeof(long) * (size_t)ndim);
     if (!t->data || !t->shape || !t->strides) {
         free(t->data); free(t->shape); free(t->strides); free(t);
         return NULL;
     }
-    for (int i = 0; i < ndim; i++) t->shape[i] = (int)shape[i];
+    for (int i = 0; i < ndim; i++) t->shape[i] = shape[i];
     /* row-major contiguous strides */
     t->strides[ndim - 1] = 1;
     for (int i = ndim - 2; i >= 0; i--)
@@ -62,7 +69,7 @@ void tt_shape(const Tensor *t, long *out) {
     for (int i = 0; i < t->ndim; i++) out[i] = t->shape[i];
 }
 
-void tt_strides(const Tensor *t, int *out) {
+void tt_strides(const Tensor *t, long *out) {
     if (!t || !out) return;
     for (int i = 0; i < t->ndim; i++) out[i] = t->strides[i];
 }

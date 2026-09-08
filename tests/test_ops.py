@@ -28,7 +28,7 @@ lib.tt_numel.argtypes = [ctypes.c_void_p]
 lib.tt_ndim.restype = ctypes.c_int
 lib.tt_ndim.argtypes = [ctypes.c_void_p]
 lib.tt_shape.argtypes = [ctypes.c_void_p, I64P]
-lib.tt_strides.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+lib.tt_strides.argtypes = [ctypes.c_void_p, I64P]
 for name in ("tt_relu", "tt_softmax", "tt_matmul_fast"):
     f = getattr(lib, name)
     f.restype = ctypes.c_void_p
@@ -189,7 +189,7 @@ print("== shape/stride metadata ==")
 x = rng.standard_normal((2, 3, 4)).astype(np.float32)
 t = make(x)
 shp = (ctypes.c_long * 3)()
-stp = (ctypes.c_int * 3)()
+stp = (ctypes.c_long * 3)()
 lib.tt_shape(ctypes.c_void_p(t), shp)
 lib.tt_strides(ctypes.c_void_p(t), stp)
 check("shape", list(shp) == [2, 3, 4], f"got {list(shp)}")
@@ -231,8 +231,8 @@ lib.tt_avgpool2d.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 4
 
 class _CTensor(ctypes.Structure):
     _fields_ = [("data", F32P),
-                ("shape", ctypes.POINTER(ctypes.c_int)),
-                ("strides", ctypes.POINTER(ctypes.c_int)),
+                ("shape", ctypes.POINTER(ctypes.c_long)),
+                ("strides", ctypes.POINTER(ctypes.c_long)),
                 ("ndim", ctypes.c_int),
                 ("numel", ctypes.c_long),
                 ("refcount", ctypes.c_int)]
@@ -292,3 +292,41 @@ def test_hostile_avgpool_zero_stride():
         assert not lib.tt_avgpool2d(a, 2, 2, 0, 2), "stride_h=0 must return NULL"
     finally:
         lib.tt_release(a)
+
+
+# === Task 2 hostile alloc validation (TDD: huge dims -> NULL, never hang/OOM) ===
+def _try_new(dims):
+    arr = (ctypes.c_long * len(dims))(*dims)
+    return lib.tt_new(arr, len(dims))
+
+
+def test_hostile_huge_dims_wraparound():
+    # 2**40 * 2**40 wraps long numel to 0 pre-fix -> must be NULL
+    assert not _try_new((2**40, 2**40)), "2**40 dims must return NULL"
+
+
+def test_hostile_huge_dims_product_overflow():
+    # 2**62 * 2 overflows LONG_MAX -> must be NULL
+    assert not _try_new((2**62, 2)), "numel overflow must return NULL"
+
+
+def test_hostile_huge_dims_over_cap():
+    # 2**42 elements: no long overflow, but insane -> reject before calloc
+    assert not _try_new((2**21, 2**21)), "over-cap alloc must return NULL"
+
+
+def test_hostile_huge_single_dim():
+    assert not _try_new((2**40,)), "single huge dim must return NULL"
+
+
+def test_hostile_negative_dim():
+    assert not _try_new((-3, 4)), "negative dim must return NULL"
+
+
+def test_hostile_zero_dim():
+    assert not _try_new((0, 4)), "zero dim must return NULL"
+
+
+def test_hostile_fromdata_huge_rejected():
+    big = (ctypes.c_long * 2)(2**40, 2**40)
+    assert not lib.tt_fromdata(None, big, 2), "fromdata huge dims must return NULL"
