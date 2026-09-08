@@ -20,10 +20,12 @@ using SharedTensor = std::shared_ptr<Tensor>;
 using SharedNode = std::shared_ptr<AGNode>;
 
 static SharedTensor make_shared_tensor(Tensor *t) {
+    if (!t) throw py::value_error("tinytorch: invalid arguments or shape mismatch");
     return SharedTensor(t, TensorDeleter());
 }
 
 static SharedNode make_shared_node(AGNode *n) {
+    if (!n) throw py::value_error("tinytorch: invalid arguments or shape mismatch");
     return SharedNode(n, NodeDeleter());
 }
 

@@ -69,6 +69,14 @@ def _load():
 LIB = _load()
 
 
+def _checked(ptr, op):
+    if not ptr:
+        raise ValueError(
+            f"tinytorch: {op} failed (invalid arguments or shape mismatch)"
+        )
+    return ptr
+
+
 class Tensor:
     """Owns a C Tensor; releases on GC."""
 
@@ -81,8 +89,7 @@ class Tensor:
         ndim = arr.ndim
         shape = (ctypes.c_long * max(ndim, 1))(*arr.shape)
         ptr = LIB.tt_fromdata(arr.ctypes.data_as(F32P), shape, ndim)
-        assert ptr, "tt_fromdata failed"
-        return cls(ptr)
+        return cls(_checked(ptr, "tt_fromdata"))
 
     def to_np(self):
         n = int(LIB.tt_numel(self.ptr))
@@ -110,7 +117,7 @@ class Node:
     @classmethod
     def leaf(cls, arr, requires_grad=True):
         t = Tensor.from_np(arr)
-        n = cls(LIB.ag_leaf(t.ptr, 1 if requires_grad else 0))
+        n = cls(_checked(LIB.ag_leaf(t.ptr, 1 if requires_grad else 0), "ag_leaf"))
         t.release()  # node holds its own reference
         return n
 
@@ -140,33 +147,33 @@ class Node:
 
     def __add__(self, other):
         if isinstance(other, (int, float)):
-            return Node(LIB.ag_addscalar(self.ptr, ctypes.c_float(other)))
-        return Node(LIB.ag_add(self.ptr, other.ptr))
+            return Node(_checked(LIB.ag_addscalar(self.ptr, ctypes.c_float(other)), "ag_addscalar"))
+        return Node(_checked(LIB.ag_add(self.ptr, other.ptr), "ag_add"))
 
     def __mul__(self, other):
         if isinstance(other, (int, float)):
-            return Node(LIB.ag_mulscalar(self.ptr, ctypes.c_float(other)))
-        return Node(LIB.ag_mul(self.ptr, other.ptr))
+            return Node(_checked(LIB.ag_mulscalar(self.ptr, ctypes.c_float(other)), "ag_mulscalar"))
+        return Node(_checked(LIB.ag_mul(self.ptr, other.ptr), "ag_mul"))
 
     def __rmul__(self, other):
         return self.__mul__(other)
 
     def matmul(self, other):
-        return Node(LIB.ag_matmul(self.ptr, other.ptr))
+        return Node(_checked(LIB.ag_matmul(self.ptr, other.ptr), "ag_matmul"))
 
     def relu(self):
-        return Node(LIB.ag_relu(self.ptr))
+        return Node(_checked(LIB.ag_relu(self.ptr), "ag_relu"))
 
     def softmax(self):
-        return Node(LIB.ag_softmax(self.ptr))
+        return Node(_checked(LIB.ag_softmax(self.ptr), "ag_softmax"))
 
     def padones(self):
-        return Node(LIB.ag_padones(self.ptr))
+        return Node(_checked(LIB.ag_padones(self.ptr), "ag_padones"))
 
     def reshape(self, shape):
         ndim = len(shape)
         c_shape = (ctypes.c_long * ndim)(*shape)
-        return Node(LIB.ag_reshape(self.ptr, c_shape, ndim))
+        return Node(_checked(LIB.ag_reshape(self.ptr, c_shape, ndim), "ag_reshape"))
 
     def conv2d(self, w, b=None, stride=1, pad=0):
         sh = stride if isinstance(stride, int) else stride[0]
@@ -174,21 +181,21 @@ class Node:
         ph = pad if isinstance(pad, int) else pad[0]
         pw = pad if isinstance(pad, int) else pad[1]
         b_ptr = b.ptr if b else None
-        return Node(LIB.ag_conv2d(self.ptr, w.ptr, b_ptr, sh, sw, ph, pw))
+        return Node(_checked(LIB.ag_conv2d(self.ptr, w.ptr, b_ptr, sh, sw, ph, pw), "ag_conv2d"))
 
     def maxpool2d(self, pool_size=2, stride=2):
         ph = pool_size if isinstance(pool_size, int) else pool_size[0]
         pw = pool_size if isinstance(pool_size, int) else pool_size[1]
         sh = stride if isinstance(stride, int) else stride[0]
         sw = stride if isinstance(stride, int) else stride[1]
-        return Node(LIB.ag_maxpool2d(self.ptr, ph, pw, sh, sw))
+        return Node(_checked(LIB.ag_maxpool2d(self.ptr, ph, pw, sh, sw), "ag_maxpool2d"))
 
     def avgpool2d(self, pool_size=2, stride=2):
         ph = pool_size if isinstance(pool_size, int) else pool_size[0]
         pw = pool_size if isinstance(pool_size, int) else pool_size[1]
         sh = stride if isinstance(stride, int) else stride[0]
         sw = stride if isinstance(stride, int) else stride[1]
-        return Node(LIB.ag_avgpool2d(self.ptr, ph, pw, sh, sw))
+        return Node(_checked(LIB.ag_avgpool2d(self.ptr, ph, pw, sh, sw), "ag_avgpool2d"))
 
     def release(self):
         if self.ptr:

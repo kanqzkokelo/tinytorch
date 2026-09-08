@@ -330,3 +330,53 @@ def test_hostile_zero_dim():
 def test_hostile_fromdata_huge_rejected():
     big = (ctypes.c_long * 2)(2**40, 2**40)
     assert not lib.tt_fromdata(None, big, 2), "fromdata huge dims must return NULL"
+
+
+# === Task 4: pybind NULL -> ValueError (TDD: shape mismatch must raise) ===
+def _load_pybind():
+    import os as _os
+    import subprocess as _sp
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.join(ROOT, "build"))
+    try:
+        import tinytorch_pybind as _tt
+    except ImportError:
+        _sp.run(["make", "-s", "pybind"], cwd=ROOT, check=True)
+        import tinytorch_pybind as _tt
+    return _tt
+
+
+def test_shape_mismatch_raises():
+    import numpy as _np
+
+    _tt = _load_pybind()
+    a = _tt.Node.leaf(_np.ones((2, 3), dtype=_np.float32), False)
+    b = _tt.Node.leaf(_np.ones((4, 5), dtype=_np.float32), False)
+    try:
+        c = a.matmul(b)
+    except ValueError:
+        return
+    raise AssertionError("matmul shape mismatch must raise ValueError")
+
+
+def test_ctypes_mismatch_raises():
+    import os as _os2
+    import sys as _sys
+
+    import numpy as _np
+
+    _sys.path.insert(0, _os2.path.dirname(_os2.path.abspath(__file__)))
+    from torch_py import Node as _CNode
+
+    a = _CNode.leaf(_np.ones((2, 3), dtype=_np.float32), False)
+    b = _CNode.leaf(_np.ones((4, 5), dtype=_np.float32), False)
+    try:
+        try:
+            a.matmul(b)
+        except ValueError:
+            return
+        raise AssertionError("ctypes matmul mismatch must raise ValueError")
+    finally:
+        a.release()
+        b.release()
