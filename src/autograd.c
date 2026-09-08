@@ -432,6 +432,26 @@ static void batched_col2im_local(const float *data_col, int N, int C, int H, int
     }
 }
 
+/* C(MxN) = A(MxK) * B(NxK)^T with B kept row-major: the KxN transpose
+ * is fused into the inner-product read, so no data_col_t buffer is
+ * needed. K-loop stays sequential per output to match GEMM order. */
+static void sgemm_A_Bt_local(int M, int N, long K,
+                             const float *A, const float *B, float *C) {
+    if (M <= 0 || N <= 0 || K <= 0 || !A || !B || !C) return;
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            const float *a = A + (long)i * K;
+            const float *b = B + (long)j * K;
+            float sum = 0.0f;
+            for (long k = 0; k < K; k++) sum += a[k] * b[k];
+            C[(long)i * N + j] = sum;
+        }
+    }
+}
+
 static void backward_conv2d(AGNode *n) {
     AGNode *a = n->parents[0], *w = n->parents[1];
     AGNode *b = n->nparents > 2 ? n->parents[2] : NULL;
@@ -467,43 +487,28 @@ static void backward_conv2d(AGNode *n) {
         long w_shp[4] = {F, C, HH, WW};
         Tensor *gw = tt_new(w_shp, 4);
         float *data_col = (float *)malloc(sizeof(float) * (size_t)K_col * N_col);
-        if (gw && data_col) {
+        float *g_perm = NULL;
+        if (gw && data_col)
+            g_perm = (float *)malloc(sizeof(float) * (size_t)F * N_col);
+        if (gw && data_col && g_perm) {
             batched_im2col_local(a->val->data, N, C, H, W_in, HH, WW, ph, pw, sh, sw, data_col);
 
-            float *g_perm = (float *)malloc(sizeof(float) * (size_t)F * N_col);
-            float *data_col_t = (float *)malloc(sizeof(float) * (size_t)K_col * N_col);
-
-            if (g_perm && data_col_t) {
-                long N_spatial = Hout * Wout;
-                for (int f = 0; f < F; f++) {
-                    for (int n_idx = 0; n_idx < N; n_idx++) {
-                        const float *src = g->data + ((long)n_idx * F + f) * N_spatial;
-                        float *dst = g_perm + (long)f * N_col + (long)n_idx * N_spatial;
-                        memcpy(dst, src, sizeof(float) * N_spatial);
-                    }
+            long N_spatial = Hout * Wout;
+            for (int f = 0; f < F; f++) {
+                for (int n_idx = 0; n_idx < N; n_idx++) {
+                    const float *src = g->data + ((long)n_idx * F + f) * N_spatial;
+                    float *dst = g_perm + (long)f * N_col + (long)n_idx * N_spatial;
+                    memcpy(dst, src, sizeof(float) * N_spatial);
                 }
-                for (int r = 0; r < K_col; r++)
-                    for (long c_idx = 0; c_idx < N_col; c_idx++)
-                        data_col_t[c_idx * K_col + r] = data_col[r * N_col + c_idx];
-
-                long shape_g_mat[2] = {F, N_col};
-                long shape_col_t[2] = {N_col, K_col};
-                Tensor *g_mat = tt_fromdata(g_perm, shape_g_mat, 2);
-                Tensor *col_t = tt_fromdata(data_col_t, shape_col_t, 2);
-                Tensor *gw_mat = tt_matmul_omp(g_mat, col_t, 12);
-                if (gw_mat) {
-                    memcpy(gw->data, gw_mat->data, sizeof(float) * (size_t)gw->numel);
-                    tt_release(gw_mat);
-                }
-                tt_release(g_mat);
-                tt_release(col_t);
             }
-            free(g_perm);
-            free(data_col_t);
+            /* fused: gw = g_perm * data_col^T, no KxN transpose buffer,
+             * no fromdata wrapper copies, GEMM writes gw->data directly */
+            sgemm_A_Bt_local(F, K_col, N_col, g_perm, data_col, gw->data);
             accum(w, gw);
-            tt_release(gw);
         }
         free(data_col);
+        free(g_perm);
+        if (gw) tt_release(gw);
     }
 
     if (a->requires_grad) {
