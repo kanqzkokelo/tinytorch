@@ -209,3 +209,140 @@ def test_int_dtype_seed_coerced():
     finally:
         z.release()
         x.release()
+
+
+# === Task 8: hostile/edge grad battery (append-only; no case may crash/hang) ===
+import signal as _gsig
+
+
+class _GTimeout:
+    """SIGALRM guard for stress loops (no-op where SIGALRM missing)."""
+
+    def __init__(self, sec):
+        self.sec = sec
+
+    def __enter__(self):
+        if hasattr(_gsig, "SIGALRM"):
+            def _raise(*a):
+                raise TimeoutError("stress case timed out")
+            _gsig.signal(_gsig.SIGALRM, _raise)
+            _gsig.alarm(self.sec)
+        return self
+
+    def __exit__(self, *exc):
+        if hasattr(_gsig, "SIGALRM"):
+            _gsig.alarm(0)
+        return False
+
+
+def test_wrong_dtype_f64_seed_coerced():
+    import numpy as np
+
+    x = _leaf10()
+    z = x * 2
+    try:
+        z.backward(np.arange(1, 11, dtype=np.float64))
+        xg = x.grad()
+        assert (xg == 2 * np.arange(1, 11, dtype=np.float32)).all(), \
+            f"f64 seed must coerce, got {xg}"
+    finally:
+        z.release()
+        x.release()
+
+
+def test_noncontiguous_seed_coerced():
+    import numpy as np
+
+    x = _leaf10()
+    z = x * 2
+    try:
+        seed = np.arange(1, 21, dtype=np.float64)[::2]  # non-contig f64
+        assert not seed.flags["C_CONTIGUOUS"]
+        assert seed.size == 10
+        z.backward(seed)
+        xg = x.grad()
+        assert (xg == 2 * np.arange(1, 20, 2, dtype=np.float32)).all(), \
+            f"non-contig seed must coerce, got {xg}"
+    finally:
+        z.release()
+        x.release()
+
+
+def test_deep_chain_1000_backward():
+    import numpy as np
+
+    from torch_py import Node
+
+    with _GTimeout(60):
+        v = Node.leaf(np.array([1.0, 2.0], dtype=np.float32), True)
+        nodes = [v]
+        cur = v
+        for _ in range(1000):
+            cur = cur + 1.0
+            nodes.append(cur)
+        try:
+            cur.backward(None)
+            g = v.grad()
+            assert g is not None
+            assert np.allclose(g, 1.0, atol=1e-6), f"deep-chain grad must be 1, got {g}"
+        finally:
+            for n in nodes:
+                n.release()
+
+
+def test_shared_subgraph_double_backward():
+    import numpy as np
+
+    from torch_py import Node
+
+    x = Node.leaf(np.array([1.0, 2.0, 3.0], dtype=np.float32), True)
+    y = x * x
+    z = y + y
+    try:
+        with _GTimeout(30):
+            z.backward(None)
+            g1 = x.grad().copy()
+            assert np.allclose(g1, [4.0, 8.0, 12.0]), f"1st grad 4x, got {g1}"
+            z.backward(None)  # must not crash; accumulates deterministically
+            g2 = x.grad()
+            assert np.isfinite(g2).all()
+            assert np.allclose(g2, 3 * g1), f"2nd backward accumulates 3x, got {g2}"
+    finally:
+        z.release()
+        y.release()
+        x.release()
+
+
+def test_nan_backward_no_crash():
+    import numpy as np
+
+    from torch_py import Node
+
+    with _GTimeout(30):
+        x = Node.leaf(np.array([np.nan, 1.0], dtype=np.float32), True)
+        y = x * x
+        try:
+            y.backward(None)  # must not crash
+            g = x.grad()
+            assert g is not None and g.shape == (2,)
+        finally:
+            y.release()
+            x.release()
+
+
+def test_inf_backward_no_crash():
+    import numpy as np
+
+    from torch_py import Node
+
+    with _GTimeout(30):
+        x = Node.leaf(np.array([np.inf, -np.inf], dtype=np.float32), True)
+        r = x.relu()
+        try:
+            r.backward(None)  # must not crash
+            g = x.grad()
+            assert g is not None and g.shape == (2,)
+            assert np.isfinite(g).all(), f"relu(+-Inf) grad must be finite, got {g}"
+        finally:
+            r.release()
+            x.release()

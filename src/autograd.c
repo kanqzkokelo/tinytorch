@@ -1,4 +1,5 @@
 #include "autograd.h"
+#include <math.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -571,7 +572,7 @@ static void backward_maxpool2d(AGNode *n) {
                 for (int wo = 0; wo < Wout; wo++) {
                     int w_start = wo * sw;
                     float g_val = g->data[((long)n_idx * C + c) * Hout * Wout + (long)ho * Wout + wo];
-                    float max_val = -1e30f;
+                    float max_val = -INFINITY;
                     int max_h = h_start, max_w = w_start;
                     for (int kh = 0; kh < ph; kh++) {
                         for (int kw = 0; kw < pw; kw++) {

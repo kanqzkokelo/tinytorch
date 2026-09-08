@@ -148,7 +148,7 @@ Tensor *tt_maxpool2d(const Tensor *a, int pool_h, int pool_w,
                 int h_start = ho * stride_h;
                 for (int wo = 0; wo < Wout; wo++) {
                     int w_start = wo * stride_w;
-                    float max_val = -1e30f;
+                    float max_val = -INFINITY;
                     for (int kh = 0; kh < pool_h; kh++) {
                         for (int kw = 0; kw < pool_w; kw++) {
                             float v = a->data[((long)n * C + c) * H * W + (long)(h_start + kh) * W + (w_start + kw)];

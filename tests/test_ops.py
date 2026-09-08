@@ -414,3 +414,167 @@ def test_reshape_returns_contiguous_copy():
             lib.tt_release(t_out)
     finally:
         lib.tt_release(t_in)
+
+
+# === Task 8: hostile/edge battery (append-only; no case may crash/hang) ===
+import signal as _sig
+
+
+class _Timeout:
+    """SIGALRM guard for stress loops (no-op where SIGALRM missing)."""
+
+    def __init__(self, sec):
+        self.sec = sec
+
+    def __enter__(self):
+        if hasattr(_sig, "SIGALRM"):
+            def _raise(*a):
+                raise TimeoutError("stress case timed out")
+            _sig.signal(_sig.SIGALRM, _raise)
+            _sig.alarm(self.sec)
+        return self
+
+    def __exit__(self, *exc):
+        if hasattr(_sig, "SIGALRM"):
+            _sig.alarm(0)
+        return False
+
+
+def _assert_ptr_alive(ptr, what):
+    assert ptr, f"{what} must return non-NULL, never crash"
+    lib.tt_release(ptr)
+
+
+def test_edge_nan_inputs_no_crash():
+    import numpy as _np
+    nan1 = _np.array([_np.nan, 1.0, -2.0], dtype=_np.float32)
+    t = make(nan1)
+    try:
+        _assert_ptr_alive(lib.tt_relu(t), "relu(NaN)")
+        _assert_ptr_alive(lib.tt_softmax(t), "softmax(NaN)")
+    finally:
+        lib.tt_release(t)
+    a, b = make(nan1), make(nan1)
+    try:
+        _assert_ptr_alive(lib.tt_add(a, b), "add(NaN)")
+        _assert_ptr_alive(lib.tt_mul(a, b), "mul(NaN)")
+    finally:
+        lib.tt_release(a)
+        lib.tt_release(b)
+    m1 = make(_np.full((4, 4), _np.nan, dtype=_np.float32))
+    m2 = make(_np.full((4, 4), 1.0, dtype=_np.float32))
+    try:
+        _assert_ptr_alive(lib.tt_matmul(m1, m2), "matmul(NaN)")
+    finally:
+        lib.tt_release(m1)
+        lib.tt_release(m2)
+
+
+def test_edge_inf_inputs_no_crash():
+    import numpy as _np
+    inf1 = _np.array([_np.inf, -_np.inf, 1.5], dtype=_np.float32)
+    t = make(inf1)
+    try:
+        _assert_ptr_alive(lib.tt_relu(t), "relu(+-Inf)")
+    finally:
+        lib.tt_release(t)
+    a, b = make(inf1), make(inf1)
+    try:
+        _assert_ptr_alive(lib.tt_add(a, b), "add(+-Inf)")
+        _assert_ptr_alive(lib.tt_mul(a, b), "mul(+-Inf)")
+    finally:
+        lib.tt_release(a)
+        lib.tt_release(b)
+    m1 = make(_np.full((4, 4), _np.inf, dtype=_np.float32))
+    m2 = make(_np.full((4, 4), 1.0, dtype=_np.float32))
+    try:
+        _assert_ptr_alive(lib.tt_matmul(m1, m2), "matmul(+Inf)")
+    finally:
+        lib.tt_release(m1)
+        lib.tt_release(m2)
+
+
+def test_edge_softmax_all_neginf_uniform():
+    import numpy as _np
+    t = make(_np.full((4,), -_np.inf, dtype=_np.float32))
+    try:
+        o = lib.tt_softmax(t)
+        assert o, "softmax(all -Inf) must return tensor"
+        try:
+            got = to_np(o, (4,))
+            assert not _np.isnan(got).any(), f"no NaN allowed, got {got}"
+            assert _np.allclose(got, 0.25, atol=1e-6), f"expect uniform, got {got}"
+        finally:
+            lib.tt_release(o)
+    finally:
+        lib.tt_release(t)
+    # 2D: -Inf row uniform, finite row matches reference
+    x = _np.array([[-_np.inf] * 4, [1.0, 2.0, 3.0, 4.0]], dtype=_np.float32)
+    t = make(x)
+    try:
+        o = lib.tt_softmax(t)
+        assert o, "softmax 2D must return tensor"
+        try:
+            got = to_np(o, (2, 4))
+            assert _np.allclose(got[0], 0.25, atol=1e-6), f"row0 uniform, got {got[0]}"
+            assert _np.allclose(got[1], softmax_ref(x[1:])[0], atol=1e-5, rtol=1e-5)
+        finally:
+            lib.tt_release(o)
+    finally:
+        lib.tt_release(t)
+
+
+def test_edge_softmax_mixed_inf_no_crash():
+    import numpy as _np
+    t = make(_np.array([1.0, _np.inf, -_np.inf, 0.0], dtype=_np.float32))
+    try:
+        _assert_ptr_alive(lib.tt_softmax(t), "softmax(mixed Inf)")
+    finally:
+        lib.tt_release(t)
+
+
+def _maxpool4(arr4, ph=2, pw=2, sh=2, sw=2):
+    t = make(arr4)
+    try:
+        o = lib.tt_maxpool2d(t, ph, pw, sh, sw)
+        assert o, "maxpool must return tensor"
+        try:
+            return to_np(o, (arr4.shape[0], arr4.shape[1],
+                             (arr4.shape[2] - ph) // sh + 1,
+                             (arr4.shape[3] - pw) // sw + 1))
+        finally:
+            lib.tt_release(o)
+    finally:
+        lib.tt_release(t)
+
+
+def test_edge_maxpool_sub_neg1e30():
+    import numpy as _np
+    got = _maxpool4(_np.full((1, 1, 4, 4), -2e30, dtype=_np.float32))
+    assert _np.all(got == _np.float32(-2e30)), f"must propagate -2e30, got {got.ravel()}"
+
+
+def test_edge_maxpool_neginf():
+    import numpy as _np
+    got = _maxpool4(_np.full((1, 1, 4, 4), -_np.inf, dtype=_np.float32))
+    assert _np.all(got == -_np.inf), f"must propagate -Inf, got {got.ravel()}"
+    assert not _np.isnan(got).any()
+
+
+def test_edge_maxpool_nan_window():
+    import numpy as _np
+    got = _maxpool4(_np.full((1, 1, 4, 4), _np.nan, dtype=_np.float32))
+    assert _np.all(got == -_np.inf), f"NaN window -> -Inf init, got {got.ravel()}"
+
+
+def test_edge_retain_release_10k():
+    import numpy as _np
+    t = make(_np.ones((8,), dtype=_np.float32))
+    try:
+        with _Timeout(30):
+            for _ in range(10000):
+                u = lib.tt_retain(ctypes.c_void_p(t))
+                assert u, "retain must not return NULL"
+                lib.tt_release(ctypes.c_void_p(u))
+    finally:
+        lib.tt_release(ctypes.c_void_p(t))

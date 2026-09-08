@@ -122,14 +122,20 @@ Tensor *tt_softmax(const Tensor *a) {
             float v = a->data[base + (long)j * s_in];
             if (v > mx) mx = v;
         }
-        float sum = 0.0f;
-        for (int j = 0; j < N; j++) {
-            float e = expf(a->data[base + (long)j * s_in] - mx);
-            out->data[(long)r * N + j] = e;
-            sum += e;
+        if (mx == -INFINITY) {
+            /* all inputs -Inf: exp(NaN) would give NaN; return uniform */
+            for (int j = 0; j < N; j++)
+                out->data[(long)r * N + j] = 1.0f / (float)N;
+        } else {
+            float sum = 0.0f;
+            for (int j = 0; j < N; j++) {
+                float e = expf(a->data[base + (long)j * s_in] - mx);
+                out->data[(long)r * N + j] = e;
+                sum += e;
+            }
+            for (int j = 0; j < N; j++)
+                out->data[(long)r * N + j] /= sum;
         }
-        for (int j = 0; j < N; j++)
-            out->data[(long)r * N + j] /= sum;
         for (int d = a->ndim - 2; d >= 0; d--) {
             if (++idx[d] < a->shape[d]) break;
             idx[d] = 0;
