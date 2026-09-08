@@ -369,6 +369,7 @@ static void backward_reshape(AGNode *n) {
 static void batched_im2col_local(const float *data_im, int N, int C, int H, int W_in,
                                  int HH, int WW, int pad_h, int pad_w,
                                  int stride_h, int stride_w, float *data_col) {
+    if (HH <= 0 || WW <= 0 || stride_h <= 0 || stride_w <= 0 || pad_h < 0 || pad_w < 0) return;
     int Hout = (H + 2 * pad_h - HH) / stride_h + 1;
     int Wout = (W_in + 2 * pad_w - WW) / stride_w + 1;
     int channels_col = C * HH * WW;
@@ -403,6 +404,7 @@ static void batched_im2col_local(const float *data_im, int N, int C, int H, int 
 static void batched_col2im_local(const float *data_col, int N, int C, int H, int W_in,
                                  int HH, int WW, int pad_h, int pad_w,
                                  int stride_h, int stride_w, float *data_im) {
+    if (HH <= 0 || WW <= 0 || stride_h <= 0 || stride_w <= 0 || pad_h < 0 || pad_w < 0) return;
     memset(data_im, 0, sizeof(float) * (size_t)N * C * H * W_in);
     int Hout = (H + 2 * pad_h - HH) / stride_h + 1;
     int Wout = (W_in + 2 * pad_w - WW) / stride_w + 1;
@@ -437,6 +439,7 @@ static void backward_conv2d(AGNode *n) {
 
     int N = a->val->shape[0], C = a->val->shape[1], H = a->val->shape[2], W_in = a->val->shape[3];
     int F = w->val->shape[0], HH = w->val->shape[2], WW = w->val->shape[3];
+    if (HH <= 0 || WW <= 0 || sh <= 0 || sw <= 0 || ph < 0 || pw < 0) return;
     int Hout = g->shape[2], Wout = g->shape[3];
 
     if (b && b->requires_grad) {
@@ -549,6 +552,7 @@ static void backward_maxpool2d(AGNode *n) {
     Tensor *g = n->grad;
     int N = a->val->shape[0], C = a->val->shape[1], H = a->val->shape[2], W = a->val->shape[3];
     int Hout = g->shape[2], Wout = g->shape[3];
+    if (ph <= 0 || pw <= 0 || sh <= 0 || sw <= 0) return;
 
     long a_shp[4] = {N, C, H, W};
     Tensor *ga = tt_new(a_shp, 4);
@@ -589,6 +593,7 @@ static void backward_avgpool2d(AGNode *n) {
     Tensor *g = n->grad;
     int N = a->val->shape[0], C = a->val->shape[1], H = a->val->shape[2], W = a->val->shape[3];
     int Hout = g->shape[2], Wout = g->shape[3];
+    if (ph <= 0 || pw <= 0 || sh <= 0 || sw <= 0) return;
     float norm = 1.0f / (float)(ph * pw);
 
     long a_shp[4] = {N, C, H, W};

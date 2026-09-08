@@ -8,6 +8,17 @@
 #include <omp.h>
 #endif
 
+/* Task 1: central param validation — call BEFORE any output-dim arithmetic. */
+static int valid_conv_params(int HH, int WW, int stride_h, int stride_w,
+                             int pad_h, int pad_w) {
+    return HH > 0 && WW > 0 && stride_h > 0 && stride_w > 0 &&
+           pad_h >= 0 && pad_w >= 0;
+}
+
+static int valid_pool_params(int pool_h, int pool_w, int stride_h, int stride_w) {
+    return pool_h > 0 && pool_w > 0 && stride_h > 0 && stride_w > 0;
+}
+
 Tensor *tt_reshape(const Tensor *a, const long *new_shape, int new_ndim) {
     if (!a || !new_shape || new_ndim <= 0 || new_ndim > 8) return NULL;
     long numel = 1;
@@ -64,6 +75,7 @@ Tensor *tt_conv2d(const Tensor *a, const Tensor *w, const Tensor *b,
     int F = w->shape[0], C_w = w->shape[1], HH = w->shape[2], WW = w->shape[3];
     if (C != C_w) return NULL;
     if (b && (b->ndim != 1 || b->shape[0] != F)) return NULL;
+    if (!valid_conv_params(HH, WW, stride_h, stride_w, pad_h, pad_w)) return NULL;
 
     int Hout = (H + 2 * pad_h - HH) / stride_h + 1;
     int Wout = (W_in + 2 * pad_w - WW) / stride_w + 1;
@@ -117,6 +129,7 @@ Tensor *tt_conv2d(const Tensor *a, const Tensor *w, const Tensor *b,
 Tensor *tt_maxpool2d(const Tensor *a, int pool_h, int pool_w,
                      int stride_h, int stride_w) {
     if (!a || a->ndim != 4) return NULL;
+    if (!valid_pool_params(pool_h, pool_w, stride_h, stride_w)) return NULL;
     int N = a->shape[0], C = a->shape[1], H = a->shape[2], W = a->shape[3];
     int Hout = (H - pool_h) / stride_h + 1;
     int Wout = (W - pool_w) / stride_w + 1;
@@ -153,6 +166,7 @@ Tensor *tt_maxpool2d(const Tensor *a, int pool_h, int pool_w,
 Tensor *tt_avgpool2d(const Tensor *a, int pool_h, int pool_w,
                      int stride_h, int stride_w) {
     if (!a || a->ndim != 4) return NULL;
+    if (!valid_pool_params(pool_h, pool_w, stride_h, stride_w)) return NULL;
     int N = a->shape[0], C = a->shape[1], H = a->shape[2], W = a->shape[3];
     int Hout = (H - pool_h) / stride_h + 1;
     int Wout = (W - pool_w) / stride_w + 1;

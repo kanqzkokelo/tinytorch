@@ -219,3 +219,76 @@ if FAILURES:
     print(f"\n{len(FAILURES)} FAILURE(S)")
     sys.exit(1)
 print("\nALL M0 OP TESTS PASS")
+
+# === Task 1 hostile param validation (TDD: must return NULL, never crash) ===
+lib.tt_conv2d.restype = ctypes.c_void_p
+lib.tt_conv2d.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 4
+lib.tt_maxpool2d.restype = ctypes.c_void_p
+lib.tt_maxpool2d.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 4
+lib.tt_avgpool2d.restype = ctypes.c_void_p
+lib.tt_avgpool2d.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 4
+
+
+class _CTensor(ctypes.Structure):
+    _fields_ = [("data", F32P),
+                ("shape", ctypes.POINTER(ctypes.c_int)),
+                ("strides", ctypes.POINTER(ctypes.c_int)),
+                ("ndim", ctypes.c_int),
+                ("numel", ctypes.c_long),
+                ("refcount", ctypes.c_int)]
+
+
+def _t4(*shape):
+    return make(rng.standard_normal(shape).astype(np.float32))
+
+
+def test_hostile_conv_zero_stride():
+    a, w = _t4(1, 1, 8, 8), _t4(2, 1, 3, 3)
+    try:
+        assert not lib.tt_conv2d(a, w, None, 0, 1, 0, 0), "stride_h=0 must return NULL"
+    finally:
+        lib.tt_release(a); lib.tt_release(w)
+
+
+def test_hostile_conv_neg_stride():
+    a, w = _t4(1, 1, 8, 8), _t4(2, 1, 3, 3)
+    try:
+        assert not lib.tt_conv2d(a, w, None, -1, 1, 0, 0), "stride_h=-1 must return NULL"
+    finally:
+        lib.tt_release(a); lib.tt_release(w)
+
+
+def test_hostile_conv_zero_kernel():
+    a, w = _t4(1, 1, 8, 8), _t4(2, 1, 3, 3)
+    tw = _CTensor.from_address(w)
+    assert tw.ndim == 4 and tw.shape[2] == 3  # layout sanity
+    tw.shape[2] = 0  # hostile: HH=0 (allocator would never build this)
+    try:
+        assert not lib.tt_conv2d(a, w, None, 1, 1, 0, 0), "HH=0 must return NULL"
+    finally:
+        tw.shape[2] = 3
+        lib.tt_release(a); lib.tt_release(w)
+
+
+def test_hostile_conv_neg_pad():
+    a, w = _t4(1, 1, 8, 8), _t4(2, 1, 3, 3)
+    try:
+        assert not lib.tt_conv2d(a, w, None, 1, 1, -1, 0), "pad_h=-1 must return NULL"
+    finally:
+        lib.tt_release(a); lib.tt_release(w)
+
+
+def test_hostile_maxpool_zero_pool():
+    a = _t4(1, 1, 8, 8)
+    try:
+        assert not lib.tt_maxpool2d(a, 0, 2, 2, 2), "pool_h=0 must return NULL"
+    finally:
+        lib.tt_release(a)
+
+
+def test_hostile_avgpool_zero_stride():
+    a = _t4(1, 1, 8, 8)
+    try:
+        assert not lib.tt_avgpool2d(a, 2, 2, 0, 2), "stride_h=0 must return NULL"
+    finally:
+        lib.tt_release(a)
