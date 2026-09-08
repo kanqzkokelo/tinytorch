@@ -4,7 +4,8 @@ C tensor library with autograd, built from scratch. No dependencies beyond
 a C compiler, OpenMP, NumPy, and (optionally) pybind11. Split out of the
 `nnfromscratch` monorepo; inference-engine code lives in `tinyinference`.
 
-What works: strided tensors, elementwise / matmul / softmax / relu ops,
+What works: contiguous row-major tensors (`strides` metadata is informational only;
+`reshape` returns a copy, not a view), elementwise / matmul / softmax / relu ops,
 reverse-mode autograd with gradcheck, im2col conv2d + maxpool for CNNs,
 AVX2+FMA blocked sgemm (single + OpenMP paths), pybind11 bindings.
 

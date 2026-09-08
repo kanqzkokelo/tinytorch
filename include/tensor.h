@@ -10,7 +10,7 @@ extern "C" {
 typedef struct Tensor {
     float *data;     /* row-major payload */
     long  *shape;    /* ndim entries */
-    long  *strides;  /* in elements, per dim */
+    long  *strides;  /* in elements, per dim; informational: tensors are always contiguous row-major */
     int    ndim;
     long   numel;
     int    refcount;
@@ -41,7 +41,7 @@ Tensor *tt_relu(const Tensor *a);
 Tensor *tt_softmax(const Tensor *a);                  /* along last axis */
 
 /* spatial & shape ops */
-Tensor *tt_reshape(const Tensor *a, const long *new_shape, int new_ndim);
+Tensor *tt_reshape(const Tensor *a, const long *new_shape, int new_ndim); /* copy, not a view */
 Tensor *tt_conv2d(const Tensor *a, const Tensor *w, const Tensor *b,
                   int stride_h, int stride_w, int pad_h, int pad_w);
 Tensor *tt_maxpool2d(const Tensor *a, int pool_h, int pool_w,

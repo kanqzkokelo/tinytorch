@@ -380,3 +380,37 @@ def test_ctypes_mismatch_raises():
     finally:
         a.release()
         b.release()
+
+
+# === Task 5: contiguous-only contract pin (reshape = contiguous copy, not view) ===
+def test_reshape_returns_contiguous_copy():
+    import numpy as _np
+
+    # pybind level: shape + values match NumPy reshape
+    _tt = _load_pybind()
+    x_np = _np.arange(12, dtype=_np.float32).reshape(2, 6)
+    x = _tt.Node.leaf(x_np, False)
+    y = x.reshape([3, 4])
+    y_np = _np.asarray(y.value())
+    assert y_np.shape == (3, 4)
+    assert _np.array_equal(y_np, x_np.reshape(3, 4))
+
+    # C level: distinct storage (copy, not view) + contiguous row-major strides
+    lib.tt_reshape.restype = ctypes.c_void_p
+    lib.tt_reshape.argtypes = [ctypes.c_void_p, I64P, ctypes.c_int]
+    t_in = make(x_np)
+    try:
+        ns = (ctypes.c_long * 2)(3, 4)
+        t_out = lib.tt_reshape(t_in, ns, 2)
+        assert t_out, "tt_reshape (2,6)->(3,4) must succeed"
+        try:
+            assert lib.tt_data(t_out) != lib.tt_data(t_in), "reshape must copy, not alias"
+            got = to_np(t_out, (3, 4))
+            assert _np.array_equal(got, x_np.reshape(3, 4))
+            st = (ctypes.c_long * 2)()
+            lib.tt_strides(t_out, st)
+            assert tuple(st) == (4, 1), f"strides must be contiguous, got {tuple(st)}"
+        finally:
+            lib.tt_release(t_out)
+    finally:
+        lib.tt_release(t_in)
