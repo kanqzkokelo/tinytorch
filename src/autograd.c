@@ -1,4 +1,5 @@
 #include "autograd.h"
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -694,8 +695,9 @@ static void propagate(NodeList *order) {
     }
 }
 
-void ag_backward_from(AGNode *out, const float *seed) {
+void ag_backward_from(AGNode *out, const float *seed, size_t seed_numel) {
     if (!out || !out->requires_grad) return;
+    if (seed && (!out->val || seed_numel != (size_t)out->val->numel)) return;
     NodeList order = {0};
     if (!topo_sort(out, &order)) {
         free(order.items);
@@ -716,7 +718,7 @@ void ag_backward_from(AGNode *out, const float *seed) {
     free(order.items);
 }
 
-void ag_backward(AGNode *out) { ag_backward_from(out, NULL); }
+void ag_backward(AGNode *out) { ag_backward_from(out, NULL, 0); }
 
 /* ---------- lifecycle ---------- */
 

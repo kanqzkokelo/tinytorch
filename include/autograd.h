@@ -2,6 +2,7 @@
 #define TINYTORCH_AUTOGRAD_H
 
 #include "tensor.h"
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,10 +37,12 @@ int     ag_requires_grad(const AGNode *n);
 
 /* reverse-mode AD.
  * ag_backward(out): seed out->grad with 1.0 (scalar losses).
- * ag_backward_from(out, seed): copy seed (numel floats) into out->grad.
- * Both propagate through the DAG in reverse topological order. */
+ * ag_backward_from(out, seed, seed_numel): copy seed (seed_numel floats)
+ * into out->grad. seed_numel must exactly equal out->val->numel;
+ * on mismatch the call returns without touching grad (no memcpy,
+ * no propagate). Callers must surface this as an error. */
 void    ag_backward(AGNode *out);
-void    ag_backward_from(AGNode *out, const float *seed);
+void    ag_backward_from(AGNode *out, const float *seed, size_t seed_numel);
 
 void    ag_release(AGNode *n);                   /* refcounted node */
 AGNode *ag_retain(AGNode *n);

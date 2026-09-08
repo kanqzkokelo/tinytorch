@@ -61,7 +61,7 @@ def _load():
     lib.ag_requires_grad.restype = ctypes.c_int
     lib.ag_requires_grad.argtypes = [ctypes.c_void_p]
     lib.ag_backward.argtypes = [ctypes.c_void_p]
-    lib.ag_backward_from.argtypes = [ctypes.c_void_p, F32P]
+    lib.ag_backward_from.argtypes = [ctypes.c_void_p, F32P, ctypes.c_size_t]
     lib.ag_release.argtypes = [ctypes.c_void_p]
     return lib
 
@@ -128,8 +128,15 @@ class Node:
             LIB.ag_backward(ctypes.c_void_p(self.ptr))
         else:
             seed = np.ascontiguousarray(seed, dtype=np.float32)
+            vp = LIB.ag_value(ctypes.c_void_p(self.ptr))
+            need = int(LIB.tt_numel(ctypes.c_void_p(vp)))
+            if int(seed.size) != need:
+                raise ValueError(
+                    f"tinytorch: seed length mismatch "
+                    f"(got {int(seed.size)}, need {need})"
+                )
             LIB.ag_backward_from(ctypes.c_void_p(self.ptr),
-                                 seed.ctypes.data_as(F32P))
+                                 seed.ctypes.data_as(F32P), int(seed.size))
 
     def __add__(self, other):
         if isinstance(other, (int, float)):

@@ -81,7 +81,11 @@ public:
         } else {
             py::array_t<float, py::array::c_style | py::array::forcecast> arr = seed.cast<py::array_t<float>>();
             py::buffer_info info = arr.request();
-            ag_backward_from(node.get(), static_cast<float*>(info.ptr));
+            Tensor *v = ag_value(node.get());
+            long need = v ? tt_numel(v) : -1;
+            if ((size_t)info.size != (size_t)need)
+                throw py::value_error("tinytorch: seed length mismatch");
+            ag_backward_from(node.get(), static_cast<float*>(info.ptr), (size_t)info.size);
         }
     }
 

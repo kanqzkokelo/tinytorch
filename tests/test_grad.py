@@ -116,3 +116,96 @@ if FAILURES:
     sys.exit(1)
 print("\nGATE A GREEN: all grads match central finite differences "
       f"(rtol={RTOL}, atol={ATOL})")
+
+
+# === Task 3: size-aware backward seed (TDD: mismatch must raise, not OOB-read) ===
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from torch_py import Node as _Node
+
+
+def _leaf10():
+    return _Node.leaf(
+        __import__("numpy").array(
+            [1., 2., 3., 4., 5., 6., 7., 8., 9., 10.], dtype="float32"
+        ),
+        True,
+    )
+
+
+def test_short_seed_rejected():
+    import numpy as np
+
+    x = _leaf10()
+    z = x * 2
+    try:
+        try:
+            z.backward(np.array([1.0], dtype=np.float32))
+        except (ValueError, RuntimeError):
+            return
+        assert False, "short seed must raise, not OOB-read"
+    finally:
+        z.release()
+        x.release()
+
+
+def test_long_seed_rejected():
+    import numpy as np
+
+    x = _leaf10()
+    z = x * 2
+    try:
+        try:
+            z.backward(np.ones(20, dtype=np.float32))
+        except (ValueError, RuntimeError):
+            return
+        assert False, "long seed must raise, not over-read"
+    finally:
+        z.release()
+        x.release()
+
+
+def test_none_seed_gives_ones_grad():
+    x = _leaf10()
+    z = x * 2
+    try:
+        z.backward(None)
+        g = z.grad()
+        assert g is not None
+        assert (g == 1.0).all(), f"None seed must fill ones, got {g}"
+        xg = x.grad()
+        assert (xg == 2.0).all(), f"dx must be 2.0, got {xg}"
+    finally:
+        z.release()
+        x.release()
+
+
+def test_correct_seed_ok():
+    import numpy as np
+
+    x = _leaf10()
+    z = x * 2
+    try:
+        seed = np.arange(1, 11, dtype=np.float32)
+        z.backward(seed)
+        xg = x.grad()
+        assert (xg == 2 * seed).all(), f"dx must be 2*seed, got {xg}"
+    finally:
+        z.release()
+        x.release()
+
+
+def test_int_dtype_seed_coerced():
+    import numpy as np
+
+    x = _leaf10()
+    z = x * 2
+    try:
+        z.backward(np.arange(1, 11, dtype=np.int32))
+        xg = x.grad()
+        assert (xg == 2 * np.arange(1, 11, dtype=np.float32)).all()
+    finally:
+        z.release()
+        x.release()
