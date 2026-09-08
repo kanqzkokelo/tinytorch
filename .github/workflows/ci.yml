@@ -47,3 +47,40 @@ jobs:
         run: python3 tests/test_ops.py
       - name: gradcheck (m1)
         run: python3 tests/test_grad.py
+
+  mnist-smoke:
+    # CPU-only. Mirrors local gate: ./scripts/verify.sh m1 (mnist-mlp step).
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    needs: [lint-compile]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain + numpy
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc python3-numpy
+      - name: MNIST MLP gate (m1)
+        run: python3 tests/gate_mnist_mlp.py
+
+  cifar-smoke:
+    # CPU-only. Mirrors local gate: ./scripts/verify.sh m4
+    # (cifar-cnn + pybind-demo smoke).
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    needs: [lint-compile]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain + numpy + pybind11
+        run: |
+          sudo apt-get update && sudo apt-get install -y g++ python3-numpy python3-pybind11 python3-pip
+          python3 -m pip install --quiet pybind11
+      - name: CIFAR-10 CNN + pybind smoke (m4)
+        run: ./scripts/verify.sh m4
+
+  # CUDA-gated jobs are self-hosted-only (need NVIDIA GPU + CUDA toolkit).
+  # NOT active on GitHub-hosted runners. To enable on a self-hosted GPU runner:
+  #   cuda-smoke:
+  #     runs-on: [self-hosted, gpu]  # self-hosted GPU runner only
+  #     if: contains(github.event.pull_request.labels.*.name, 'gpu')  # manual gate
+  #     steps:
+  #       - uses: actions/checkout@v4
+  #       - run: ./scripts/verify.sh m3
