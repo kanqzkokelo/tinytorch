@@ -29,13 +29,13 @@
 #define KC 384
 #endif
 #ifndef NC
-#define NC 384
+#define NC 1024
 #endif
 #ifndef APAD
 #define APAD 16
 #endif
 #ifndef MC
-#define MC 240   /* row-block: MC*(KC+APAD)*4 = 384KB, fits L2 (1.25MB) */
+#define MC 120   /* row-block: 120*(KC+APAD)*4 = 192KB, L2-resident with headroom */
 #endif
 
 #ifdef TT_IN_LIB
@@ -609,15 +609,24 @@ int tt_sgemm_rowmajor(int M, int N, int K, const float *A, const float *B,
                     memcpy(Ap + (size_t)r * (KC + APAD),
                            A + (long)(ic + r) * K + kk,
                            sizeof(float) * Ki);
+                if (nthreads == 1) {
+                    for (int p = 0; p < npj; p++)
+                        for (int ig = 0; ig < mi; ig += MR)
+                            micro_kernel(Ap + (size_t)ig * (KC + APAD),
+                                         Bp + p * bpanel,
+                                         C + (long)(ic + ig) * N + jc + (long)p * NR,
+                                         KC + APAD, N, Ki, kk == 0);
+                } else {
 #ifdef _OPENMP
 #pragma omp parallel for num_threads(nthreads) schedule(static) collapse(2)
 #endif
-                for (int p = 0; p < npj; p++)
-                    for (int ig = 0; ig < mi; ig += MR)
-                        micro_kernel(Ap + (size_t)ig * (KC + APAD),
-                                     Bp + p * bpanel,
-                                     C + (long)(ic + ig) * N + jc + (long)p * NR,
-                                     KC + APAD, N, Ki, kk == 0);
+                    for (int p = 0; p < npj; p++)
+                        for (int ig = 0; ig < mi; ig += MR)
+                            micro_kernel(Ap + (size_t)ig * (KC + APAD),
+                                         Bp + p * bpanel,
+                                         C + (long)(ic + ig) * N + jc + (long)p * NR,
+                                         KC + APAD, N, Ki, kk == 0);
+                }
             }
         }
     }
