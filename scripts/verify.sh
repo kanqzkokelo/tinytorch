@@ -18,7 +18,8 @@ case "$GATE" in
   m1)  run "gradcheck"       python3 tests/test_grad.py
        run "mnist-mlp"       python3 tests/gate_mnist_mlp.py ;;
   m2)  run "cpu-bench"       python3 bench/bench_cpu.py --gate ;;
-  m3)  run "cuda-bench"      python3 bench/bench_cuda.py --gate ;;
+  m3) if [ ! -f build/libtinytorch_cuda.so ] && ! make -n cuda >/dev/null 2>&1; then echo "SKIP: CUDA objects not in this repo state"; exit 0; fi
+      run "cuda-bench"      python3 bench/bench_cuda.py --gate ;;
   m4)  run "cifar-cnn"       python3 tests/gate_cifar_cnn.py
        run "pybind-demo"     python3 examples/train_mnist.py --smoke ;;
   all) for g in m0 m1 m2 m3 m4; do "$0" "$g"; done ;;
