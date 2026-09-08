@@ -566,13 +566,13 @@ static void micro_kernel(const float *A, const float *bp0, float *C,
     }
 }
 
-void tt_sgemm_rowmajor(int M, int N, int K, const float *A, const float *B,
+int tt_sgemm_rowmajor(int M, int N, int K, const float *A, const float *B,
                        float *C, int nthreads) {
     const int Nfull = (N / NR) * NR;
     const int Msfx = (M / MR) * MR;
     if (Nfull <= 0 || K <= 0) {
         if (Nfull < N) gemm_tail(M, N, K, A, B, C, Nfull, N);
-        return;
+        return 0;
     }
 
     const size_t bpanel = (size_t)KC * NR;
@@ -584,12 +584,12 @@ void tt_sgemm_rowmajor(int M, int N, int K, const float *A, const float *B,
     if (!Bp || !Ap) {
         free(Bp);
         if (Msfx > 0) free(Ap);
-        return;
+        return -1;
     }
     if (Msfx == 0) {
         free(Bp);
         gemm_tail(M, N, K, A, B, C, 0, N);
-        return;
+        return 0;
     }
 
     for (int jc = 0; jc < Nfull; jc += NC) {
@@ -628,6 +628,7 @@ void tt_sgemm_rowmajor(int M, int N, int K, const float *A, const float *B,
                   C + (long)Msfx * N, 0, Nfull);
     if (Nfull < N)                     /* ragged right edge, full K */
         gemm_tail(M, N, K, A, B, C, Nfull, N);
+    return 0;
 }
 
 #ifdef TT_IN_LIB
@@ -637,8 +638,11 @@ static Tensor *matmul_checked(const Tensor *a, const Tensor *b, int nthr) {
     const long shp[2] = {a->shape[0], b->shape[1]};
     Tensor *out = tt_new(shp, 2);
     if (!out) return NULL;
-    tt_sgemm_rowmajor(out->shape[0], out->shape[1], a->shape[1],
-                      a->data, b->data, out->data, nthr);
+    if (tt_sgemm_rowmajor((int)out->shape[0], (int)out->shape[1], (int)a->shape[1],
+                      a->data, b->data, out->data, nthr) != 0) {
+        tt_release(out);
+        return NULL;
+    }
     return out;
 }
 
